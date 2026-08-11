@@ -1,0 +1,55 @@
+# VACCA Fase 1 — Fine-tuning combinado: Navid HSM + BCS
+# Modelo base: yolo26n.pt
+# Datasets:
+#   Navid HSM Cow Detection (CC BY 4.0) — 3,013 imágenes
+#   BCS-YOLO ScienceDB 10.57760/sciencedb.16704 (CC BY 4.0) — 5,000 imágenes (subset)
+
+data: data/combined/data.yaml
+
+model:
+  pretrained: models/checkpoints/yolo26n.pt
+
+training:
+  epochs: 12           # ~22-28 min en RTX 4060 sobre 6,791 train imgs
+  batch: 16
+  imgsz: 640
+  device: cuda:0       # RTX 4060 Laptop 8GB
+  workers: 2
+  optimizer: auto
+  lr0: 0.001
+  lrf: 0.0001
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 2
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
+  cos_lr: true
+
+  # Data augmentation (conservador para fine-tuning)
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 10.0
+  translate: 0.1
+  scale: 0.5
+  shear: 2.0
+  perspective: 0.0
+  flipud: 0.0
+  fliplr: 0.5
+  mosaic: 0.3
+  mixup: 0.1
+
+  patience: 10
+
+evaluation:
+  conf: 0.25
+  iou: 0.7
+  max_det: 300
+  plots: true
+
+output:
+  project: C:\Users\renzo\repos\Proyeto Final\IA\outputs\training
+  name: combined-finetune
+  exist_ok: true
+  save: true
+  save_period: 5
