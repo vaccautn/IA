@@ -52,7 +52,7 @@ images/
 
 # Checkpoints, weights, and exported models
 checkpoints/
-models/
+models/*
 weights/
 *.ckpt
 *.onnx
@@ -67,3 +67,7 @@ outputs/
 runs/
 artifacts/
 mlruns/
+
+# Deployment model (versioned exception for server deploys)
+!models/deploy/
+!models/deploy/*.pt
