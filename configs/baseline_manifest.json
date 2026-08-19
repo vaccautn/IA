@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-08-02T18:43:32Z",
+  "runtime": {
+    "device": "cpu",
+    "python": "3.13.5",
+    "torch": "2.13.0+cpu",
+    "torchvision": "0.28.0+cpu",
+    "ultralytics": "8.4.115",
+    "seed": 0
+  },
+  "model": {
+    "name": "yolo26n",
+    "version": "v8.4.0-release-asset",
+    "release_tag": "v8.4.0",
+    "url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt",
+    "path": "models/checkpoints/yolo26n.pt",
+    "expected_size_bytes": 5544453,
+    "sha256": "9b09cc8bf347f0fc8a5f7657480587f25db09b34bf33b0652110fb03a8ad4fef",
+    "license": "AGPL-3.0",
+    "license_path": "LICENSE",
+    "trust_constraint": "Official release URL plus fixed digest; no independent signature is available."
+  },
+  "fixture": {
+    "name": "cow_female_black_white",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/0/0c/Cow_female_black_white.jpg",
+    "page_revision_url": "https://commons.wikimedia.org/w/index.php?title=File:Cow_female_black_white.jpg&oldid=1202221419",
+    "path": "fixtures/cow_female_black_white.jpg",
+    "expected_size_bytes": 908691,
+    "sha256": "e0972384d3151174d1450cff81bb19d1fc89519a5d1f6fc7ade5d710a89e56d8",
+    "author": "Keith Weller, USDA Agricultural Research Service",
+    "license": "PD-USGov-USDA-ARS"
+  },
+  "thresholds": {
+    "model_confidence": 0.25,
+    "pipeline_min_confidence": 0.25,
+    "minimum_relative_area": 0.1,
+    "border_margin_ratio": 0.02,
+    "framing_enabled": true,
+    "input_size": 640,
+    "maximum_image_size_bytes": 20971520,
+    "minimum_width": 1,
+    "minimum_height": 1,
+    "maximum_width": 12000,
+    "maximum_height": 12000,
+    "maximum_pixels": 50000000
+  }
+}

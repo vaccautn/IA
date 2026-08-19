@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VACCA Vision — Prototype</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --success: #3fb950;
+    --danger: #f85149;
+    --warning: #d2991d;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; display:flex; flex-direction:column;
+  }
+
+  /* --- Banner --- */
+  .prototype-banner {
+    background: var(--warning); color: #000;
+    text-align: center; padding: 8px 16px;
+    font-size: 13px; font-weight: 600;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  .prototype-banner button {
+    background: rgba(0,0,0,.15); border: none; color: #000;
+    padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  }
+
+  /* --- Layout --- */
+  main {
+    flex:1; display:flex; gap: 20px; padding: 20px; max-width: 1400px;
+    margin:0 auto; width:100%;
+  }
+  @media (max-width: 900px) { main { flex-direction:column; } }
+
+  /* --- Upload zone --- */
+  .panel {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 20px; flex:1;
+    display:flex; flex-direction:column;
+  }
+  .panel h2 { font-size:16px; margin-bottom:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+
+  .dropzone {
+    border: 2px dashed var(--border); border-radius: 8px;
+    display:flex; align-items:center; justify-content:center;
+    min-height: 180px; cursor: pointer; transition: border-color .2s;
+    margin-bottom: 16px; position:relative; overflow:hidden;
+  }
+  .dropzone:hover, .dropzone.dragover { border-color: var(--accent); }
+  .dropzone input { position:absolute; inset:0; opacity:0; cursor:pointer; }
+  .dropzone.has-image { border-style:solid; border-color:var(--border); min-height:auto; }
+  .dropzone img { max-width:100%; max-height:400px; display:block; border-radius:6px; }
+
+  canvas.overlay {
+    position: absolute; top:0; left:0; pointer-events: none;
+  }
+
+  .upload-hint { text-align:center; color:var(--muted); font-size:14px; }
+  .upload-hint strong { color:var(--accent); }
+
+  /* --- Results --- */
+  .results-empty { color:var(--muted); font-size:14px; text-align:center; padding:40px 0; }
+  .result-card {
+    background: var(--bg); border:1px solid var(--border);
+    border-radius: 6px; padding: 12px; margin-bottom:8px;
+    display:flex; gap:12px; align-items:flex-start;
+  }
+  .result-rank {
+    background: var(--accent); color:#000; font-weight:700;
+    border-radius: 50%; width: 28px; height: 28px;
+    display:flex; align-items:center; justify-content:center;
+    flex-shrink:0; font-size:13px;
+  }
+  .result-info { flex:1; }
+  .result-class { font-weight:600; font-size:14px; }
+  .result-conf { font-size:22px; font-weight:700; color:var(--success); }
+  .result-bbox { font-size:12px; color:var(--muted); margin-top:4px; font-family:monospace; }
+
+  .summary { margin-top:12px; padding-top:12px; border-top:1px solid var(--border); }
+  .summary-row { display:flex; justify-content:space-between; font-size:13px; padding:4px 0; }
+  .summary-row span:last-child { color:var(--muted); font-family:monospace; }
+  .summary .positive { color:var(--success); font-weight:700; }
+  .summary .negative { color:var(--danger); font-weight:700; }
+
+  .spinner {
+    display:none; width:24px; height:24px; border:3px solid var(--border);
+    border-top-color:var(--accent); border-radius:50%;
+    animation: spin .6s linear infinite; margin:10px auto;
+  }
+  .spinner.active { display:block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* --- Footer --- */
+  .api-footer {
+    background: var(--surface); border-top:1px solid var(--border);
+    padding:12px 20px; font-size:12px; color:var(--muted);
+    text-align:center;
+  }
+  .api-footer code { color:var(--accent); }
+</style>
+</head>
+<body>
+
+<!-- PROTOTYPE BANNER — remove this <div> for production -->
+<div class="prototype-banner" id="protoBanner">
+  ⚠ PROTOTYPE — Validación de resultados. Esta UI será reemplazada por el frontend real.
+  <button onclick="document.getElementById('protoBanner').style.display='none'">✕ Ocultar</button>
+</div>
+
+<main>
+  <!-- LEFT: Upload + Image -->
+  <div class="panel">
+    <h2>📤 Imagen</h2>
+    <div class="dropzone" id="dropzone">
+      <input type="file" id="fileInput" accept="image/*">
+      <img id="preview" style="display:none" alt="Preview">
+      <canvas id="bboxCanvas" class="overlay" style="display:none"></canvas>
+      <div class="upload-hint" id="uploadHint">
+        <strong>Arrastrá una imagen</strong> o hacé clic<br>
+        <span style="font-size:12px">JPEG, PNG — máx ~10 MB</span>
+      </div>
+    </div>
+    <div class="spinner" id="spinner"></div>
+    <div id="summary" class="summary" style="display:none"></div>
+  </div>
+
+  <!-- RIGHT: Results -->
+  <div class="panel">
+    <h2>🔍 Detecciones</h2>
+    <div id="results"></div>
+  </div>
+</main>
+
+<footer class="api-footer">
+  Endpoints: <code>POST /detect</code> &nbsp;|&nbsp; <code>GET /health</code> &nbsp;|&nbsp;
+  Modelo: combined-finetune (Navid + BCS) &nbsp;|&nbsp; YOLO26n
+</footer>
+
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const preview = document.getElementById('preview');
+const canvas = document.getElementById('bboxCanvas');
+const uploadHint = document.getElementById('uploadHint');
+const spinner = document.getElementById('spinner');
+const results = document.getElementById('results');
+const summary = document.getElementById('summary');
+
+const COLORS = ['#58a6ff','#3fb950','#d2991d','#f85149','#bc8cff','#ff7b72'];
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length > 0) handleFile(fileInput.files[0]);
+});
+
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  if (e.dataTransfer.files.length > 0) handleFile(e.dataTransfer.files[0]);
+});
+
+function handleFile(file) {
+  if (!file.type.startsWith('image/')) { alert('Solo imágenes (JPEG, PNG)'); return; }
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    preview.src = reader.result;
+    preview.style.display = 'block';
+    uploadHint.style.display = 'none';
+    dropzone.classList.add('has-image');
+
+    // Show image, then detect
+    preview.onload = () => detectAndDraw(file);
+  };
+  reader.readAsDataURL(file);
+}
+
+async function detectAndDraw(file) {
+  spinner.classList.add('active');
+  results.innerHTML = '';
+  summary.style.display = 'none';
+  canvas.style.display = 'none';
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    const resp = await fetch('/detect', { method: 'POST', body: formData });
+    if (!resp.ok) {
+      const err = await resp.text();
+      results.innerHTML = `<div class="results-empty" style="color:var(--danger)">Error: ${resp.status} — ${err}</div>`;
+      return;
+    }
+    const data = await resp.json();
+    renderResults(data);
+    drawBoxes(data);
+  } catch (e) {
+    results.innerHTML = `<div class="results-empty" style="color:var(--danger)">Error de conexión: ${e.message}</div>`;
+  } finally {
+    spinner.classList.remove('active');
+  }
+}
+
+function renderResults(data) {
+  if (!data.cow_detected) {
+    results.innerHTML = `<div class="results-empty">❌ No se detectaron vacas en la imagen.</div>`;
+    summary.innerHTML = `
+      <div class="summary-row"><span>Resultado</span><span class="negative">Sin detección</span></div>
+      <div class="summary-row"><span>Inferencia</span><span>${data.inference_time_ms} ms</span></div>
+      <div class="summary-row"><span>Tamaño</span><span>${data.image_width} × ${data.image_height}</span></div>
+    `;
+    summary.style.display = 'block';
+    return;
+  }
+
+  let cards = '';
+  data.detections.forEach((d, i) => {
+    cards += `
+      <div class="result-card">
+        <div class="result-rank" style="background:${COLORS[i % COLORS.length]}">${i+1}</div>
+        <div class="result-info">
+          <div class="result-class">🐄 ${d.class_name}</div>
+          <div class="result-conf">${(d.confidence*100).toFixed(1)}%</div>
+          <div class="result-bbox">
+            bbox: [${d.x1}, ${d.y1}, ${d.x2}, ${d.y2}]<br>
+            norm: [${d.bbox.x_center.toFixed(3)}, ${d.bbox.y_center.toFixed(3)}, ${d.bbox.width.toFixed(3)}, ${d.bbox.height.toFixed(3)}]
+          </div>
+        </div>
+      </div>`;
+  });
+
+  results.innerHTML = cards;
+  summary.innerHTML = `
+    <div class="summary-row"><span>Resultado</span><span class="positive">🐄 ${data.detection_count} vaca(s)</span></div>
+    <div class="summary-row"><span>Inferencia</span><span>${data.inference_time_ms} ms</span></div>
+    <div class="summary-row"><span>Tamaño</span><span>${data.image_width} × ${data.image_height}</span></div>
+  `;
+  summary.style.display = 'block';
+}
+
+function drawBoxes(data) {
+  if (!data.cow_detected) return;
+
+  const img = preview;
+  const displayW = img.clientWidth;
+  const displayH = img.clientHeight;
+  const scaleX = displayW / data.image_width;
+  const scaleY = displayH / data.image_height;
+
+  canvas.width = displayW;
+  canvas.height = displayH;
+  canvas.style.display = 'block';
+  canvas.style.width = displayW + 'px';
+  canvas.style.height = displayH + 'px';
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, displayW, displayH);
+
+  data.detections.forEach((d, i) => {
+    const color = COLORS[i % COLORS.length];
+    const x1 = d.x1 * scaleX;
+    const y1 = d.y1 * scaleY;
+    const w = (d.x2 - d.x1) * scaleX;
+    const h = (d.y2 - d.y1) * scaleY;
+
+    // Box
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x1, y1, w, h);
+
+    // Label
+    const label = `cow ${(d.confidence*100).toFixed(0)}%`;
+    ctx.fillStyle = color;
+    ctx.font = '12px monospace';
+    const textW = ctx.measureText(label).width + 8;
+    ctx.fillRect(x1, y1 - 20, textW, 20);
+    ctx.fillStyle = '#000';
+    ctx.fillText(label, x1 + 4, y1 - 6);
+  });
+}
+
+// Redraw on window resize
+window.addEventListener('resize', () => {
+  if (preview.style.display !== 'none' && canvas.style.display !== 'none') {
+    // Re-trigger draw with last data — we store it
+  }
+});
+</script>
+</body>
+</html>

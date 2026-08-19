@@ -1,0 +1,52 @@
+# VACCA Fase 1 — Fine-tuning v2: BCS imágenes NO usadas + todo Navid
+# 18,013 imágenes totales (14,791 train / 3,222 val)
+# ~40-45 min en RTX 4060
+
+data: data/combined-v2/data.yaml
+
+model:
+  pretrained: models/checkpoints/yolo26n.pt
+
+training:
+  epochs: 15
+  batch: 16
+  imgsz: 640
+  device: cuda:0
+  workers: 2
+  optimizer: auto
+  lr0: 0.001
+  lrf: 0.0001
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 2
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
+  cos_lr: true
+
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 10.0
+  translate: 0.1
+  scale: 0.5
+  shear: 2.0
+  perspective: 0.0
+  flipud: 0.0
+  fliplr: 0.5
+  mosaic: 0.3
+  mixup: 0.1
+
+  patience: 12
+
+evaluation:
+  conf: 0.25
+  iou: 0.7
+  max_det: 300
+  plots: true
+
+output:
+  project: outputs/training
+  name: combined-v2-finetune
+  exist_ok: true
+  save: true
+  save_period: 5

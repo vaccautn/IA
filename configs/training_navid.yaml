@@ -1,0 +1,55 @@
+# VACCA Fase 1 — Fine-tuning sobre Navid HSM Cow Detection
+# Modelo base: yolo26n.pt (mismo checkpoint del baseline)
+# Dataset: https://universe.roboflow.com/navid-hsm-lzjin/cow-detection-rxhva
+
+data: data/cow-detection-navids/data.yaml
+
+model:
+  pretrained: models/checkpoints/yolo26n.pt
+  # Si no existe, Ultralytics lo baja automáticamente del release oficial
+
+training:
+  epochs: 50
+  batch: 16
+  imgsz: 640
+  device: cuda:0  # RTX 4060 Laptop 8GB
+  workers: 2
+  optimizer: auto
+  lr0: 0.001      # learning rate inicial bajo porque es fine-tuning
+  lrf: 0.0001      # learning rate final (10x menor que inicial)
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
+  cos_lr: true     # cosine learning rate scheduler
+
+  # Data augmentation (conservador para fine-tuning)
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 10.0
+  translate: 0.1
+  scale: 0.5
+  shear: 2.0
+  perspective: 0.0
+  flipud: 0.0
+  fliplr: 0.5
+  mosaic: 0.3
+  mixup: 0.1
+
+  # Early stopping
+  patience: 15
+
+evaluation:
+  conf: 0.25
+  iou: 0.7
+  max_det: 300
+  plots: true
+
+output:
+  project: C:\Users\renzo\repos\Proyeto Final\IA\outputs\training
+  name: navid-finetune
+  exist_ok: true
+  save: true
+  save_period: 10
