@@ -1,7 +1,7 @@
 """Launch the VACCA Vision API server.
 
 Usage:
-    .venv/Scripts/python scripts/run_api.py                  # default port 8000
+    .venv/Scripts/python scripts/run_api.py                  # default port 8001
     .venv/Scripts/python scripts/run_api.py --port 3000      # custom port
     .venv/Scripts/python scripts/run_api.py --reload         # dev mode
 """
@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="VACCA Vision API server")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload (dev)")
     args = parser.parse_args()

@@ -29,7 +29,7 @@ dir outputs\training\combined-v2-finetune\weights\best.pt
 .venv\Scripts\python scripts/run_api.py
 ```
 
-El servidor levanta en `http://127.0.0.1:8000` con estos endpoints:
+El servidor levanta en `http://127.0.0.1:8001` con estos endpoints:
 
 | Método | Ruta | Descripción |
 |--------|------|-------------|
@@ -43,27 +43,27 @@ El servidor levanta en `http://127.0.0.1:8000` con estos endpoints:
 
 ### Opción 1: UI web (recomendado para validar)
 
-Abrí `http://127.0.0.1:8000/ui` en el navegador, arrastrá una imagen y ves las detecciones con bounding boxes dibujados en tiempo real.
+Abrí `http://127.0.0.1:8001/ui` en el navegador, arrastrá una imagen y ves las detecciones con bounding boxes dibujados en tiempo real.
 
 > ⚠ La UI es un prototipo para validación. Para producción, borrá `src/vacca_api/static/index.html` y la ruta `/ui` de `main.py`.
 
 ### Opción 2: Swagger
 
-`http://127.0.0.1:8000/docs` — documentación interactiva, podés probar los endpoints directamente desde el navegador.
+`http://127.0.0.1:8001/docs` — documentación interactiva, podés probar los endpoints directamente desde el navegador.
 
 ### Opción 3: curl / PowerShell
 
 ```powershell
 # Health check
-Invoke-RestMethod http://127.0.0.1:8000/health
+Invoke-RestMethod http://127.0.0.1:8001/health
 
 # Detectar vacas
-Invoke-RestMethod -Uri http://127.0.0.1:8000/detect `
+Invoke-RestMethod -Uri http://127.0.0.1:8001/detect `
   -Method Post `
   -Form @{file=Get-Item "data\cow-detection-navids\valid\images\alguna.jpg"}
 
 # BCS (placeholder)
-Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs `
+Invoke-RestMethod -Uri http://127.0.0.1:8001/bcs `
   -Method Post `
   -Form @{file=Get-Item "data\cow-detection-navids\valid\images\alguna.jpg"}
 ```
@@ -74,7 +74,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs `
 import requests
 
 with open("vaca.jpg", "rb") as f:
-    resp = requests.post("http://127.0.0.1:8000/detect", files={"file": f})
+    resp = requests.post("http://127.0.0.1:8001/detect", files={"file": f})
 
 data = resp.json()
 print(f"Vacas detectadas: {data['detection_count']}")
