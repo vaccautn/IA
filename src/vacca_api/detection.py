@@ -17,7 +17,7 @@ from PIL import Image
 from .schemas import BoundingBox, Detection
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL = ROOT / "outputs" / "training" / "combined-v2-finetune" / "weights" / "best.pt"
+DEFAULT_MODEL = ROOT / "models" / "deploy" / "vacca-yolo26n-v1.pt"
 
 
 class VACCADetector:
