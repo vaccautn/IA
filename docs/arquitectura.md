@@ -10,9 +10,9 @@
 | `src/vacca_vision/` | Contratos de detección, validación de imágenes, reglas de aptitud y adaptador Ultralytics. | `contracts.py`, `image_validation.py`, `pipeline.py`, `ultralytics_adapter.py` |
 | `scripts/run_baseline.py` | Ejecuta el camino validado por manifiesto: snapshot, detector, pipeline y salida JSON. | `configs/baseline_manifest.json` |
 | `src/vacca_bcs/` comprometido | Construcción segura y reproducible del dataset ordinal. | `dataset_topology.py`, `dataset_build_plan.py`, `dataset_snapshot.py`, `dataset_recovery.py`, `dataset_transaction.py` |
-| `src/vacca_bcs/` WIP | Dataset de carpetas y modelo ordinal CORAL. | `dataset.py`, `model.py`, `__init__.py` sin commit |
-| `scripts/` y `configs/` WIP | Entrenamiento ordinal y configuración de sus ejecuciones. | `train_bcs_ordinal.py`, `training_bcs_ordinal.yaml` sin commit |
-| `tests/` | Gates de contratos, baseline, pipeline, builder y WIP ordinal. | Archivos `test_*.py` |
+| Inferencia ordinal BCS futura | Planificada, no versionada en esta rama | El PRD respalda la intención de incorporar inferencia ordinal BCS en una fase posterior; no define una arquitectura de modelo ni un contrato de score/API. |
+| Entrenamiento y reanudación ordinales | Planificados, no versionados en esta rama | La arquitectura de entrenamiento y el diseño de resume quedan fuera del estado comprometido y aprobado actual. |
+| `tests/` | Gates de contratos, baseline, pipeline y builder comprometidos | Archivos `test_*.py` versionados en la rama. |
 
 ## Flujo actual de detección HTTP
 
@@ -59,17 +59,19 @@ data/bcs-cls/{train,val,...}
 
 - `dataset_topology.py` rechaza solapamientos entre fuente y destino y puntos de reanálisis inseguros.
 - `dataset_build_plan.py` valida todos los candidatos soportados antes de seleccionar, baraja con una semilla y calcula la partición.
-- `dataset_snapshot.py` copia a staging, vuelve a validar cada imagen, calcula los digests de los bytes staged y escribe el manifiesto versionado.
+- `dataset_snapshot.py` copia a staging, vuelve a validar cada imagen, calcula los digests de los bytes staged y escribe un manifiesto cuyo campo `manifest_schema_version` versiona el esquema del registro; esto no implica seguimiento por Git.
 - `dataset_recovery.py` conserva la generación anterior en `data/bcs-cls.backup-recovery` cuando corresponde y bloquea reintentos con recuperación activa.
 - `dataset_transaction.py` publica el staging completo y trata de restaurar la generación anterior si la instalación falla. El intercambio de directorios no es una operación atómica única en Windows.
 
-El manifiesto registra entradas de builder, escala y mapeo de clases, archivos seleccionados con fuente/destino/digest, y conteos por split y clase. `data/` está ignorado por Git: el dataset generado no es un artefacto versionado por esta rama.
+El manifiesto registra entradas de builder, escala y mapeo de clases, archivos seleccionados con fuente/destino/digest, y conteos por split y clase. `data/` está ignorado por Git: tanto el dataset generado como `data/bcs-cls/manifest.json` permanecen fuera del seguimiento Git aunque su esquema tenga versión.
+
+El builder comprometido usa exactamente `3.25`, `3.5`, `3.75`, `4.0` y `4.25` como etiquetas de clase del dataset. Esa configuración sólo define la preparación de datos; no establece la arquitectura futura del modelo ordinal ni el contrato de score/API.
 
 ## Frontera BCS futura
 
-La frontera de serving BCS todavía no está implementada. El código actual sólo deja `POST /bcs` como placeholder y no carga `BCSOrdinalModel` ni ningún checkpoint ordinal. Antes de afirmar que existe inferencia BCS se deben definir y probar, como mínimo, el artefacto de pesos, su configuración, el contrato de entrada/salida y la política de errores.
+La frontera de serving BCS todavía no está implementada. El código actual sólo deja `POST /bcs` como placeholder. El PRD respalda la intención de incorporar inferencia ordinal BCS en el futuro, pero la arquitectura del modelo, el artefacto de pesos, el contrato de serving/score y la política de errores todavía no están versionados ni aprobados.
 
-El PRD menciona un modelo ordinal de condición corporal como una fase posterior. Por eso el modelo CORAL, el trainer y su configuración se documentan como WIP, no como una ruta operativa.
+El PRD menciona inferencia ordinal de condición corporal como una fase posterior, pero no selecciona CORAL, una escala concreta ni un diseño de reanudación. Esas decisiones permanecen pendientes y no constituyen una ruta operativa.
 
 ## Relación con el backend
 

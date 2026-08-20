@@ -15,7 +15,7 @@ La detección de Fase 1 tiene un camino local de prototipo. El builder transacci
 
 ## Requisitos
 
-- Python 3.13+
+- Python 3.11+ (desarrollado y probado en 3.13)
 - GPU NVIDIA con CUDA 12.4 (opcional, funciona en CPU pero más lento)
 - ~3 GB de espacio para el modelo y dependencias
 
@@ -146,7 +146,7 @@ The builder rejects source/output overlap, unsafe destination symlinks or repars
 
 If `data/bcs-cls/` is missing while `data/bcs-cls.backup-recovery/` exists, stop and inspect or restore the recovery directory manually before retrying. The builder refuses to continue in this active-recovery state so a failed retry cannot delete the only complete previous generation.
 
-`data/bcs-cls/manifest.json` is the authoritative, deterministic dataset record. It is versioned and records the builder inputs, canonical class mapping, selected source paths and SHA-256 digests, destination split/path, and per-split/per-class counts. Do not edit it manually; regenerate the dataset when source files or selection arguments change.
+`data/bcs-cls/manifest.json` is the authoritative, deterministic dataset record. Its `manifest_schema_version` field versions the manifest schema; this does not mean the generated manifest is tracked by Git. The `data/` directory remains gitignored. The record contains builder inputs, canonical class mapping, selected source paths and SHA-256 digests, destination split/path, and per-split/per-class counts. Do not edit it manually; regenerate the dataset when source files or selection arguments change.
 
 > `--val-ratio 0` intentionally leaves the `val/` split empty. It is supported for dataset inspection outside any training flow.
 
