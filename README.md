@@ -122,6 +122,34 @@ for d in data["detections"]:
 
 Ajustá `MAX_PER_CLASS` en `build_combined_v2.py` si querés más/menos imágenes.
 
+## Phase 2 — Ordinal BCS dataset builder
+
+### Build the ordinal dataset
+
+The builder requires an extracted source dataset with one non-empty folder per class at `data/bcs/dataset/{3.25,3.5,3.75,4.0,4.25}`. Each class folder must contain supported image files (`.jpg`, `.jpeg`, `.png`, `.bmp`, or `.webp`). Before selection, every supported candidate in every required class is decoded and validated, so preflight cost scales with the full source candidate set rather than only `--max-per-class`. Source roots, class folders, and supported source files must not be symlinks, junctions, or other reparse points; this conservative rule prevents source aliases from reaching the generated tree. It writes the generated stratified copy to `data/bcs-cls/`. Both `data/` and `outputs/` are gitignored, so these datasets are not versioned.
+
+```powershell
+.venv\Scripts\python scripts/build_bcs_cls.py --max-per-class 6000 --seed 42 --val-ratio 0.2
+```
+
+The builder rejects source/output overlap, unsafe destination symlinks or reparse points, corrupt images, and selections that cannot leave every class with both train and validation data. It then copies the selected files into a sibling staging directory, validates those exact staged bytes again, and computes manifest SHA-256 digests from the staged files that will be published. A corrupt or partially copied staged file therefore fails before the live swap. When an existing generated root is present, the Windows-safe swap first removes any stale `data/bcs-cls.backup-recovery`, moves the current complete root to that deterministic sibling recovery path, and then moves the complete staging tree into `data/bcs-cls/`. A stale-backup cleanup failure leaves the current live dataset untouched. After a successful replacement, the previous complete generation remains at the recovery path; a future run removes it before its next swap. If installation fails, rollback is attempted, including after an interruption such as `KeyboardInterrupt`; successful rollback re-raises the interruption. If installation and rollback both fail, manually recover the complete backup from that path because the canonical path is not assumed to be restored. The directory swap itself is not a single atomic filesystem operation on Windows.
+
+If `data/bcs-cls/` is missing while `data/bcs-cls.backup-recovery/` exists, stop and inspect or restore the recovery directory manually before retrying. The builder refuses to continue in this active-recovery state so a failed retry cannot delete the only complete previous generation.
+
+`data/bcs-cls/manifest.json` is the authoritative, deterministic dataset record. It is versioned and records the builder inputs, canonical class mapping, selected source paths and SHA-256 digests, destination split/path, and per-split/per-class counts. Do not edit it manually; regenerate the dataset when source files or selection arguments change.
+
+> `--val-ratio 0` intentionally leaves the `val/` split empty. It is supported for dataset inspection outside any training flow.
+
+Run the focused builder tests after changing the dataset builder:
+
+```powershell
+.venv\Scripts\python -m pytest tests/test_bcs_dataset_topology.py tests/test_bcs_dataset_plan.py tests/test_bcs_dataset_snapshot.py tests/test_bcs_dataset_recovery.py tests/test_bcs_dataset_publish.py tests/test_bcs_cli.py
+```
+
+### Review slicing note
+
+The builder is intentionally split into reviewable functional slices: `dataset_topology.py` and `tests/test_bcs_dataset_topology.py` own filesystem topology; `dataset_build_plan.py`, `dataset_change_summary.py`, and `tests/test_bcs_dataset_plan.py` own selection and immutable counts; `dataset_snapshot.py` and `tests/test_bcs_dataset_snapshot.py` own staged-byte validation and the manifest; `dataset_recovery.py` with `tests/test_bcs_dataset_recovery.py` owns recovery state; `dataset_transaction.py` with `tests/test_bcs_dataset_publish.py` owns publication; and `scripts/build_bcs_cls.py` with `tests/test_bcs_cli.py` owns the CLI adapter. Review and deliver these as chained functional slices rather than artificial hunks.
+
 ## Resultados de entrenamiento
 
 | Run | Imágenes | Épocas | mAP50 | mAP50-95 | Precision | Recall | Tiempo |
@@ -138,14 +166,25 @@ IA/
 │   ├── detection.py         ← Wrapper YOLO (singleton)
 │   ├── schemas.py           ← Modelos Pydantic
 │   └── static/index.html    ← UI de prototipo (descartable)
+├── src/vacca_bcs/           ← Ordinal BCS package
+│   ├── constants.py         ← Class scale, builder defaults, and shared paths
+│   ├── dataset_topology.py  ← Source/output safety and path topology
+│   ├── dataset_build_plan.py← Topology, preflight, selection, and change summary
+│   ├── dataset_change_summary.py← Immutable build change counts
+│   ├── dataset_snapshot.py  ← Staged-byte validation, hashing, and manifest
+│   ├── dataset_recovery.py  ← Recovery state and rollback primitives
+│   └── dataset_transaction.py← Live publication and recovery
 ├── scripts/
 │   ├── train.py             ← Entrenamiento YOLO
+│   ├── build_bcs_cls.py     ← Builder del dataset ordinal BCS (exacto, re-ejecutable)
 │   ├── run_api.py           ← Launcher del servidor
 │   ├── convert_bcs.py       ← Conversión XML → YOLO (subconjunto inicial)
 │   ├── build_combined_v2.py ← Dataset con imágenes BCS no usadas
 │   └── smoke_test_api.py    ← Test rápido sin servidor
 ├── configs/                 ← YAMLs de entrenamiento
-├── data/
+├── data/                    ← (gitignored)
+│   ├── bcs/dataset/         ← Fuente BCS por clase: {3.25, 3.5, 3.75, 4.0, 4.25}
+│   ├── bcs-cls/             ← Dataset ordinal generado (train/val)
 │   ├── combined/            ← Dataset v1 (8K)
 │   ├── combined-v2/         ← Dataset v2 (18K)
 │   └── cow-detection-navids/← Navid HSM original
