@@ -3,6 +3,16 @@
 Microservicio de detección de bovinos con YOLO26n fine-tuneado sobre Navid HSM + BCS ScienceDB.  
 **mAP50: 0.974 · mAP50-95: 0.610 · Precision: 0.976 · Recall: 0.924**
 
+## Documentación
+
+- [Estado del repositorio](docs/estado-del-repositorio.md): estado operativo, gates, riesgos y próximos pasos.
+- [Arquitectura](docs/arquitectura.md): responsabilidades, flujos y límites entre detección, builder BCS y backend.
+- [API](docs/api.md): prerrequisitos, rutas, contratos actuales y troubleshooting.
+
+## Estado actual
+
+La detección de Fase 1 tiene un camino local de prototipo. El builder transaccional BCS está verificado, mientras que el core ordinal, el trainer y `/bcs` siguen en desarrollo o son placeholder. Ver el [estado detallado](docs/estado-del-repositorio.md) antes de operar o revisar Phase 2.
+
 ## Requisitos
 
 - Python 3.13+
