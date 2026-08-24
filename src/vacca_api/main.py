@@ -26,7 +26,7 @@ from .schemas import BCSResponse, DetectResponse, HealthResponse
 # --- Configuration ---
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-MODEL_PATH = ROOT / "outputs" / "training" / "combined-v2-finetune" / "weights" / "best.pt"
+MODEL_PATH = ROOT / "models" / "deploy" / "vacca-yolo26n-v1.pt"
 
 # --- App ---
 app = FastAPI(
