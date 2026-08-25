@@ -10,6 +10,13 @@ from typing import Any
 import hashlib
 import json
 import platform
+import csv
+import datetime as dt
+import tempfile
+import time
+from dataclasses import dataclass, replace
+from typing import TextIO
+from torch import Tensor
 
 _CUBLAS_WORKSPACE_CONFIG = "CUBLAS_WORKSPACE_CONFIG"
 _ACCEPTED_CUBLAS_WORKSPACE_CONFIGS = {":4096:8", ":16:8"}
@@ -43,10 +50,21 @@ from vacca_bcs.constants import (
     SCORE_STEP,
     SPLITS,
 )
+from vacca_bcs.dataset import BCSFolderDataset
 
+RESULTS_FIELDNAMES = [
+    "epoch",
+    "lr",
+    "train_loss",
+    "val_exact_acc",
+    "val_pm1_acc",
+    "val_mae",
+]
 def _resolve_path(raw: str | Path) -> Path:
     path = Path(raw)
     return path if path.is_absolute() else (ROOT / path).resolve()
+def _utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 def load_config(config_path: Path) -> dict[str, Any]:
     with config_path.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -369,3 +387,204 @@ def _validate_provenance(
                 f"Resume provenance mismatch for {key}: checkpoint has {saved.get(key)!r}, "
                 f"active run has {expected[key]!r}. Use the matching config and dataset manifest."
             )
+def _capture_rng_state() -> dict[str, Any]:
+    cuda_states: list[Tensor] | None = None
+    cuda_device_count = 0
+    if torch.cuda.is_available():
+        cuda_device_count = torch.cuda.device_count()
+        cuda_states = [state.cpu() for state in torch.cuda.get_rng_state_all()]
+    return {
+        "python": random.getstate(),
+        "torch_cpu": torch.get_rng_state(),
+        "cuda": cuda_states,
+        "cuda_device_count": cuda_device_count,
+    }
+
+
+def _restore_rng_state(checkpoint: dict[str, Any]) -> None:
+    state = checkpoint.get("rng_state")
+    if not isinstance(state, dict):
+        raise ValueError("Checkpoint has no valid RNG state; it cannot be resumed safely")
+    try:
+        random.setstate(state["python"])
+        torch.set_rng_state(state["torch_cpu"])
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"Checkpoint CPU RNG state is invalid: {exc}") from exc
+
+    saved_cuda = state.get("cuda")
+    saved_count = state.get("cuda_device_count", 0)
+    if type(saved_count) is not int or saved_count < 0:
+        raise ValueError("Checkpoint CUDA RNG device count is invalid")
+    current_available = torch.cuda.is_available()
+    current_count = torch.cuda.device_count() if current_available else 0
+    if saved_cuda is None:
+        if saved_count != 0:
+            raise ValueError("Checkpoint CUDA RNG metadata is inconsistent")
+        return
+    if not current_available:
+        raise ValueError(
+            "Checkpoint contains CUDA RNG state, but CUDA is unavailable in this environment; "
+            "resume on CPU is unsafe."
+        )
+    if not isinstance(saved_cuda, list) or len(saved_cuda) != current_count:
+        raise ValueError(
+            f"Checkpoint CUDA RNG state covers {saved_count} device(s), but this environment "
+            f"has {current_count}; resume requires the same CUDA device count."
+        )
+    for index, value in enumerate(saved_cuda):
+        if not isinstance(value, torch.Tensor) or value.dtype != torch.uint8 or value.ndim != 1:
+            raise ValueError(f"Checkpoint CUDA RNG entry {index} is not a usable byte tensor")
+    if saved_count != current_count:
+        raise ValueError(
+            f"Checkpoint CUDA RNG state covers {saved_count} device(s), but this environment "
+            f"has {current_count}; resume requires the same CUDA device count."
+        )
+    try:
+        torch.cuda.set_rng_state_all([value.cpu() for value in saved_cuda])
+    except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"Checkpoint CUDA RNG state is invalid: {exc}") from exc
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort directory durability; Windows may not support directory fsync."""
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
+
+
+def _flush_and_fsync(handle: Any) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
+    """Flush a staged checkpoint, then replace the destination atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_temp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temp_path = Path(raw_temp_path)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            torch.save(payload, handle)
+            _flush_and_fsync(handle)
+        os.replace(temp_path, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        if descriptor != -1:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _existing_run_artifacts(output_dir: Path) -> list[Path]:
+    """List run artifacts whose presence marks the output dir as an existing run."""
+    candidates = [output_dir / "results.csv", output_dir / "run_info.json"]
+    weights_dir = output_dir / "weights"
+    if weights_dir.is_dir():
+        candidates.extend(sorted(weights_dir.glob("*.pt")))
+    return [path for path in candidates if path.is_file()]
+
+
+def _atomic_write_json(payload: dict[str, Any], path: Path) -> None:
+    descriptor, raw_temp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temp_path = Path(raw_temp_path)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+            _flush_and_fsync(handle)
+        os.replace(temp_path, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        if descriptor != -1:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@dataclass(frozen=True)
+class RunInfoContext:
+    """Inputs shared by normal and terminal-finalization run metadata writes."""
+
+    config: dict[str, Any]
+    data_dir: Path
+    output_dir: Path
+    device: torch.device
+    provenance: dict[str, Any]
+    train_dataset: BCSFolderDataset
+    val_dataset: BCSFolderDataset
+    started_at: str
+    started_time: float
+    resume: Path | None
+    start_epoch: int
+    terminal_finalization: bool = False
+
+
+def _build_run_info(context: RunInfoContext) -> dict[str, Any]:
+    """Build serialized run metadata from one cohesive execution context."""
+    run_info: dict[str, Any] = {
+        "started_at_utc": context.started_at,
+        "finished_at_utc": _utc_now(),
+        "config_file": str(context.config["_config_path"]),
+        "dataset": str(context.data_dir),
+        "class_counts": {
+            "train": context.train_dataset.class_counts,
+            "val": context.val_dataset.class_counts,
+        },
+        "device": str(context.device),
+        "output_dir": str(context.output_dir),
+        "provenance": context.provenance,
+        "wall_time_seconds": time.perf_counter() - context.started_time,
+    }
+    if context.resume is not None:
+        run_info["resumed_from"] = str(context.resume)
+        run_info["resumed_at_epoch"] = context.start_epoch
+    if context.terminal_finalization:
+        run_info["finalized_from_terminal_checkpoint"] = True
+    return run_info
+
+
+def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
+    """Protect a fresh run from clobbering artifacts of a previous run."""
+    existing = _existing_run_artifacts(output_dir)
+    if existing and not overwrite:
+        raise FileExistsError(
+            "Output directory already contains run artifacts: "
+            + ", ".join(str(path) for path in existing)
+            + ". Use --overwrite to replace them, or --resume "
+            "<output>/weights/last.pt to continue the existing run."
+        )
+    for path in existing:
+        path.unlink()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _open_results_csv(
+    results_path: Path, *, append: bool
+) -> tuple[TextIO, csv.DictWriter[str]]:
+    """Open results.csv, appending without a duplicate header when resuming."""
+    if append and results_path.is_file() and results_path.stat().st_size > 0:
+        handle = results_path.open("a", newline="", encoding="utf-8")
+        return handle, csv.DictWriter(handle, fieldnames=RESULTS_FIELDNAMES)
+    handle = results_path.open("w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(handle, fieldnames=RESULTS_FIELDNAMES)
+    writer.writeheader()
+    return handle, writer

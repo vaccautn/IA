@@ -10,6 +10,7 @@ import subprocess
 import yaml
 import hashlib
 import json
+import random
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -27,6 +28,13 @@ from vacca_bcs.model import (  # noqa: E402
 import scripts.train_bcs_ordinal as trainer  # noqa: E402
 from scripts.train_bcs_ordinal import load_config, set_seed  # noqa: E402
 from scripts.train_bcs_ordinal import _build_provenance, _runtime_identity  # noqa: E402
+from scripts.train_bcs_ordinal import (  # noqa: E402
+    _atomic_torch_save,
+    _atomic_write_json,
+    _capture_rng_state,
+    _prepare_output_dir,
+    _restore_rng_state,
+)
 
 def test_coral_level_encoding_for_all_classes() -> None:
     levels = torch.arange(5)
@@ -217,6 +225,159 @@ def test_load_config_rejects_invalid_training_boundaries(
 def test_load_config_rejects_warmup_longer_than_training(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="warmup_epochs"):
         load_config(_write_config(tmp_path, epochs=2, warmup_epochs=3))
+
+def _seed_run_artifacts(output_dir: Path) -> None:
+    weights_dir = output_dir / "weights"
+    weights_dir.mkdir(parents=True)
+    (output_dir / "results.csv").write_text("epoch\n1\n", encoding="utf-8")
+    (weights_dir / "best.pt").write_bytes(b"fake")
+
+
+def test_fresh_run_refuses_to_clobber_existing_artifacts(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    _seed_run_artifacts(output_dir)
+    with pytest.raises(FileExistsError, match="--overwrite"):
+        _prepare_output_dir(output_dir, overwrite=False)
+    assert (output_dir / "results.csv").is_file()
+    assert (output_dir / "weights" / "best.pt").is_file()
+
+
+def test_overwrite_removes_existing_artifacts(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    _seed_run_artifacts(output_dir)
+    _prepare_output_dir(output_dir, overwrite=True)
+    assert not (output_dir / "results.csv").exists()
+    assert not (output_dir / "weights" / "best.pt").exists()
+
+
+def test_prepare_output_dir_allows_empty_fresh_dir(tmp_path: Path) -> None:
+    output_dir = tmp_path / "new-run"
+    _prepare_output_dir(output_dir, overwrite=False)
+    assert output_dir.is_dir()
+
+
+def test_atomic_checkpoint_failure_preserves_prior_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "weights" / "last.pt"
+    path.parent.mkdir()
+    path.write_bytes(b"prior-valid-checkpoint")
+
+    def fail_save(*args, **kwargs):
+        raise OSError("simulated checkpoint write failure")
+
+    monkeypatch.setattr(trainer.torch, "save", fail_save)
+    with pytest.raises(OSError, match="simulated"):
+        _atomic_torch_save({"epoch": 2}, path)
+    assert path.read_bytes() == b"prior-valid-checkpoint"
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_atomic_checkpoint_replace_failure_preserves_prior_checkpoint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "weights" / "last.pt"
+    path.parent.mkdir()
+    path.write_bytes(b"prior-valid-checkpoint")
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(trainer.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace"):
+        _atomic_torch_save({"epoch": 2}, path)
+    assert path.read_bytes() == b"prior-valid-checkpoint"
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_atomic_checkpoint_fsync_failure_preserves_prior_checkpoint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "weights" / "last.pt"
+    path.parent.mkdir()
+    path.write_bytes(b"prior-valid-checkpoint")
+
+    def fail_fsync(descriptor):
+        raise OSError("checkpoint fsync failure")
+
+    monkeypatch.setattr(trainer.os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="checkpoint fsync failure"):
+        _atomic_torch_save({"epoch": 2}, path)
+    assert path.read_bytes() == b"prior-valid-checkpoint"
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_atomic_checkpoint_cleanup_failure_preserves_fsync_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "weights" / "last.pt"
+    path.parent.mkdir()
+    path.write_bytes(b"prior-valid-checkpoint")
+
+    def fail_fsync(descriptor):
+        raise OSError("checkpoint fsync failure")
+
+    def fail_unlink(self, missing_ok=False):
+        raise OSError("checkpoint cleanup failure")
+
+    monkeypatch.setattr(trainer.os, "fsync", fail_fsync)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    with pytest.raises(OSError, match="checkpoint fsync failure"):
+        _atomic_torch_save({"epoch": 2}, path)
+    assert path.read_bytes() == b"prior-valid-checkpoint"
+
+
+def test_run_info_fsync_failure_preserves_prior_metadata(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "run_info.json"
+    path.write_bytes(b"prior-run-info")
+
+    def fail_fsync(descriptor):
+        raise OSError("run-info fsync failure")
+
+    monkeypatch.setattr(trainer.os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="run-info fsync failure"):
+        _atomic_write_json({"complete": True}, path)
+    assert path.read_bytes() == b"prior-run-info"
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_run_info_cleanup_failure_preserves_fsync_error(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "run_info.json"
+    path.write_bytes(b"prior-run-info")
+
+    def fail_fsync(descriptor):
+        raise OSError("run-info fsync failure")
+
+    def fail_unlink(self, missing_ok=False):
+        raise OSError("run-info cleanup failure")
+
+    monkeypatch.setattr(trainer.os, "fsync", fail_fsync)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    with pytest.raises(OSError, match="run-info fsync failure"):
+        _atomic_write_json({"complete": True}, path)
+    assert path.read_bytes() == b"prior-run-info"
+
+def test_resume_restores_python_and_torch_cpu_rng_state() -> None:
+    random.seed(123)
+    torch.manual_seed(123)
+    state = _capture_rng_state()
+    expected_python = random.random()
+    expected_torch = torch.rand(4)
+
+    random.random()
+    torch.rand(4)
+    _restore_rng_state({"rng_state": state})
+
+    assert random.random() == expected_python
+    assert torch.equal(torch.rand(4), expected_torch)
+
+
+def test_resume_rejects_cuda_rng_device_count_mismatch(monkeypatch) -> None:
+    state = _capture_rng_state()
+    state["cuda"] = [torch.zeros(4, dtype=torch.uint8)]
+    state["cuda_device_count"] = 1
+    monkeypatch.setattr(trainer.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(trainer.torch.cuda, "device_count", lambda: 2)
+    with pytest.raises(ValueError, match="device count"):
+        _restore_rng_state({"rng_state": state})
 
 def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -> dict[str, object]:
     data_dir = tmp_path / "dataset"
