@@ -60,6 +60,17 @@ RESULTS_FIELDNAMES = [
     "val_pm1_acc",
     "val_mae",
 ]
+RESUMABLE_CHECKPOINT_FIELDS = {
+    "model_state_dict",
+    "optimizer_state_dict",
+    "epoch",
+    "best_mae",
+    "epochs_without_improvement",
+    "config",
+    "classes",
+    "provenance",
+    "rng_state",
+}
 def _resolve_path(raw: str | Path) -> Path:
     path = Path(raw)
     return path if path.is_absolute() else (ROOT / path).resolve()
@@ -742,3 +753,159 @@ def _reconcile_results_csv(results_path: Path, *, checkpoint_epoch: int) -> int:
             f" época {checkpoint_epoch} para coincidir con el checkpoint."
         )
     return checkpoint_epoch
+def _build_last_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    epoch: int,
+    best_mae: float,
+    epochs_without_improvement: int,
+    config: dict[str, Any],
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble the resumable checkpoint saved as weights/last.pt every epoch."""
+    return {
+        "model_state_dict": {
+            key: value.detach().cpu() for key, value in model.state_dict().items()
+        },
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": int(epoch),
+        "best_mae": float(best_mae),
+        "epochs_without_improvement": int(epochs_without_improvement),
+        "config": config,
+        "classes": list(CLASS_NAMES),
+        "provenance": provenance or {},
+        "rng_state": _capture_rng_state(),
+    }
+
+
+def _validate_checkpoint_metadata(
+    checkpoint: dict[str, Any], *, path: Path, total_epochs: int
+) -> None:
+    for field in ("model_state_dict", "optimizer_state_dict", "config", "provenance", "rng_state"):
+        if not isinstance(checkpoint[field], dict):
+            raise ValueError(f"Checkpoint {path} field {field!r} must be an object")
+    classes = checkpoint["classes"]
+    if not isinstance(classes, list) or not all(isinstance(value, str) for value in classes):
+        raise ValueError(f"Checkpoint {path} classes must be a list of strings")
+    epoch = checkpoint["epoch"]
+    if type(epoch) is not int or epoch < 1:
+        raise ValueError(f"Checkpoint {path} epoch must be a non-negative integer >= 1")
+    if epoch > total_epochs:
+        raise ValueError(
+            f"Checkpoint epoch {epoch} exceeds configured total of {total_epochs} epochs"
+        )
+    best_mae = checkpoint["best_mae"]
+    if isinstance(best_mae, bool) or not isinstance(best_mae, (int, float)):
+        raise ValueError(f"Checkpoint {path} best_mae must be a finite number")
+    best_mae = float(best_mae)
+    if not math.isfinite(best_mae) or best_mae < 0 or best_mae > SCORE_STEP * (len(CLASS_NAMES) - 1):
+        raise ValueError(f"Checkpoint {path} best_mae is outside the valid BCS metric domain")
+    without_improvement = checkpoint["epochs_without_improvement"]
+    if type(without_improvement) is not int or without_improvement < 0:
+        raise ValueError(
+            f"Checkpoint {path} epochs_without_improvement must be a non-negative integer"
+        )
+    if without_improvement > epoch:
+        raise ValueError(
+            f"Checkpoint {path} epochs_without_improvement cannot exceed completed epoch {epoch}"
+        )
+    rng_state = checkpoint["rng_state"]
+    cuda_count = rng_state.get("cuda_device_count")
+    if type(cuda_count) is not int or cuda_count < 0:
+        raise ValueError(f"Checkpoint {path} CUDA RNG device count is invalid")
+    cuda_state = rng_state.get("cuda")
+    if cuda_count == 0:
+        if cuda_state is not None:
+            raise ValueError(
+                f"Checkpoint {path} CUDA RNG state must be absent when device count is zero"
+            )
+    elif not isinstance(cuda_state, list) or len(cuda_state) != cuda_count:
+        raise ValueError(f"Checkpoint {path} CUDA RNG state does not match its device count")
+    if isinstance(cuda_state, list):
+        for index, value in enumerate(cuda_state):
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.dtype != torch.uint8
+                or value.ndim != 1
+            ):
+                raise ValueError(f"Checkpoint {path} CUDA RNG entry {index} is not a usable byte tensor")
+
+
+def _load_resume_checkpoint(
+    path: Path,
+    *,
+    expected_classes: list[str],
+    total_epochs: int,
+    expected_provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load and validate a resumable checkpoint (weights/last.pt)."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ValueError(f"Resume checkpoint could not be loaded safely: {path}: {exc}") from exc
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Resume checkpoint is not a state dictionary: {path}")
+    missing = sorted(RESUMABLE_CHECKPOINT_FIELDS.difference(checkpoint))
+    if missing:
+        hint = ""
+        if "optimizer_state_dict" in missing:
+            hint = (
+                " Best-only checkpoints such as weights/best.pt are not"
+                " resumable; pass weights/last.pt instead."
+            )
+        raise ValueError(
+            f"Checkpoint {path} is missing required fields:"
+            f" {', '.join(missing)}.{hint}"
+        )
+    _validate_checkpoint_metadata(checkpoint, path=path, total_epochs=total_epochs)
+    classes = list(checkpoint["classes"])
+    if classes != list(expected_classes):
+        raise ValueError(
+            f"Checkpoint classes {classes} do not match the expected BCS"
+            f" classes {list(expected_classes)}"
+        )
+    if expected_provenance is not None:
+        _validate_provenance(checkpoint, expected_provenance, path)
+    completed_epochs = int(checkpoint["epoch"])
+    if completed_epochs < 1:
+        raise ValueError(f"Checkpoint epoch must be >= 1, got {completed_epochs}")
+    if completed_epochs == total_epochs:
+        return checkpoint
+    if completed_epochs > total_epochs:
+        raise ValueError(
+            f"Checkpoint already completed {completed_epochs} epochs, which"
+            f" exceeds the configured total of {total_epochs} epochs"
+        )
+    return checkpoint
+
+
+def _restore_model_state(model: torch.nn.Module, checkpoint: dict[str, Any]) -> None:
+    """Restore model weights, failing clearly on architecture mismatch."""
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except (KeyError, TypeError, RuntimeError) as exc:
+        raise ValueError(
+            "Checkpoint model state does not match the BCS ordinal model"
+            f" architecture: {exc}"
+        ) from exc
+
+
+def _restore_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    checkpoint: dict[str, Any],
+    *,
+    device: torch.device | None = None,
+) -> None:
+    """Restore optimizer state, moving tensors to the training device."""
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(f"Checkpoint optimizer state is incompatible: {exc}") from exc
+    if device is not None:
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(device)

@@ -41,6 +41,13 @@ from scripts.train_bcs_ordinal import (  # noqa: E402
     _open_results_csv,
     _reconcile_results_csv,
 )
+from scripts.train_bcs_ordinal import (  # noqa: E402
+    RESUMABLE_CHECKPOINT_FIELDS,
+    _build_last_checkpoint,
+    _load_resume_checkpoint,
+    _restore_model_state,
+    _restore_optimizer_state,
+)
 
 def test_coral_level_encoding_for_all_classes() -> None:
     levels = torch.arange(5)
@@ -262,6 +269,38 @@ def test_prepare_output_dir_allows_empty_fresh_dir(tmp_path: Path) -> None:
     assert output_dir.is_dir()
 
 
+def test_last_checkpoint_roundtrip_restores_training_state(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model,
+        optimizer,
+        epoch=2,
+        best_mae=0.5,
+        epochs_without_improvement=1,
+        config={"epochs": 4},
+    )
+    assert RESUMABLE_CHECKPOINT_FIELDS.issubset(checkpoint)
+
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+    loaded = _load_resume_checkpoint(
+        path, expected_classes=list(CLASS_NAMES), total_epochs=4
+    )
+    assert loaded["epoch"] == 2
+    assert loaded["best_mae"] == 0.5
+    assert loaded["epochs_without_improvement"] == 1
+
+    new_model = torch.nn.Linear(3, 2)
+    _restore_model_state(new_model, loaded)
+    for name, value in new_model.state_dict().items():
+        assert torch.equal(value, checkpoint["model_state_dict"][name])
+
+    new_optimizer = torch.optim.AdamW(new_model.parameters(), lr=0.99)
+    _restore_optimizer_state(new_optimizer, loaded)
+    assert new_optimizer.param_groups[0]["lr"] == 0.01
+
+
 def test_atomic_checkpoint_failure_preserves_prior_checkpoint(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "weights" / "last.pt"
     path.parent.mkdir()
@@ -384,6 +423,158 @@ def test_resume_rejects_cuda_rng_device_count_mismatch(monkeypatch) -> None:
     monkeypatch.setattr(trainer.torch.cuda, "device_count", lambda: 2)
     with pytest.raises(ValueError, match="device count"):
         _restore_rng_state({"rng_state": state})
+
+def test_resume_rejects_malformed_cuda_rng_entry(tmp_path: Path, monkeypatch) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model,
+        optimizer,
+        epoch=1,
+        best_mae=0.5,
+        epochs_without_improvement=0,
+        config={"epochs": 4},
+    )
+    checkpoint["rng_state"]["cuda"] = ["not-a-tensor"]
+    checkpoint["rng_state"]["cuda_device_count"] = 1
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+    monkeypatch.setattr(trainer.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(trainer.torch.cuda, "device_count", lambda: 1)
+    with pytest.raises(ValueError, match="CUDA RNG entry 0"):
+        _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
+
+
+@pytest.mark.parametrize(
+    ("cuda_state", "cuda_count"),
+    [(None, 1), ([torch.zeros(4, dtype=torch.uint8)], 2)],
+)
+def test_resume_rejects_inconsistent_cuda_rng_metadata(
+    tmp_path: Path, cuda_state, cuda_count: int
+) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model,
+        optimizer,
+        epoch=1,
+        best_mae=0.5,
+        epochs_without_improvement=0,
+        config={"epochs": 4},
+    )
+    checkpoint["rng_state"]["cuda"] = cuda_state
+    checkpoint["rng_state"]["cuda_device_count"] = cuda_count
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+    with pytest.raises(ValueError, match="CUDA RNG state"):
+        _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
+
+
+def test_resume_accepts_mocked_valid_cuda_rng_metadata(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model,
+        optimizer,
+        epoch=1,
+        best_mae=0.5,
+        epochs_without_improvement=0,
+        config={"epochs": 4},
+    )
+    checkpoint["rng_state"]["cuda"] = [torch.zeros(4, dtype=torch.uint8)]
+    checkpoint["rng_state"]["cuda_device_count"] = 1
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+    loaded = _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
+    assert loaded["rng_state"]["cuda_device_count"] == 1
+
+
+def test_resume_accepts_valid_cpu_only_rng_metadata(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model,
+        optimizer,
+        epoch=1,
+        best_mae=0.5,
+        epochs_without_improvement=0,
+        config={"epochs": 4},
+    )
+    checkpoint["rng_state"]["cuda"] = None
+    checkpoint["rng_state"]["cuda_device_count"] = 0
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+    loaded = _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
+    assert loaded["rng_state"]["cuda"] is None
+
+def test_resume_rejects_best_only_checkpoint(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    path = tmp_path / "best.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": {"epochs": 4},
+            "classes": list(CLASS_NAMES),
+            "epoch": 1,
+            "val_mae": 0.5,
+        },
+        path,
+    )
+    with pytest.raises(ValueError, match="not resumable"):
+        _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
+
+
+def test_resume_rejects_mismatched_classes(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model, optimizer, epoch=1, best_mae=0.5,
+        epochs_without_improvement=0, config={"epochs": 4},
+    )
+    checkpoint["classes"] = ["a", "b"]
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+    with pytest.raises(ValueError, match="classes"):
+        _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
+
+
+def test_resume_rejects_already_completed_total_epochs(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model, optimizer, epoch=5, best_mae=0.5,
+        epochs_without_improvement=0, config={"epochs": 4},
+    )
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+    with pytest.raises(ValueError, match="exceeds"):
+        _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("best_mae", float("nan"), "best_mae"),
+        ("epochs_without_improvement", -1, "non-negative"),
+        ("classes", "invalid", "classes must be a list"),
+        ("epoch", True, "epoch must be"),
+    ],
+)
+def test_resume_rejects_malformed_checkpoint_metadata(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model, optimizer, epoch=1, best_mae=0.5,
+        epochs_without_improvement=0, config={"epochs": 4},
+    )
+    checkpoint[field] = value
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+    with pytest.raises(ValueError, match=message):
+        _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
+
 
 def _results_row(epoch: int) -> dict[str, str]:
     return {
@@ -680,6 +871,45 @@ def test_cuda_runtime_identity_records_version_and_gpu_facts(monkeypatch) -> Non
     assert identity["cuda_device_count"] == 2
     assert identity["gpu_names"] == ["controlled-gpu-0", "controlled-gpu-1"]
 
+def test_resume_roundtrip_rejects_runtime_identity_drift(tmp_path: Path) -> None:
+    config = _tiny_training_config(tmp_path, tmp_path / "run")
+    provenance = _build_provenance(
+        config,
+        data_dir=Path(config["data_dir"]),
+        output_dir=Path(config["output"]),
+        device=torch.device("cpu"),
+    )
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model,
+        optimizer,
+        epoch=1,
+        best_mae=0.5,
+        epochs_without_improvement=0,
+        config=config,
+        provenance=provenance,
+    )
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+
+    loaded = _load_resume_checkpoint(
+        path,
+        expected_classes=list(CLASS_NAMES),
+        total_epochs=3,
+        expected_provenance=provenance,
+    )
+    assert loaded["provenance"]["runtime"] == provenance["runtime"]
+
+    drifted = json.loads(json.dumps(provenance))
+    drifted["runtime"]["torch"] = "different-torch-runtime"
+    with pytest.raises(ValueError, match="provenance mismatch for runtime"):
+        _load_resume_checkpoint(
+            path,
+            expected_classes=list(CLASS_NAMES),
+            total_epochs=3,
+            expected_provenance=drifted,
+        )
 @pytest.mark.parametrize("mutation", ["added", "missing", "escaping"])
 def test_dataset_provenance_rejects_inconsistent_live_membership(
     tmp_path: Path, mutation: str
