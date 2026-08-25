@@ -11,7 +11,7 @@ Microservicio de detección de bovinos con YOLO26n fine-tuneado sobre Navid HSM 
 
 ## Estado actual
 
-La detección de Fase 1 tiene un camino local de prototipo. El builder transaccional BCS está verificado, mientras que el core ordinal, el trainer y `/bcs` siguen en desarrollo o son placeholder. Ver el [estado detallado](docs/estado-del-repositorio.md) antes de operar o revisar Phase 2.
+La detección de Fase 1 tiene un camino local de prototipo. El builder, el núcleo ordinal BCS, el trainer y sus pruebas están versionados en esta rama; `/bcs` sigue siendo un placeholder y no se afirma una ejecución real ni disponibilidad productiva. Ver el [estado detallado](docs/estado-del-repositorio.md) antes de operar o revisar Phase 2.
 
 ## Requisitos
 
@@ -159,6 +159,27 @@ Run the focused builder tests after changing the dataset builder:
 ### Review slicing note
 
 The builder is intentionally split into reviewable functional slices: `dataset_topology.py` and `tests/test_bcs_dataset_topology.py` own filesystem topology; `dataset_build_plan.py`, `dataset_change_summary.py`, and `tests/test_bcs_dataset_plan.py` own selection and immutable counts; `dataset_snapshot.py` and `tests/test_bcs_dataset_snapshot.py` own staged-byte validation and the manifest; `dataset_recovery.py` with `tests/test_bcs_dataset_recovery.py` owns recovery state; `dataset_transaction.py` with `tests/test_bcs_dataset_publish.py` owns publication; and `scripts/build_bcs_cls.py` with `tests/test_bcs_cli.py` owns the CLI adapter. Review and deliver these as chained functional slices rather than artificial hunks.
+
+## Phase 2 — Entrenamiento ordinal BCS
+
+El núcleo ordinal y el trainer están versionados y cubiertos por pruebas con imágenes y tensores controlados. El modelo conserva la escala fraccionaria `3.25, 3.5, 3.75, 4.0, 4.25`; cualquier redondeo entero queda fuera del modelo y se reserva para el contrato futuro del backend. `/bcs` sigue siendo placeholder; el contrato futuro aprobado sólo permite un entero `1..5` en el borde del endpoint, con redondeo decimal half-down (un empate exacto `.5` baja, por ejemplo `3.5 → 3`).
+
+### Prerrequisitos y ejecución
+
+- Python 3.11 o posterior.
+- Entorno `.venv` con las dependencias BCS instaladas (`.venv\Scripts\python -m pip install -e .[bcs]`).
+- Dataset generado en `data/bcs-cls/` y su `manifest.json` validado por el builder.
+- La configuración operativa usa el backbone ImageNet por defecto en una ejecución fresca y puede requerir que esos pesos estén disponibles; las pruebas de esta transición usan `pretrained=False` y no descargan modelos.
+
+Para iniciar una ejecución operativa, usar:
+
+```powershell
+.venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
+```
+
+El directorio configurado (`outputs/bcs-ordinal/`) contiene `results.csv`, `run_info.json`, `weights/best.pt` y el checkpoint reanudable `weights/last.pt`. Una ejecución fresca rechaza artefactos existentes; `--overwrite` permite reemplazarlos después de las validaciones previas. `--resume outputs/bcs-ordinal/weights/last.pt` exige compatibilidad de configuración, manifiesto/dataset vivo e identidad del runtime, y no es un mecanismo para mezclar entornos.
+
+La evidencia comprometida de esta transición se limita a pruebas deterministas con imágenes Pillow temporales y tensores pequeños. No se ejecutó entrenamiento real, no se descargaron pesos y no se accedió ni se generaron datos o outputs reales para producir esta documentación.
 
 ## Resultados de entrenamiento
 

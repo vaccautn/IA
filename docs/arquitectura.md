@@ -1,6 +1,6 @@
 # Arquitectura
 
-`IA` contiene un prototipo de detección de bovinos, un núcleo de reglas desacoplado y un builder transaccional para preparar el dataset ordinal BCS. La detección HTTP actual y el core `vacca_vision` son caminos relacionados, pero no están conectados entre sí.
+`IA` contiene un prototipo de detección de bovinos, un núcleo de reglas desacoplado y un pipeline ordinal BCS versionado para preparar datos, entrenar un modelo CORAL y conservar checkpoints reanudables. La detección HTTP actual y los caminos `vacca_vision`/`vacca_bcs` son relacionados, pero no están conectados entre sí.
 
 ## Mapa de responsabilidades
 
@@ -9,10 +9,10 @@
 | `src/vacca_api/` | Adaptador FastAPI, carga del detector YOLO, esquemas HTTP y UI de prototipo. | `main.py`, `detection.py`, `schemas.py` |
 | `src/vacca_vision/` | Contratos de detección, validación de imágenes, reglas de aptitud y adaptador Ultralytics. | `contracts.py`, `image_validation.py`, `pipeline.py`, `ultralytics_adapter.py` |
 | `scripts/run_baseline.py` | Ejecuta el camino validado por manifiesto: snapshot, detector, pipeline y salida JSON. | `configs/baseline_manifest.json` |
-| `src/vacca_bcs/` comprometido | Construcción segura y reproducible del dataset ordinal. | `dataset_topology.py`, `dataset_build_plan.py`, `dataset_snapshot.py`, `dataset_recovery.py`, `dataset_transaction.py` |
-| Inferencia ordinal BCS futura | Planificada, no versionada en esta rama | El PRD respalda la intención de incorporar inferencia ordinal BCS en una fase posterior; no define una arquitectura de modelo ni un contrato de score/API. |
-| Entrenamiento y reanudación ordinales | Planificados, no versionados en esta rama | La arquitectura de entrenamiento y el diseño de resume quedan fuera del estado comprometido y aprobado actual. |
-| `tests/` | Gates de contratos, baseline, pipeline y builder comprometidos | Archivos `test_*.py` versionados en la rama. |
+| `src/vacca_bcs/` comprometido | Dataset ordinal seguro y pipeline de modelo/transformaciones. | `constants.py`, `dataset.py`, `model.py` y módulos `dataset_*` |
+| Modelo ordinal BCS | Versionado y probado con fixtures temporales; no es serving HTTP. | `BCSOrdinalModel`, `CORALHead`, `coral_loss` y `predict` en `model.py` |
+| Entrenamiento y reanudación ordinales | Código, configuración y pruebas versionados; no hay una ejecución real comprometida. | `scripts/train_bcs_ordinal.py`, `configs/training_bcs_ordinal.yaml` y artefactos `weights/last.pt`/`run_info.json` sólo cuando una operación local los genera |
+| `tests/` | Gates de contratos, baseline, pipeline, builder y BCS ordinal. | Archivos `test_*.py` versionados en la rama, incluidos los caminos reales temporales |
 
 ## Flujo actual de detección HTTP
 
@@ -55,6 +55,10 @@ copiar → validar bytes staged → SHA-256 → manifest.json
 recuperación/publicación del árbol completo
     ↓
 data/bcs-cls/{train,val,...}
+    ↓
+Letterbox + normalización → ResNet18 + cabeza CORAL
+    ↓
+score BCS fraccionario → results.csv / best.pt / last.pt / run_info.json
 ```
 
 - `dataset_topology.py` rechaza solapamientos entre fuente y destino y puntos de reanálisis inseguros.
@@ -65,13 +69,15 @@ data/bcs-cls/{train,val,...}
 
 El manifiesto registra entradas de builder, escala y mapeo de clases, archivos seleccionados con fuente/destino/digest, y conteos por split y clase. `data/` está ignorado por Git: tanto el dataset generado como `data/bcs-cls/manifest.json` permanecen fuera del seguimiento Git aunque su esquema tenga versión.
 
-El builder comprometido usa exactamente `3.25`, `3.5`, `3.75`, `4.0` y `4.25` como etiquetas de clase del dataset. Esa configuración sólo define la preparación de datos; no establece la arquitectura futura del modelo ordinal ni el contrato de score/API.
+El builder comprometido usa exactamente `3.25`, `3.5`, `3.75`, `4.0` y `4.25` como etiquetas de clase del dataset. El modelo ordinal versionado consume ese orden; ni el builder ni el modelo implementan todavía el contrato HTTP de `/bcs`.
+
+El dataset por carpetas conserva esas cinco clases ordenadas. `dataset.py` aplica letterbox cuadrado, aumentos sólo en entrenamiento y normalización ImageNet; `model.py` usa ResNet18 sin pesos descargados en las pruebas y una cabeza CORAL con umbrales ordenados. El modelo y el trainer mantienen scores fraccionarios en pasos de `0.25`. El trainer registra la configuración, el manifiesto vivo y la identidad real del runtime —Python, Torch, Torchvision, CUDA/cuDNN y GPU cuando corresponde— para rechazar resumes incompatibles.
 
 ## Frontera BCS futura
 
-La frontera de serving BCS todavía no está implementada. El código actual sólo deja `POST /bcs` como placeholder. El PRD respalda la intención de incorporar inferencia ordinal BCS en el futuro, pero la arquitectura del modelo, el artefacto de pesos, el contrato de serving/score y la política de errores todavía no están versionados ni aprobados.
+La frontera de serving BCS todavía no está implementada. El código actual sólo deja `POST /bcs` como placeholder; no carga `BCSOrdinalModel` ni calcula un score.
 
-El PRD menciona inferencia ordinal de condición corporal como una fase posterior, pero no selecciona CORAL, una escala concreta ni un diseño de reanudación. Esas decisiones permanecen pendientes y no constituyen una ruta operativa.
+La integración futura aprobada sólo podrá exponer un score entero en `1..5`, con redondeo decimal half-down en el límite del endpoint (un empate exacto `.5` baja, por ejemplo `3.5 → 3`). Ese contrato no cambia la escala fraccionaria interna ni implementa todavía `/bcs`.
 
 ## Relación con el backend
 

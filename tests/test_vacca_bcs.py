@@ -1,22 +1,44 @@
 from __future__ import annotations
 
-from pathlib import Path
-import sys
-import pytest
-import torch
-from PIL import Image
-import os
-import subprocess
-import yaml
+import csv
 import hashlib
 import json
+import os
 import random
-import csv
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+import yaml
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.train_bcs_ordinal import (  # noqa: E402
+    RESULTS_FIELDNAMES,
+    RESUMABLE_CHECKPOINT_FIELDS,
+    _build_last_checkpoint,
+    _build_provenance,
+    _runtime_identity,
+    _capture_rng_state,
+    _atomic_write_json,
+    _atomic_torch_save,
+    _load_resume_checkpoint,
+    _open_results_csv,
+    _prepare_output_dir,
+    _reconcile_results_csv,
+    _restore_model_state,
+    _restore_optimizer_state,
+    _restore_rng_state,
+    set_seed,
+    load_config,
+)
+from scripts.train_bcs_ordinal import main as train_main  # noqa: E402
+import scripts.train_bcs_ordinal as trainer  # noqa: E402
 from vacca_bcs.constants import CLASS_NAMES  # noqa: E402
 from vacca_bcs.dataset import BCSFolderDataset, Letterbox, build_transforms  # noqa: E402
 from vacca_bcs.model import (  # noqa: E402
@@ -26,28 +48,7 @@ from vacca_bcs.model import (  # noqa: E402
     encode_levels,
     predict,
 )
-import scripts.train_bcs_ordinal as trainer  # noqa: E402
-from scripts.train_bcs_ordinal import load_config, set_seed  # noqa: E402
-from scripts.train_bcs_ordinal import _build_provenance, _runtime_identity  # noqa: E402
-from scripts.train_bcs_ordinal import (  # noqa: E402
-    _atomic_torch_save,
-    _atomic_write_json,
-    _capture_rng_state,
-    _prepare_output_dir,
-    _restore_rng_state,
-)
-from scripts.train_bcs_ordinal import (  # noqa: E402
-    RESULTS_FIELDNAMES,
-    _open_results_csv,
-    _reconcile_results_csv,
-)
-from scripts.train_bcs_ordinal import (  # noqa: E402
-    RESUMABLE_CHECKPOINT_FIELDS,
-    _build_last_checkpoint,
-    _load_resume_checkpoint,
-    _restore_model_state,
-    _restore_optimizer_state,
-)
+
 
 def test_coral_level_encoding_for_all_classes() -> None:
     levels = torch.arange(5)
@@ -112,6 +113,7 @@ def test_coral_head_produces_ordered_logits() -> None:
     class_idx, scores = predict(logits)
     assert torch.all((class_idx >= 0) & (class_idx < len(CLASS_NAMES)))
     assert torch.all((scores >= 3.25) & (scores <= 4.25))
+
 
 def test_real_dataset_transforms_and_model_training_step(tmp_path: Path) -> None:
     torch.manual_seed(11)
@@ -181,6 +183,8 @@ def test_real_dataset_transforms_and_model_training_step(tmp_path: Path) -> None
         for value in state.values()
         if isinstance(value, torch.Tensor)
     )
+
+
 def _write_config(tmp_path: Path, name: str = "config.yaml", **overrides: object) -> Path:
     config = {
         "data_dir": "data/bcs-cls",
@@ -239,6 +243,7 @@ def test_load_config_rejects_warmup_longer_than_training(tmp_path: Path) -> None
     with pytest.raises(ValueError, match="warmup_epochs"):
         load_config(_write_config(tmp_path, epochs=2, warmup_epochs=3))
 
+
 def _seed_run_artifacts(output_dir: Path) -> None:
     weights_dir = output_dir / "weights"
     weights_dir.mkdir(parents=True)
@@ -267,6 +272,17 @@ def test_prepare_output_dir_allows_empty_fresh_dir(tmp_path: Path) -> None:
     output_dir = tmp_path / "new-run"
     _prepare_output_dir(output_dir, overwrite=False)
     assert output_dir.is_dir()
+
+
+def test_main_fails_clearly_when_output_exists(tmp_path: Path, capsys) -> None:
+    output_dir = tmp_path / "run"
+    _seed_run_artifacts(output_dir)
+    config_path = _write_config(tmp_path, output=str(output_dir))
+    exit_code = train_main(["--config", str(config_path)])
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "--overwrite" in captured.err
+    assert "--resume" in captured.err
 
 
 def test_last_checkpoint_roundtrip_restores_training_state(tmp_path: Path) -> None:
@@ -400,6 +416,7 @@ def test_run_info_cleanup_failure_preserves_fsync_error(tmp_path: Path, monkeypa
         _atomic_write_json({"complete": True}, path)
     assert path.read_bytes() == b"prior-run-info"
 
+
 def test_resume_restores_python_and_torch_cpu_rng_state() -> None:
     random.seed(123)
     torch.manual_seed(123)
@@ -508,6 +525,7 @@ def test_resume_accepts_valid_cpu_only_rng_metadata(tmp_path: Path) -> None:
     loaded = _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
     assert loaded["rng_state"]["cuda"] is None
 
+
 def test_resume_rejects_best_only_checkpoint(tmp_path: Path) -> None:
     model = torch.nn.Linear(3, 2)
     path = tmp_path / "best.pt"
@@ -587,6 +605,8 @@ def test_restore_model_state_rejects_shape_mismatch(tmp_path: Path) -> None:
     incompatible = torch.nn.Linear(5, 2)
     with pytest.raises(ValueError, match="does not match"):
         _restore_model_state(incompatible, checkpoint)
+
+
 def _results_row(epoch: int) -> dict[str, str]:
     return {
         "epoch": str(epoch),
@@ -892,6 +912,7 @@ def test_validate_computes_mae_with_canonical_score_step(monkeypatch) -> None:
     metrics = trainer._validate(_FixedLogitsModel(), loader, torch.device("cpu"))
     assert metrics["mae"] == pytest.approx(2.0)
 
+
 def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -> dict[str, object]:
     data_dir = tmp_path / "dataset"
     selected_files = []
@@ -976,6 +997,7 @@ def test_cuda_runtime_identity_records_version_and_gpu_facts(monkeypatch) -> Non
     assert identity["cuda_device_count"] == 2
     assert identity["gpu_names"] == ["controlled-gpu-0", "controlled-gpu-1"]
 
+
 def test_resume_roundtrip_rejects_runtime_identity_drift(tmp_path: Path) -> None:
     config = _tiny_training_config(tmp_path, tmp_path / "run")
     provenance = _build_provenance(
@@ -1015,6 +1037,8 @@ def test_resume_roundtrip_rejects_runtime_identity_drift(tmp_path: Path) -> None
             total_epochs=3,
             expected_provenance=drifted,
         )
+
+
 @pytest.mark.parametrize("mutation", ["added", "missing", "escaping"])
 def test_dataset_provenance_rejects_inconsistent_live_membership(
     tmp_path: Path, mutation: str
@@ -1037,6 +1061,7 @@ def test_dataset_provenance_rejects_inconsistent_live_membership(
             output_dir=Path(config["output"]),
             device=torch.device("cpu"),
         )
+
 
 def _seed_prior_training_artifacts(output: Path) -> dict[Path, bytes]:
     artifacts = {
@@ -1179,6 +1204,60 @@ def test_interrupted_and_resumed_workflow_matches_uninterrupted_run(
     assert (interrupted_output / "results.csv").read_bytes() == (
         baseline_output / "results.csv"
     ).read_bytes()
+
+
+def test_terminal_checkpoint_resume_finalizes_run_info_without_overwrite(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output)
+    config["epochs"] = 1
+    _install_tiny_training_fakes(monkeypatch, [])
+    real_atomic_save = trainer._atomic_torch_save
+
+    def interrupt_after_terminal_save(payload, path):
+        real_atomic_save(payload, path)
+        if path.name == "last.pt":
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(trainer, "_atomic_torch_save", interrupt_after_terminal_save)
+    with pytest.raises(KeyboardInterrupt):
+        trainer.train(config, overwrite=True)
+    assert not (output / "run_info.json").exists()
+
+    result = trainer.train(config, resume=output / "weights" / "last.pt")
+
+    assert result["run_info"]["finalized_from_terminal_checkpoint"] is True
+    assert (output / "run_info.json").is_file()
+
+
+def test_resume_stops_at_restored_patience_boundary(tmp_path: Path, monkeypatch) -> None:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output, patience=1)
+    calls: list[float] = []
+    _install_tiny_training_fakes(monkeypatch, calls)
+    data_dir = Path(config["data_dir"])
+    device = torch.device("cpu")
+    provenance = _build_provenance(config, data_dir=data_dir, output_dir=output, device=device)
+    model = _TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model,
+        optimizer,
+        epoch=1,
+        best_mae=0.25,
+        epochs_without_improvement=1,
+        config=config,
+        provenance=provenance,
+    )
+    _atomic_torch_save(checkpoint, output / "weights" / "last.pt")
+    _write_results_history(output / "results.csv", [1])
+
+    result = trainer.train(config, resume=output / "weights" / "last.pt")
+
+    assert calls == []
+    assert result["final_metrics"] == {}
+
 
 def test_set_seed_requires_deterministic_torch_algorithms(monkeypatch) -> None:
     calls: list[bool] = []

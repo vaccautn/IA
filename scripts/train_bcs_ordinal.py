@@ -1,26 +1,26 @@
 """Train and validate the VACCA ordinal BCS ResNet18 model."""
 from __future__ import annotations
 
-import math
-import os
-import random
-import sys
-from pathlib import Path
-from typing import Any
-import hashlib
-import json
-import platform
+import argparse
 import csv
 import datetime as dt
+import hashlib
+import json
+import math
+import os
+import platform
+import random
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, replace
-from typing import TextIO
-from torch import Tensor
-from torch.utils.data import DataLoader
+from pathlib import Path
+from typing import Any, TextIO
+
 
 _CUBLAS_WORKSPACE_CONFIG = "CUBLAS_WORKSPACE_CONFIG"
 _ACCEPTED_CUBLAS_WORKSPACE_CONFIGS = {":4096:8", ":16:8"}
+
 
 def _configure_cublas_determinism() -> None:
     configured = os.environ.get(_CUBLAS_WORKSPACE_CONFIG)
@@ -37,13 +37,15 @@ def _configure_cublas_determinism() -> None:
 _configure_cublas_determinism()
 
 import torch
-import yaml  # type: ignore[import-untyped]
 import torchvision
+import yaml  # type: ignore[import-untyped]
+from torch import Tensor
+from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from vacca_bcs.constants import (
+from vacca_bcs.constants import (  # noqa: E402
     CLASS_NAMES,
     IMAGE_EXTENSIONS,
     MANIFEST_FILENAME,
@@ -51,8 +53,8 @@ from vacca_bcs.constants import (
     SCORE_STEP,
     SPLITS,
 )
-from vacca_bcs.dataset import BCSFolderDataset
-from vacca_bcs.model import BCSOrdinalModel, coral_loss, predict
+from vacca_bcs.dataset import BCSFolderDataset  # noqa: E402
+from vacca_bcs.model import BCSOrdinalModel, coral_loss, predict  # noqa: E402
 
 RESULTS_FIELDNAMES = [
     "epoch",
@@ -62,6 +64,7 @@ RESULTS_FIELDNAMES = [
     "val_pm1_acc",
     "val_mae",
 ]
+
 RESUMABLE_CHECKPOINT_FIELDS = {
     "model_state_dict",
     "optimizer_state_dict",
@@ -73,11 +76,17 @@ RESUMABLE_CHECKPOINT_FIELDS = {
     "provenance",
     "rng_state",
 }
+
+
 def _resolve_path(raw: str | Path) -> Path:
     path = Path(raw)
     return path if path.is_absolute() else (ROOT / path).resolve()
+
+
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def load_config(config_path: Path) -> dict[str, Any]:
     with config_path.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -163,6 +172,8 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
+
+
 def _canonical_json(value: Any) -> str:
     try:
         return json.dumps(
@@ -400,6 +411,8 @@ def _validate_provenance(
                 f"Resume provenance mismatch for {key}: checkpoint has {saved.get(key)!r}, "
                 f"active run has {expected[key]!r}. Use the matching config and dataset manifest."
             )
+
+
 def _capture_rng_state() -> dict[str, Any]:
     cuda_states: list[Tensor] | None = None
     cuda_device_count = 0
@@ -601,6 +614,8 @@ def _open_results_csv(
     writer = csv.DictWriter(handle, fieldnames=RESULTS_FIELDNAMES)
     writer.writeheader()
     return handle, writer
+
+
 def _atomic_write_results_prefix(path: Path, rows: list[list[str]]) -> None:
     descriptor, raw_temp_path = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -755,6 +770,8 @@ def _reconcile_results_csv(results_path: Path, *, checkpoint_epoch: int) -> int:
             f" época {checkpoint_epoch} para coincidir con el checkpoint."
         )
     return checkpoint_epoch
+
+
 def _build_last_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -911,6 +928,8 @@ def _restore_optimizer_state(
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
                     state[key] = value.to(device)
+
+
 def _lr_factor(epoch: int, epochs: int, warmup_epochs: int) -> float:
     if warmup_epochs > 0 and epoch < warmup_epochs:
         return (epoch + 1) / warmup_epochs
@@ -988,6 +1007,8 @@ def _validate(
         "recall": recalls,
         "total": total,
     }
+
+
 def train(
     config: dict[str, Any],
     *,
@@ -1197,3 +1218,55 @@ def train(
         "best_mae": best_mae,
         "output_dir": output_dir,
     }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train the VACCA ordinal BCS model")
+    parser.add_argument("--config", required=True, help="YAML training configuration")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--output", default=None)
+    guard = parser.add_mutually_exclusive_group()
+    guard.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete existing run artifacts in the output directory and start fresh",
+    )
+    guard.add_argument(
+        "--resume",
+        default=None,
+        help="Path to a resumable weights/last.pt checkpoint to continue training",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    config_path = _resolve_path(args.config)
+    if not config_path.is_file():
+        print(f"[ERROR] Config file not found: {config_path}", file=sys.stderr)
+        return 1
+    try:
+        config = load_config(config_path)
+        overrides = {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "device": args.device,
+            "data_dir": args.data_dir,
+            "output": args.output,
+        }
+        for key, value in overrides.items():
+            if value is not None:
+                config[key] = value
+        resume_path = _resolve_path(args.resume) if args.resume else None
+        train(config, resume=resume_path, overwrite=args.overwrite)
+    except (FileExistsError, FileNotFoundError, RuntimeError, ValueError, yaml.YAMLError) as exc:
+        print(f"[ERROR] Training failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
