@@ -1038,6 +1038,148 @@ def test_dataset_provenance_rejects_inconsistent_live_membership(
             device=torch.device("cpu"),
         )
 
+def _seed_prior_training_artifacts(output: Path) -> dict[Path, bytes]:
+    artifacts = {
+        output / "results.csv": b"prior-results",
+        output / "run_info.json": b"prior-run-info",
+        output / "weights" / "best.pt": b"prior-best",
+        output / "weights" / "last.pt": b"prior-last",
+    }
+    for path, content in artifacts.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    return artifacts
+
+
+def _assert_artifacts_unchanged(artifacts: dict[Path, bytes]) -> None:
+    assert {path: path.read_bytes() for path in artifacts} == artifacts
+
+
+def test_overwrite_invalid_manifest_preserves_prior_artifacts(tmp_path: Path) -> None:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output)
+    artifacts = _seed_prior_training_artifacts(output)
+    manifest_path = Path(config["data_dir"]) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["selected_files"] = []
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="membership"):
+        trainer.train(config, overwrite=True)
+    _assert_artifacts_unchanged(artifacts)
+
+
+def test_overwrite_unsupported_optimizer_preserves_prior_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output)
+    config["optimizer"] = "SGD"
+    artifacts = _seed_prior_training_artifacts(output)
+    _install_tiny_training_fakes(monkeypatch, [])
+
+    with pytest.raises(ValueError, match="Unsupported optimizer"):
+        trainer.train(config, overwrite=True)
+    _assert_artifacts_unchanged(artifacts)
+
+
+class _TinyDataset:
+    class_counts = {name: 1 for name in CLASS_NAMES}
+
+    def __init__(self, root, **kwargs) -> None:
+        self.root = root
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, index: int):
+        return torch.zeros(1), 0
+
+
+class _TinyModel(torch.nn.Module):
+    def __init__(self, pretrained: bool = False) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+
+def _install_tiny_training_fakes(monkeypatch, calls: list[float], interrupt_at: int | None = None) -> None:
+    monkeypatch.setattr(trainer, "BCSFolderDataset", _TinyDataset)
+    monkeypatch.setattr(trainer, "BCSOrdinalModel", _TinyModel)
+    call_count = 0
+
+    def fake_train(model, loader, optimizer, device) -> float:
+        nonlocal call_count
+        call_count += 1
+        if interrupt_at == call_count:
+            raise KeyboardInterrupt()
+        target = random.random() + float(torch.rand(1).item())
+        target_tensor = torch.tensor(target)
+        optimizer.zero_grad(set_to_none=True)
+        (model.weight - target_tensor).pow(2).sum().backward()
+        optimizer.step()
+        calls.append(target)
+        return float((model.weight.detach() - target_tensor).abs().item())
+
+    def fake_validate(model, loader, device) -> dict[str, object]:
+        return {
+            "exact_acc": 0.5,
+            "pm1_acc": 1.0,
+            "mae": 0.25,
+            "recall": {name: 0.0 for name in CLASS_NAMES},
+            "total": 1,
+        }
+
+    monkeypatch.setattr(trainer, "_train_epoch", fake_train)
+    monkeypatch.setattr(trainer, "_validate", fake_validate)
+
+
+def test_public_resume_rejects_changed_dataset_manifest(tmp_path: Path, monkeypatch) -> None:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output)
+    _install_tiny_training_fakes(monkeypatch, [], interrupt_at=2)
+    with pytest.raises(KeyboardInterrupt):
+        trainer.train(config, overwrite=True)
+    config["lr"] = 0.02
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        trainer.train(config, resume=output / "weights" / "last.pt")
+    config["lr"] = 0.01
+    live_file = Path(config["data_dir"]) / "train" / CLASS_NAMES[0] / "fixture.jpg"
+    live_file.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        trainer.train(config, resume=output / "weights" / "last.pt")
+
+
+def test_interrupted_and_resumed_workflow_matches_uninterrupted_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    interrupted_output = tmp_path / "interrupted"
+    interrupted_config = _tiny_training_config(tmp_path, interrupted_output)
+    resumed_calls: list[float] = []
+    _install_tiny_training_fakes(monkeypatch, resumed_calls, interrupt_at=2)
+    with pytest.raises(KeyboardInterrupt):
+        trainer.train(interrupted_config, overwrite=True)
+
+    baseline_output = tmp_path / "baseline"
+    baseline_config = _tiny_training_config(tmp_path, baseline_output)
+    baseline_calls: list[float] = []
+    _install_tiny_training_fakes(monkeypatch, baseline_calls)
+    trainer.train(baseline_config, overwrite=True)
+    assert "provenance" in torch.load(
+        baseline_output / "weights" / "best.pt", map_location="cpu", weights_only=True
+    )
+
+    resumed_calls.clear()
+    _install_tiny_training_fakes(monkeypatch, resumed_calls)
+    trainer.train(
+        interrupted_config,
+        resume=interrupted_output / "weights" / "last.pt",
+    )
+
+    assert resumed_calls == pytest.approx(baseline_calls[1:])
+    assert (interrupted_output / "results.csv").read_bytes() == (
+        baseline_output / "results.csv"
+    ).read_bytes()
+
 def test_set_seed_requires_deterministic_torch_algorithms(monkeypatch) -> None:
     calls: list[bool] = []
     monkeypatch.setattr(trainer.torch.cuda, "is_available", lambda: True)

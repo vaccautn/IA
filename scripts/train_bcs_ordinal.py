@@ -988,3 +988,212 @@ def _validate(
         "recall": recalls,
         "total": total,
     }
+def train(
+    config: dict[str, Any],
+    *,
+    resume: Path | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    _validate_training_config(config)
+    total_epochs = int(config["epochs"])
+    set_seed(int(config["seed"]))
+    device = resolve_device(str(config["device"]))
+    data_dir = _resolve_path(config["data_dir"])
+    output_dir = _resolve_path(config["output"])
+
+    start_epoch = 0
+    best_mae = float("inf")
+    epochs_without_improvement = 0
+    checkpoint: dict[str, Any] | None = None
+
+    if resume is None:
+        if _existing_run_artifacts(output_dir) and not overwrite:
+            _prepare_output_dir(output_dir, overwrite=False)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    provenance = _build_provenance(
+        config, data_dir=data_dir, output_dir=output_dir, device=device
+    )
+    if resume is not None:
+        checkpoint = _load_resume_checkpoint(
+            resume,
+            expected_classes=list(CLASS_NAMES),
+            total_epochs=total_epochs,
+            expected_provenance=provenance,
+        )
+        _restore_rng_state(checkpoint)
+        start_epoch = int(checkpoint["epoch"])
+        best_mae = float(checkpoint["best_mae"])
+        epochs_without_improvement = int(checkpoint["epochs_without_improvement"])
+        print(
+            f"[INFO] Reanudando desde {resume}: época {start_epoch} completada, "
+            f"mejor MAE={best_mae:.4f} BCS. Objetivo total: {total_epochs} épocas."
+        )
+
+    weights_dir = output_dir / "weights"
+
+    train_dataset = BCSFolderDataset(
+        data_dir / "train", train=True, imgsz=int(config["imgsz"])
+    )
+    val_dataset = BCSFolderDataset(
+        data_dir / "val", train=False, imgsz=int(config["imgsz"])
+    )
+    started_at = _utc_now()
+    started_time = time.perf_counter()
+    run_info_context = RunInfoContext(
+        config=config,
+        data_dir=data_dir,
+        output_dir=output_dir,
+        device=device,
+        provenance=provenance,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        started_at=started_at,
+        started_time=started_time,
+        resume=resume,
+        start_epoch=start_epoch,
+    )
+    results_path = output_dir / "results.csv"
+    if checkpoint is not None:
+        _reconcile_results_csv(results_path, checkpoint_epoch=start_epoch)
+        if start_epoch == total_epochs:
+            run_info = _build_run_info(
+                replace(run_info_context, terminal_finalization=True)
+            )
+            _atomic_write_json(run_info, output_dir / "run_info.json")
+            return {
+                "run_info": run_info,
+                "final_metrics": {},
+                "best_mae": best_mae,
+                "output_dir": output_dir,
+            }
+    loader_kwargs = {
+        "batch_size": int(config["batch_size"]),
+        "num_workers": int(config["num_workers"]),
+        "pin_memory": device.type == "cuda",
+    }
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+
+    model = BCSOrdinalModel(pretrained=checkpoint is None).to(device)
+    optimizer_name = str(config["optimizer"]).lower()
+    if optimizer_name != "adamw":
+        raise ValueError(f"Unsupported optimizer: {config['optimizer']}")
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(config["lr"]),
+        weight_decay=float(config["weight_decay"]),
+    )
+    if checkpoint is not None:
+        _restore_model_state(model, checkpoint)
+        _restore_optimizer_state(optimizer, checkpoint, device=device)
+        _restore_rng_state(checkpoint)
+    if resume is None:
+        _prepare_output_dir(output_dir, overwrite=overwrite)
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    epoch_range = range(start_epoch, total_epochs)
+    if checkpoint is not None and epochs_without_improvement >= int(config["patience"]):
+        print(
+            f"[INFO] Early stopping already reached at epoch {start_epoch}; "
+            "no additional epoch was run."
+        )
+        epoch_range = range(0)
+
+    csv_file, writer = _open_results_csv(results_path, append=checkpoint is not None)
+    final_metrics: dict[str, Any] = {}
+    train_loss = 0.0
+    with csv_file:
+        for epoch in epoch_range:
+            current_lr = float(config["lr"]) * _lr_factor(
+                epoch,
+                total_epochs,
+                int(config.get("warmup_epochs", 2)),
+            )
+            _set_learning_rate(optimizer, current_lr)
+            train_loss = _train_epoch(model, train_loader, optimizer, device)
+            metrics = _validate(model, val_loader, device)
+            final_metrics = metrics
+            writer.writerow(
+                {
+                    "epoch": epoch + 1,
+                    "lr": f"{current_lr:.10g}",
+                    "train_loss": f"{train_loss:.8f}",
+                    "val_exact_acc": f"{metrics['exact_acc']:.8f}",
+                    "val_pm1_acc": f"{metrics['pm1_acc']:.8f}",
+                    "val_mae": f"{metrics['mae']:.8f}",
+                }
+            )
+            _flush_and_fsync(csv_file)
+            print(
+                f"[ÉPOCA {epoch + 1}/{total_epochs}] "
+                f"loss={train_loss:.5f} "
+                f"exact={metrics['exact_acc']:.4f} "
+                f"±1={metrics['pm1_acc']:.4f} "
+                f"MAE={metrics['mae']:.4f} BCS"
+            )
+            print(
+                "  Recall: "
+                + ", ".join(
+                    f"{class_name}={recall:.3f}"
+                    for class_name, recall in metrics["recall"].items()
+                )
+            )
+
+            if metrics["mae"] < best_mae:
+                best_mae = metrics["mae"]
+                epochs_without_improvement = 0
+                state_dict = {
+                    key: value.detach().cpu()
+                    for key, value in model.state_dict().items()
+                }
+                _atomic_torch_save(
+                    {
+                        "model_state_dict": state_dict,
+                        "config": config,
+                        "classes": list(CLASS_NAMES),
+                        "provenance": provenance,
+                        "epoch": epoch + 1,
+                        "val_mae": best_mae,
+                    },
+                    weights_dir / "best.pt",
+                )
+            else:
+                epochs_without_improvement += 1
+
+            _atomic_torch_save(
+                _build_last_checkpoint(
+                    model,
+                    optimizer,
+                    epoch=epoch + 1,
+                    best_mae=best_mae,
+                    epochs_without_improvement=epochs_without_improvement,
+                    config=config,
+                    provenance=provenance,
+                ),
+                weights_dir / "last.pt",
+            )
+
+            if epochs_without_improvement >= int(config["patience"]):
+                print(f"[INFO] Early stopping en época {epoch + 1}.")
+                break
+
+    run_info = _build_run_info(run_info_context)
+    _atomic_write_json(run_info, output_dir / "run_info.json")
+    print(f"\n[LISTO] Entrenamiento BCS completado en {run_info['wall_time_seconds']:.1f}s.")
+    print(f"  Directorio: {output_dir}")
+    print(f"  Mejor checkpoint: {weights_dir / 'best.pt'}")
+    print(f"  Checkpoint reanudable: {weights_dir / 'last.pt'}")
+    if final_metrics:
+        print(
+            f"  Final: loss={train_loss:.5f}, "
+            f"exact={final_metrics['exact_acc']:.4f}, "
+            f"±1={final_metrics['pm1_acc']:.4f}, "
+            f"MAE={final_metrics['mae']:.4f} BCS"
+        )
+    return {
+        "run_info": run_info,
+        "final_metrics": final_metrics,
+        "best_mae": best_mae,
+        "output_dir": output_dir,
+    }
