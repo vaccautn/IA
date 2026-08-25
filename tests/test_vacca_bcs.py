@@ -8,6 +8,8 @@ from PIL import Image
 import os
 import subprocess
 import yaml
+import hashlib
+import json
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -24,6 +26,7 @@ from vacca_bcs.model import (  # noqa: E402
 )
 import scripts.train_bcs_ordinal as trainer  # noqa: E402
 from scripts.train_bcs_ordinal import load_config, set_seed  # noqa: E402
+from scripts.train_bcs_ordinal import _build_provenance, _runtime_identity  # noqa: E402
 
 def test_coral_level_encoding_for_all_classes() -> None:
     levels = torch.arange(5)
@@ -214,6 +217,113 @@ def test_load_config_rejects_invalid_training_boundaries(
 def test_load_config_rejects_warmup_longer_than_training(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="warmup_epochs"):
         load_config(_write_config(tmp_path, epochs=2, warmup_epochs=3))
+
+def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -> dict[str, object]:
+    data_dir = tmp_path / "dataset"
+    selected_files = []
+    for split in ("train", "val"):
+        for class_name in CLASS_NAMES:
+            class_dir = data_dir / split / class_name
+            class_dir.mkdir(parents=True, exist_ok=True)
+            path = class_dir / "fixture.jpg"
+            content = f"{split}/{class_name}".encode("utf-8")
+            path.write_bytes(content)
+            selected_files.append(
+                {
+                    "source": f"fixture/{split}/{class_name}.jpg",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "split": split,
+                    "destination": f"{split}/{class_name}/fixture.jpg",
+                }
+            )
+    (data_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "manifest_schema_version": 1,
+                "class_values": list(CLASS_NAMES),
+                "class_mapping": {name: index for index, name in enumerate(CLASS_NAMES)},
+                "selected_files": selected_files,
+                "counts": {
+                    split: {name: 1 for name in CLASS_NAMES} for split in ("train", "val")
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "data_dir": str(data_dir),
+        "output": str(output),
+        "epochs": 3,
+        "batch_size": 1,
+        "lr": 0.01,
+        "weight_decay": 0.0,
+        "optimizer": "AdamW",
+        "lr_schedule": "cosine",
+        "warmup_epochs": 0,
+        "patience": patience,
+        "num_workers": 0,
+        "imgsz": 8,
+        "device": "cpu",
+        "seed": 7,
+        "_config_path": str(tmp_path / "config.yaml"),
+    }
+
+
+def test_cpu_runtime_identity_is_canonical_and_does_not_query_cuda(monkeypatch) -> None:
+    def fail_cuda_query(*args, **kwargs):
+        raise AssertionError("CPU runtime identity must not query CUDA")
+
+    monkeypatch.setattr(trainer.torch.cuda, "device_count", fail_cuda_query)
+    monkeypatch.setattr(trainer.torch.cuda, "get_device_name", fail_cuda_query)
+    identity = _runtime_identity(torch.device("cpu"))
+
+    assert identity["python"] == f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    assert identity["torch"] == str(torch.__version__)
+    assert identity["torchvision"] == str(trainer.torchvision.__version__)
+    assert identity["cuda_runtime"] is None
+    assert identity["cudnn"] is None
+    assert identity["cuda_device_count"] == 0
+    assert identity["gpu_names"] == []
+
+
+def test_cuda_runtime_identity_records_version_and_gpu_facts(monkeypatch) -> None:
+    monkeypatch.setattr(trainer.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(
+        trainer.torch.cuda,
+        "get_device_name",
+        lambda index: f"controlled-gpu-{index}",
+    )
+    monkeypatch.setattr(trainer.torch.backends.cudnn, "version", lambda: 9010)
+    identity = _runtime_identity(torch.device("cuda:0"))
+
+    assert identity["cuda_runtime"] == torch.version.cuda
+    assert identity["cudnn"] == 9010
+    assert identity["cuda_device_count"] == 2
+    assert identity["gpu_names"] == ["controlled-gpu-0", "controlled-gpu-1"]
+
+@pytest.mark.parametrize("mutation", ["added", "missing", "escaping"])
+def test_dataset_provenance_rejects_inconsistent_live_membership(
+    tmp_path: Path, mutation: str
+) -> None:
+    config = _tiny_training_config(tmp_path, tmp_path / "out")
+    data_dir = Path(config["data_dir"])
+    manifest_path = data_dir / "manifest.json"
+    if mutation == "added":
+        (data_dir / "train" / CLASS_NAMES[0] / "added.jpg").write_bytes(b"added")
+    elif mutation == "missing":
+        (data_dir / "train" / CLASS_NAMES[0] / "fixture.jpg").unlink()
+    else:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["selected_files"][0]["destination"] = "../escape.jpg"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="membership|unsafe path"):
+        _build_provenance(
+            config,
+            data_dir=data_dir,
+            output_dir=Path(config["output"]),
+            device=torch.device("cpu"),
+        )
 
 def test_set_seed_requires_deterministic_torch_algorithms(monkeypatch) -> None:
     calls: list[bool] = []
