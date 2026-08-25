@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 from pydantic import BaseModel, Field
+
+
+BCSScore = Annotated[int, Field(strict=True, ge=1, le=5)]
 
 
 class BoundingBox(BaseModel):
@@ -50,7 +53,7 @@ class BCSResponse(BaseModel):
         "Currently only cow detection is available at POST /detect."
     )
     cow_detected: Optional[bool] = None
-    bcs_score: Optional[float] = None
+    bcs_score: Optional[BCSScore] = None
 
 
 class HealthResponse(BaseModel):

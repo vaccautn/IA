@@ -1,6 +1,8 @@
 # API de detección
 
-Esta es la guía operativa del servicio FastAPI que existe hoy. Describe la detección de Fase 1 y separa explícitamente el endpoint BCS, que sigue siendo un placeholder.
+**BCS hoy:** `POST /bcs` sigue siendo un placeholder y siempre devuelve `bcs_score: null`; no ejecuta inferencia BCS.
+
+Esta es la guía operativa del servicio FastAPI que existe hoy. La detección de Fase 1 está implementada; la integración futura con el backend aceptará scores finitos en el rango inclusivo `1..5` y usará un score entero con redondeo decimal half-down (los empates exactos `.5` bajan, por ejemplo `3.5 → 3`), sin clamp ni cambio de la precisión fraccionaria del modelo. Esa inferencia futura todavía no está implementada.
 
 ## Camino rápido
 
