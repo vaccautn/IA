@@ -11,6 +11,7 @@ import yaml
 import hashlib
 import json
 import random
+import csv
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -34,6 +35,11 @@ from scripts.train_bcs_ordinal import (  # noqa: E402
     _capture_rng_state,
     _prepare_output_dir,
     _restore_rng_state,
+)
+from scripts.train_bcs_ordinal import (  # noqa: E402
+    RESULTS_FIELDNAMES,
+    _open_results_csv,
+    _reconcile_results_csv,
 )
 
 def test_coral_level_encoding_for_all_classes() -> None:
@@ -378,6 +384,217 @@ def test_resume_rejects_cuda_rng_device_count_mismatch(monkeypatch) -> None:
     monkeypatch.setattr(trainer.torch.cuda, "device_count", lambda: 2)
     with pytest.raises(ValueError, match="device count"):
         _restore_rng_state({"rng_state": state})
+
+def _results_row(epoch: int) -> dict[str, str]:
+    return {
+        "epoch": str(epoch),
+        "lr": "0.001",
+        "train_loss": "1.0",
+        "val_exact_acc": "0.5",
+        "val_pm1_acc": "0.9",
+        "val_mae": "0.25",
+    }
+
+
+def test_results_csv_appends_without_duplicate_header(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    handle, writer = _open_results_csv(results_path, append=False)
+    writer.writerow(_results_row(1))
+    handle.close()
+
+    handle, writer = _open_results_csv(results_path, append=True)
+    writer.writerow(_results_row(2))
+    handle.close()
+
+    with results_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    assert rows[0] == RESULTS_FIELDNAMES
+    assert [row[0] for row in rows[1:]] == ["1", "2"]
+
+
+def test_results_csv_append_on_missing_file_writes_header(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    handle, writer = _open_results_csv(results_path, append=True)
+    writer.writerow(_results_row(1))
+    handle.close()
+
+    with results_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    assert rows[0] == RESULTS_FIELDNAMES
+    assert rows[1][0] == "1"
+
+
+def _write_results_history(path: Path, epochs: list[int]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(RESULTS_FIELDNAMES)
+        for epoch in epochs:
+            writer.writerow([epoch, "0.001", "1.0", "0.5", "0.9", "0.25"])
+
+
+def _read_epoch_sequence(path: Path) -> list[str]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    assert rows[0] == RESULTS_FIELDNAMES
+    return [row[0] for row in rows[1:]]
+
+
+def test_reconcile_truncates_one_row_ahead_history(tmp_path: Path) -> None:
+    # Interruption after the CSV flush but before the last.pt save.
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 2, 3])
+    kept = _reconcile_results_csv(results_path, checkpoint_epoch=2)
+    assert kept == 2
+    assert _read_epoch_sequence(results_path) == ["1", "2"]
+    assert not (tmp_path / "results.csv.tmp").exists()
+
+
+def test_reconcile_discards_partial_one_row_crash_suffix(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    results_path.write_text(
+        ",".join(RESULTS_FIELDNAMES)
+        + "\n1,0.001,1.0,0.5,0.9,0.25\n2,0.001,",
+        encoding="utf-8",
+    )
+    assert _reconcile_results_csv(results_path, checkpoint_epoch=1) == 1
+    assert _read_epoch_sequence(results_path) == ["1"]
+    assert not list(tmp_path.glob(".results.csv.*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("lr", "-0.001"),
+        ("train_loss", "nan"),
+        ("val_exact_acc", "1.1"),
+        ("val_pm1_acc", "-0.1"),
+        ("val_mae", "1.1"),
+    ],
+)
+def test_reconcile_rejects_invalid_complete_expected_suffix(
+    tmp_path: Path, column: str, value: str
+) -> None:
+    row = _results_row(2)
+    row[column] = value
+    results_path = tmp_path / "results.csv"
+    with results_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULTS_FIELDNAMES)
+        writer.writeheader()
+        writer.writerow(_results_row(1))
+        writer.writerow(row)
+    with pytest.raises(ValueError, match=column):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+@pytest.mark.parametrize("torn_suffix", ["\n", "2,", "12"])
+def test_reconcile_discards_torn_suffix_without_complete_epoch(
+    tmp_path: Path, torn_suffix: str
+) -> None:
+    results_path = tmp_path / "results.csv"
+    results_path.write_text(
+        ",".join(RESULTS_FIELDNAMES)
+        + "\n1,0.001,1.0,0.5,0.9,0.25\n"
+        + torn_suffix,
+        encoding="utf-8",
+    )
+    assert _reconcile_results_csv(results_path, checkpoint_epoch=1) == 1
+    assert _read_epoch_sequence(results_path) == ["1"]
+
+
+def test_reconcile_rejects_complete_wrong_epoch_suffix(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 12])
+    with pytest.raises(ValueError, match="unrecoverable suffix"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+def test_reconcile_rejects_complete_non_integer_epoch_suffix(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    results_path.write_text(
+        ",".join(RESULTS_FIELDNAMES)
+        + "\n1,0.001,1.0,0.5,0.9,0.25\nabc,0.001,1.0,0.5,0.9,0.25\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unrecoverable complete suffix"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+def test_reconcile_rejects_overfull_suffix(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    with results_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(RESULTS_FIELDNAMES)
+        writer.writerow(list(_results_row(1).values()))
+        writer.writerow([*list(_results_row(2).values()), "extra"])
+    with pytest.raises(ValueError, match="malformed"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+def test_reconcile_rejects_two_rows_beyond_checkpoint(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 2, 3])
+    with pytest.raises(ValueError, match="only one crash-window row"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+def test_reconcile_replace_failure_preserves_prior_csv(tmp_path: Path, monkeypatch) -> None:
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 2])
+    before = results_path.read_bytes()
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(trainer.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+    assert results_path.read_bytes() == before
+    assert not list(tmp_path.glob(".results.csv.*.tmp"))
+
+
+def test_reconcile_fsync_failure_preserves_prior_csv(tmp_path: Path, monkeypatch) -> None:
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 2])
+    before = results_path.read_bytes()
+
+    def fail_fsync(descriptor):
+        raise OSError("csv fsync failure")
+
+    monkeypatch.setattr(trainer.os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="csv fsync failure"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+    assert results_path.read_bytes() == before
+    assert not list(tmp_path.glob(".results.csv.*.tmp"))
+
+
+def test_reconcile_cleanup_failure_preserves_fsync_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 2])
+    before = results_path.read_bytes()
+
+    def fail_fsync(descriptor):
+        raise OSError("csv fsync failure")
+
+    def fail_unlink(self, missing_ok=False):
+        raise OSError("csv cleanup failure")
+
+    monkeypatch.setattr(trainer.os, "fsync", fail_fsync)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    with pytest.raises(OSError, match="csv fsync failure"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+    assert results_path.read_bytes() == before
+
+
+def test_reconcile_accepts_exact_history_without_rewrite(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 2, 3])
+    before = results_path.read_bytes()
+    kept = _reconcile_results_csv(results_path, checkpoint_epoch=3)
+    assert kept == 3
+    assert results_path.read_bytes() == before
+
 
 def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -> dict[str, object]:
     data_dir = tmp_path / "dataset"

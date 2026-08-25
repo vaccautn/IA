@@ -588,3 +588,157 @@ def _open_results_csv(
     writer = csv.DictWriter(handle, fieldnames=RESULTS_FIELDNAMES)
     writer.writeheader()
     return handle, writer
+def _atomic_write_results_prefix(path: Path, rows: list[list[str]]) -> None:
+    descriptor, raw_temp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temp_path = Path(raw_temp_path)
+    try:
+        with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as handle:
+            descriptor = -1
+            writer = csv.writer(handle)
+            writer.writerow(RESULTS_FIELDNAMES)
+            writer.writerows(rows)
+            _flush_and_fsync(handle)
+        os.replace(temp_path, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        if descriptor != -1:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _validate_result_epoch(
+    row: list[str], *, line_number: int, expected_epoch: int
+) -> None:
+    if not row:
+        return
+    try:
+        epoch_value = int(row[0])
+    except ValueError:
+        raise ValueError(
+            f"results.csv line {line_number} has a non-integer epoch: {row[0]!r}"
+        ) from None
+    if epoch_value != expected_epoch:
+        raise ValueError(
+            f"results.csv line {line_number} breaks the contiguous epoch"
+            f" sequence: expected epoch {expected_epoch}, found {epoch_value}"
+            " (gap, duplicate, or missing row)"
+        )
+
+
+def _validate_results_row(row: list[str], *, line_number: int, expected_epoch: int) -> None:
+    if len(row) != len(RESULTS_FIELDNAMES):
+        raise ValueError(
+            f"results.csv line {line_number} is malformed: expected"
+            f" {len(RESULTS_FIELDNAMES)} columns, got {len(row)}"
+        )
+    _validate_result_epoch(row, line_number=line_number, expected_epoch=expected_epoch)
+    metric_domains = {
+        "lr": (0.0, None),
+        "train_loss": (0.0, None),
+        "val_exact_acc": (0.0, 1.0),
+        "val_pm1_acc": (0.0, 1.0),
+        "val_mae": (0.0, SCORE_STEP * (len(CLASS_NAMES) - 1)),
+    }
+    for column, (lower, upper) in metric_domains.items():
+        try:
+            value = float(row[RESULTS_FIELDNAMES.index(column)])
+        except (ValueError, OverflowError):
+            raise ValueError(
+                f"results.csv line {line_number} has a non-numeric {column}:"
+                f" {row[RESULTS_FIELDNAMES.index(column)]!r}"
+            ) from None
+        if not math.isfinite(value) or value < lower or (
+            upper is not None and value > upper
+        ):
+            domain = f"[{lower}, {upper}]" if upper is not None else f">= {lower}"
+            raise ValueError(
+                f"results.csv line {line_number} has an invalid {column} {value!r};"
+                f" expected a finite value {domain}"
+            )
+
+
+def _reconcile_results_csv(results_path: Path, *, checkpoint_epoch: int) -> int:
+    """Reconcile an existing results.csv with a resumed checkpoint epoch.
+
+    The CSV must carry the exact RESULTS_FIELDNAMES header and a contiguous
+    committed prefix 1..checkpoint_epoch. Only one complete or partial final
+    row for checkpoint_epoch + 1 is disposable as the CSV/checkpoint crash
+    window. Older stale checkpoints and malformed committed rows raise.
+    Returns the number of epoch rows kept (always checkpoint_epoch).
+    """
+    if not results_path.is_file():
+        raise FileNotFoundError(
+            "Cannot resume without the matching results history:"
+            f" {results_path}"
+        )
+    with results_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    if not rows:
+        raise ValueError(
+            f"results.csv is empty; expected epochs 1..{checkpoint_epoch}:"
+            f" {results_path}"
+        )
+    if rows[0] != RESULTS_FIELDNAMES:
+        raise ValueError(
+            f"results.csv has an unexpected schema; expected header"
+            f" {RESULTS_FIELDNAMES}: {results_path}"
+        )
+
+    data_rows = rows[1:]
+    for line_number, row in enumerate(data_rows[:checkpoint_epoch], start=2):
+        _validate_result_epoch(row, line_number=line_number, expected_epoch=line_number - 1)
+    if len(data_rows) < checkpoint_epoch:
+        raise ValueError(
+            f"results.csv history ends at epoch {len(data_rows)}, before the"
+            f" checkpoint epoch {checkpoint_epoch}; missing rows cannot be"
+            " recovered"
+        )
+    committed_rows = data_rows[:checkpoint_epoch]
+    for line_number, row in enumerate(committed_rows, start=2):
+        _validate_results_row(row, line_number=line_number, expected_epoch=line_number - 1)
+
+    suffix = data_rows[checkpoint_epoch:]
+    if not suffix:
+        return checkpoint_epoch
+    if len(suffix) != 1:
+        raise ValueError(
+            f"results.csv has {len(suffix)} rows beyond checkpoint epoch "
+            f"{checkpoint_epoch}; only one crash-window row is recoverable"
+        )
+    extra_row = suffix[0]
+    if len(extra_row) > len(RESULTS_FIELDNAMES):
+        raise ValueError(
+            f"results.csv line {checkpoint_epoch + 2} is malformed: expected"
+            f" {len(RESULTS_FIELDNAMES)} columns, got {len(extra_row)}"
+        )
+    if len(extra_row) == len(RESULTS_FIELDNAMES):
+        try:
+            extra_epoch = int(extra_row[0])
+        except ValueError:
+            raise ValueError(
+                f"results.csv has an unrecoverable complete suffix beyond checkpoint "
+                f"epoch {checkpoint_epoch}: non-integer epoch {extra_row[0]!r}"
+            ) from None
+        if extra_epoch != checkpoint_epoch + 1:
+            raise ValueError(
+                f"results.csv has an unrecoverable suffix beyond checkpoint epoch "
+                f"{checkpoint_epoch}; expected disposable epoch {checkpoint_epoch + 1}"
+            )
+        _validate_results_row(
+            extra_row,
+            line_number=checkpoint_epoch + 2,
+            expected_epoch=checkpoint_epoch + 1,
+        )
+    _atomic_write_results_prefix(results_path, committed_rows)
+    if len(data_rows) > checkpoint_epoch:
+        print(
+            f"[INFO] results.csv tenía {len(data_rows)} épocas; truncado a la"
+            f" época {checkpoint_epoch} para coincidir con el checkpoint."
+        )
+    return checkpoint_epoch
