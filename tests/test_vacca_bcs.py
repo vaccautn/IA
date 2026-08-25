@@ -5,6 +5,9 @@ import sys
 import pytest
 import torch
 from PIL import Image
+import os
+import subprocess
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -19,6 +22,8 @@ from vacca_bcs.model import (  # noqa: E402
     encode_levels,
     predict,
 )
+import scripts.train_bcs_ordinal as trainer  # noqa: E402
+from scripts.train_bcs_ordinal import load_config, set_seed  # noqa: E402
 
 def test_coral_level_encoding_for_all_classes() -> None:
     levels = torch.arange(5)
@@ -152,3 +157,139 @@ def test_real_dataset_transforms_and_model_training_step(tmp_path: Path) -> None
         for value in state.values()
         if isinstance(value, torch.Tensor)
     )
+def _write_config(tmp_path: Path, name: str = "config.yaml", **overrides: object) -> Path:
+    config = {
+        "data_dir": "data/bcs-cls",
+        "output": str(tmp_path / "out"),
+        "epochs": 2,
+        "batch_size": 2,
+        "lr": 0.001,
+        "weight_decay": 0.0,
+        "optimizer": "AdamW",
+        "patience": 2,
+        "num_workers": 0,
+        "imgsz": 32,
+        "device": "cpu",
+        "seed": 0,
+    }
+    config.update(overrides)
+    path = tmp_path / name
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    return path
+
+
+def test_load_config_accepts_cosine_or_default_schedule(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path, "a.yaml", lr_schedule="cosine"))
+    assert config["lr_schedule"] == "cosine"
+    default = load_config(_write_config(tmp_path, "b.yaml"))
+    assert default["lr_schedule"] == "cosine"
+
+
+def test_load_config_rejects_unsupported_schedule(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="lr_schedule"):
+        load_config(_write_config(tmp_path, lr_schedule="step"))
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("epochs", 0, "epochs"),
+        ("batch_size", 0, "batch_size"),
+        ("patience", 0, "patience"),
+        ("warmup_epochs", -1, "warmup_epochs"),
+        ("lr", 0, "lr"),
+        ("weight_decay", -0.1, "weight_decay"),
+        ("num_workers", -1, "num_workers"),
+        ("imgsz", 0, "imgsz"),
+        ("seed", -1, "seed"),
+    ],
+)
+def test_load_config_rejects_invalid_training_boundaries(
+    tmp_path: Path, key: str, value: object, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        load_config(_write_config(tmp_path, **{key: value}))
+
+
+def test_load_config_rejects_warmup_longer_than_training(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="warmup_epochs"):
+        load_config(_write_config(tmp_path, epochs=2, warmup_epochs=3))
+
+def test_set_seed_requires_deterministic_torch_algorithms(monkeypatch) -> None:
+    calls: list[bool] = []
+    monkeypatch.setattr(trainer.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(trainer.torch.cuda, "manual_seed_all", lambda seed: None)
+    monkeypatch.setattr(
+        trainer.torch, "use_deterministic_algorithms", lambda enabled: calls.append(enabled)
+    )
+
+    set_seed(7)
+
+    assert calls == [True]
+    assert trainer.torch.backends.cudnn.deterministic is True
+    assert trainer.torch.backends.cudnn.benchmark is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_deterministic_matrix_operation_subprocess() -> None:
+    script = """
+import os
+import scripts.train_bcs_ordinal
+import torch
+
+assert os.environ["CUBLAS_WORKSPACE_CONFIG"] in {":4096:8", ":16:8"}
+left = torch.randn((32, 32), device="cuda")
+right = torch.randn((32, 32), device="cuda")
+left @ right
+torch.cuda.synchronize()
+print("cuda-matmul-ok")
+"""
+    environment = os.environ.copy()
+    environment.pop("CUBLAS_WORKSPACE_CONFIG", None)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "cuda-matmul-ok" in completed.stdout
+
+
+@pytest.mark.parametrize("workspace", [":4096:8", ":16:8"])
+def test_cublas_workspace_config_preserves_accepted_inherited_value(workspace: str) -> None:
+    script = """
+import os
+import scripts.train_bcs_ordinal
+assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == %r
+print("cublas-value-ok")
+""" % workspace
+    environment = os.environ.copy()
+    environment["CUBLAS_WORKSPACE_CONFIG"] = workspace
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "cublas-value-ok" in completed.stdout
+
+
+def test_cublas_workspace_config_rejects_invalid_inherited_value() -> None:
+    environment = os.environ.copy()
+    environment["CUBLAS_WORKSPACE_CONFIG"] = ":invalid"
+    completed = subprocess.run(
+        [sys.executable, "-c", "import scripts.train_bcs_ordinal"],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "Invalid CUBLAS_WORKSPACE_CONFIG" in completed.stderr
