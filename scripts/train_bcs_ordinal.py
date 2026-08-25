@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import TextIO
 from torch import Tensor
+from torch.utils.data import DataLoader
 
 _CUBLAS_WORKSPACE_CONFIG = "CUBLAS_WORKSPACE_CONFIG"
 _ACCEPTED_CUBLAS_WORKSPACE_CONFIGS = {":4096:8", ":16:8"}
@@ -51,6 +52,7 @@ from vacca_bcs.constants import (
     SPLITS,
 )
 from vacca_bcs.dataset import BCSFolderDataset
+from vacca_bcs.model import BCSOrdinalModel, coral_loss, predict
 
 RESULTS_FIELDNAMES = [
     "epoch",
@@ -909,3 +911,80 @@ def _restore_optimizer_state(
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
                     state[key] = value.to(device)
+def _lr_factor(epoch: int, epochs: int, warmup_epochs: int) -> float:
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        return (epoch + 1) / warmup_epochs
+    cosine_epoch = epoch - warmup_epochs
+    cosine_total = max(1, epochs - warmup_epochs)
+    return 0.5 * (1.0 + math.cos(math.pi * cosine_epoch / cosine_total))
+
+
+def _set_learning_rate(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def _train_epoch(
+    model: BCSOrdinalModel,
+    loader: DataLoader[tuple[Tensor, int]],
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> float:
+    model.train()
+    loss_total = 0.0
+    samples = 0
+    for images, levels in loader:
+        images = images.to(device, non_blocking=True)
+        levels = levels.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        loss = coral_loss(model(images), levels)
+        loss.backward()
+        optimizer.step()
+        loss_total += loss.item()
+        samples += levels.shape[0]
+    return loss_total / max(1, samples)
+
+
+@torch.no_grad()
+def _validate(
+    model: BCSOrdinalModel,
+    loader: DataLoader[tuple[Tensor, int]],
+    device: torch.device,
+) -> dict[str, Any]:
+    model.eval()
+    exact = 0
+    plus_minus_one = 0
+    absolute_index_error = 0
+    total = 0
+    class_total = [0] * len(CLASS_NAMES)
+    class_correct = [0] * len(CLASS_NAMES)
+
+    for images, levels in loader:
+        images = images.to(device, non_blocking=True)
+        levels = levels.to(device, non_blocking=True)
+        pred_idx, _ = predict(model(images))
+        errors = (pred_idx - levels).abs()
+        exact += int((errors == 0).sum().item())
+        plus_minus_one += int((errors <= 1).sum().item())
+        absolute_index_error += int(errors.sum().item())
+        total += levels.shape[0]
+        for class_idx in range(len(CLASS_NAMES)):
+            mask = levels == class_idx
+            class_total[class_idx] += int(mask.sum().item())
+            class_correct[class_idx] += int(((pred_idx == class_idx) & mask).sum().item())
+
+    recalls = {
+        class_name: (
+            class_correct[index] / class_total[index]
+            if class_total[index]
+            else 0.0
+        )
+        for index, class_name in enumerate(CLASS_NAMES)
+    }
+    return {
+        "exact_acc": exact / max(1, total),
+        "pm1_acc": plus_minus_one / max(1, total),
+        "mae": SCORE_STEP * absolute_index_error / max(1, total),
+        "recall": recalls,
+        "total": total,
+    }

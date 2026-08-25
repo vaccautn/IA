@@ -424,6 +424,7 @@ def test_resume_rejects_cuda_rng_device_count_mismatch(monkeypatch) -> None:
     with pytest.raises(ValueError, match="device count"):
         _restore_rng_state({"rng_state": state})
 
+
 def test_resume_rejects_malformed_cuda_rng_entry(tmp_path: Path, monkeypatch) -> None:
     model = torch.nn.Linear(3, 2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
@@ -576,6 +577,16 @@ def test_resume_rejects_malformed_checkpoint_metadata(
         _load_resume_checkpoint(path, expected_classes=list(CLASS_NAMES), total_epochs=4)
 
 
+def test_restore_model_state_rejects_shape_mismatch(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model, optimizer, epoch=1, best_mae=0.5,
+        epochs_without_improvement=0, config={"epochs": 4},
+    )
+    incompatible = torch.nn.Linear(5, 2)
+    with pytest.raises(ValueError, match="does not match"):
+        _restore_model_state(incompatible, checkpoint)
 def _results_row(epoch: int) -> dict[str, str]:
     return {
         "epoch": str(epoch),
@@ -786,6 +797,100 @@ def test_reconcile_accepts_exact_history_without_rewrite(tmp_path: Path) -> None
     assert kept == 3
     assert results_path.read_bytes() == before
 
+
+def test_reconcile_rejects_missing_results_file(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="results history"):
+        _reconcile_results_csv(tmp_path / "results.csv", checkpoint_epoch=2)
+
+
+def test_reconcile_rejects_empty_results_file(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    results_path.write_bytes(b"")
+    with pytest.raises(ValueError, match="empty"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+def test_reconcile_rejects_wrong_schema(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    results_path.write_text("epoch,loss\n1,1.0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="schema"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+def test_reconcile_rejects_malformed_row(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    results_path.write_text(
+        ",".join(RESULTS_FIELDNAMES) + "\n1,0.001,1.0,0.5,0.9\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="malformed"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+def test_reconcile_rejects_non_integer_epoch(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    results_path.write_text(
+        ",".join(RESULTS_FIELDNAMES) + "\nabc,0.001,1.0,0.5,0.9,0.25\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="non-integer"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+def test_reconcile_rejects_gapped_history(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 2, 4])
+    with pytest.raises(ValueError, match="contiguous"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=4)
+
+
+def test_reconcile_rejects_duplicate_epoch(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 2, 2])
+    with pytest.raises(ValueError, match="unrecoverable suffix"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=2)
+
+
+def test_reconcile_rejects_history_ending_before_checkpoint(tmp_path: Path) -> None:
+    results_path = tmp_path / "results.csv"
+    _write_results_history(results_path, [1, 2])
+    with pytest.raises(ValueError, match="ends at epoch 2"):
+        _reconcile_results_csv(results_path, checkpoint_epoch=3)
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("train_loss", "nan"), ("val_exact_acc", "1.1"), ("val_mae", "-0.01")],
+)
+def test_reconcile_rejects_invalid_or_impossible_metrics(
+    tmp_path: Path, column: str, value: str
+) -> None:
+    row = _results_row(1)
+    row[column] = value
+    results_path = tmp_path / "results.csv"
+    with results_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULTS_FIELDNAMES)
+        writer.writeheader()
+        writer.writerow(row)
+    with pytest.raises(ValueError, match=column):
+        _reconcile_results_csv(results_path, checkpoint_epoch=1)
+
+
+def test_validate_computes_mae_with_canonical_score_step(monkeypatch) -> None:
+    import scripts.train_bcs_ordinal as trainer
+
+    class _FixedLogitsModel(torch.nn.Module):
+        def forward(self, images: torch.Tensor) -> torch.Tensor:
+            return torch.tensor([[-8.0, -8.0, -8.0, -8.0], [8.0, 8.0, 8.0, 8.0]])
+
+    # Two samples, both off by 4 class indices: MAE = SCORE_STEP * 8 / 2.
+    loader = [(torch.zeros(2, 3, 8, 8), torch.tensor([4, 0]))]
+    metrics = trainer._validate(_FixedLogitsModel(), loader, torch.device("cpu"))
+    assert metrics["mae"] == pytest.approx(1.0)
+
+    monkeypatch.setattr(trainer, "SCORE_STEP", 0.5)
+    metrics = trainer._validate(_FixedLogitsModel(), loader, torch.device("cpu"))
+    assert metrics["mae"] == pytest.approx(2.0)
 
 def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -> dict[str, object]:
     data_dir = tmp_path / "dataset"
