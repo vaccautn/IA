@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
@@ -14,6 +15,13 @@ _SOURCE_KEYS = {"schema_version", "rows"}
 _ROW_KEYS = {"evaluation_id", "session_id", "animal_id", "valor_cc", "evidence"}
 _EVIDENCE_KEYS = {"evidence_id", "storage_key"}
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_SIGNED_URL_KEYS = {
+    "schema_version",
+    "evidence_id",
+    "signed_url",
+    "expires_in_seconds",
+}
 
 
 class BCSSourceClientError(Exception):
@@ -109,6 +117,19 @@ class BCSSourceExport:
         if len(evidence_ids) != len(set(evidence_ids)):
             raise BCSSourceContractError("duplicate evidence_id")
         object.__setattr__(self, "rows", rows)
+
+
+@dataclass(frozen=True, slots=True)
+class BCSEvidencePayload:
+    evidence_id: int
+    payload: bytes
+    sha256: str
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(evidence_id={self.evidence_id!r}, "
+            f"size_bytes={len(self.payload)!r}, sha256={self.sha256!r})"
+        )
 
 
 class HTTPTransport(Protocol):
@@ -224,6 +245,95 @@ def _read_response_body(response: Any, maximum: int) -> bytes:
         _close_response(response)
 
 
+def _request_response(
+    transport: HTTPTransport, url: str, headers: Mapping[str, str], timeout: float
+) -> Any:
+    response = None
+    try:
+        response = transport.get(
+            url,
+            headers=headers,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=False,
+        )
+        status_code = response.status_code
+    except Exception as exc:
+        _close_response(response)
+        raise BCSSourceTransportError(
+            f"bcs source transport failed with {type(exc).__name__}"
+        ) from None
+    if type(status_code) is not int:
+        _close_response(response)
+        raise BCSSourceTransportError("invalid HTTP status code")
+    if not 200 <= status_code < 300:
+        _close_response(response)
+        raise BCSSourceHTTPError(status_code)
+    return response
+
+
+def _decode_json_response(response: Any, maximum: int) -> Any:
+    try:
+        return json.loads(
+            _read_response_body(response, maximum),
+            object_pairs_hook=_reject_duplicate_members,
+        )
+    except BCSSourceClientError:
+        raise
+    except RecursionError:
+        raise BCSSourceContractError("JSON nesting is too deep") from None
+    except (TypeError, ValueError):
+        raise BCSSourceJSONError("bcs source response was not valid JSON") from None
+
+
+def _validate_signed_url(value: str) -> None:
+    if not value or any(char.isspace() or char in r"\@#" for char in value):
+        raise BCSSourceContractError("signed_url is malformed")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        raise BCSSourceContractError("signed_url is malformed") from None
+    if (
+        not hostname
+        or not parsed.netloc
+        or parsed.netloc.endswith(":")
+        or parsed.username
+        or parsed.password
+        or not parsed.query
+        or parsed.scheme.lower() not in {"http", "https"}
+    ):
+        raise BCSSourceContractError("signed_url is malformed")
+    if parsed.scheme.lower() == "http" and hostname.lower() not in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }:
+        raise BCSSourceContractError("insecure remote signed_url is not allowed")
+
+
+def _parse_signed_response(payload: Any, evidence_id: int) -> str:
+    signed = _require_object(payload, "signed evidence response")
+    _require_keys(signed, _SIGNED_URL_KEYS, "signed evidence response")
+    if signed["schema_version"] != SCHEMA_VERSION:
+        raise BCSSourceContractError("schema_version must be bcs-source-v1")
+    if type(signed["evidence_id"]) is not int or signed["evidence_id"] != evidence_id:
+        raise BCSSourceContractError("signed evidence_id does not match request")
+    if (
+        type(signed["expires_in_seconds"]) is not int
+        or not 1 <= signed["expires_in_seconds"] <= 86400
+    ):
+        raise BCSSourceContractError(
+            "expires_in_seconds must be an integer in the range 1..86400"
+        )
+    signed_url = signed["signed_url"]
+    if type(signed_url) is not str:
+        raise BCSSourceContractError("signed_url must be a string")
+    _validate_signed_url(signed_url)
+    return signed_url
+
+
 class BCSSourceClient:
     def __init__(
         self,
@@ -307,39 +417,74 @@ class BCSSourceClient:
         return f"{type(self).__name__}(base_url={self._base_url!r}, timeout={self._timeout!r})"
 
     def fetch(self) -> BCSSourceExport:
-        response = None
-        try:
-            response = self._transport.get(
-                f"{self._base_url}{SOURCE_PATH}",
-                headers={
-                    "Authorization": f"Bearer {self._bearer_token}",
-                    "Accept": "application/json",
-                },
-                timeout=self._timeout,
-                stream=True,
-                allow_redirects=False,
+        response = _request_response(
+            self._transport,
+            f"{self._base_url}{SOURCE_PATH}",
+            {
+                "Authorization": f"Bearer {self._bearer_token}",
+                "Accept": "application/json",
+            },
+            self._timeout,
+        )
+        return _parse_export(_decode_json_response(response, self._max_response_bytes))
+
+
+class BCSEvidenceMaterializer(BCSSourceClient):
+    def __init__(
+        self,
+        backend_base_url: str,
+        bearer_token: str,
+        timeout: float,
+        *,
+        backend_transport: HTTPTransport | None = None,
+        download_transport: HTTPTransport | None = None,
+        max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+    ) -> None:
+        super().__init__(backend_base_url, bearer_token, timeout, backend_transport)
+        if type(max_image_bytes) is not int or max_image_bytes <= 0:
+            raise BCSSourceConfigurationError(
+                "max_image_bytes must be a positive integer"
             )
-            status_code = response.status_code
-        except Exception as exc:
-            _close_response(response)
-            raise BCSSourceTransportError(
-                f"bcs source transport failed with {type(exc).__name__}"
-            ) from None
-        if type(status_code) is not int:
-            _close_response(response)
-            raise BCSSourceTransportError("invalid HTTP status code")
-        if not 200 <= status_code < 300:
-            _close_response(response)
-            raise BCSSourceHTTPError(status_code)
-        try:
-            payload = json.loads(
-                _read_response_body(response, self._max_response_bytes),
-                object_pairs_hook=_reject_duplicate_members,
-            )
-        except BCSSourceClientError:
-            raise
-        except RecursionError:
-            raise BCSSourceContractError("JSON nesting is too deep") from None
-        except (TypeError, ValueError):
-            raise BCSSourceJSONError("bcs source response was not valid JSON") from None
-        return _parse_export(payload)
+        self._max_image_bytes = max_image_bytes
+        self._download_transport = (
+            download_transport if download_transport is not None else requests.Session()
+        )
+        self._owns_download_transport = download_transport is None
+
+    def close(self) -> None:
+        super().close()
+        if self._owns_download_transport:
+            _close_response(self._download_transport)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(backend_base_url={self._base_url!r}, "
+            f"timeout={self._timeout!r}, max_image_bytes={self._max_image_bytes!r})"
+        )
+
+    def materialize(self, evidence_id: int) -> BCSEvidencePayload:
+        if type(evidence_id) is not int or evidence_id <= 0:
+            raise BCSSourceContractError("evidence_id must be a positive integer")
+        signed_response = _request_response(
+            self._transport,
+            f"{self._base_url}{SOURCE_PATH}/evidence/{evidence_id}/signed-url",
+            {
+                "Authorization": f"Bearer {self._bearer_token}",
+                "Accept": "application/json",
+            },
+            self._timeout,
+        )
+        signed_url = _parse_signed_response(
+            _decode_json_response(signed_response, 64 * 1024), evidence_id
+        )
+        download_response = _request_response(
+            self._download_transport, signed_url, {}, self._timeout
+        )
+        payload = _read_response_body(download_response, self._max_image_bytes)
+        if not payload:
+            raise BCSSourceContractError("evidence payload must not be empty")
+        return BCSEvidencePayload(
+            evidence_id=evidence_id,
+            payload=payload,
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )

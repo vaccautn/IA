@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import requests
@@ -7,12 +8,13 @@ import pytest
 import vacca_bcs.source_client as source_client_module
 
 from vacca_bcs.source_client import (
+    BCSEvidenceMaterializer,
+    BCSSourceResponseTooLargeError,
     BCSSourceClient,
     BCSSourceConfigurationError,
     BCSSourceContractError,
     BCSSourceHTTPError,
     BCSSourceJSONError,
-    BCSSourceResponseTooLargeError,
     BCSSourceTransportError,
 )
 
@@ -34,6 +36,8 @@ class FakeResponse:
                 else (
                     b"not-json"
                     if isinstance(payload, Exception)
+                    else payload
+                    if isinstance(payload, bytes)
                     else json.dumps(payload).encode()
                 )
             ]
@@ -470,3 +474,174 @@ def test_client_rejects_invalid_response_limit(max_response_bytes):
             FakeTransport(),
             max_response_bytes=max_response_bytes,
         )
+
+
+def signed_url_body(
+    evidence_id=7,
+    signed_url="https://r2.example/object?sig=abc",
+    expiry=3600,
+    schema_version="bcs-source-v1",
+):
+    return json.dumps(
+        {
+            "schema_version": schema_version,
+            "evidence_id": evidence_id,
+            "signed_url": signed_url,
+            "expires_in_seconds": expiry,
+        }
+    ).encode()
+
+
+def materializer_for(
+    signed_response=None,
+    download_response=None,
+    *,
+    max_image_bytes=None,
+):
+    backend = FakeTransport(signed_response or FakeResponse(signed_url_body()))
+    download = FakeTransport(download_response or FakeResponse(b"image-bytes"))
+    kwargs = {} if max_image_bytes is None else {"max_image_bytes": max_image_bytes}
+    return (
+        BCSEvidenceMaterializer(
+            "https://backend.example/",
+            "backend-token",
+            2.5,
+            backend_transport=backend,
+            download_transport=download,
+            **kwargs,
+        ),
+        backend,
+        download,
+    )
+
+
+def test_materialize_resolves_signed_url_and_keeps_credentials_separate():
+    client, backend, download = materializer_for()
+
+    result = client.materialize(7)
+
+    assert result.evidence_id == 7
+    assert result.payload == b"image-bytes"
+    assert result.sha256 == hashlib.sha256(b"image-bytes").hexdigest()
+    assert backend.calls[0] == (
+        "https://backend.example/api/bcs-source-v1/evidence/7/signed-url",
+        {"Authorization": "Bearer backend-token", "Accept": "application/json"},
+        2.5,
+        True,
+        False,
+    )
+    assert download.calls[0] == (
+        "https://r2.example/object?sig=abc",
+        {},
+        2.5,
+        True,
+        False,
+    )
+    assert "backend-token" not in repr(client)
+    assert "sig=abc" not in repr(result)
+    assert "image-bytes" not in repr(result)
+
+
+@pytest.mark.parametrize("evidence_id", [True, 0, -1, 1.5])
+def test_materialize_requires_positive_strict_evidence_id(evidence_id):
+    client, backend, _ = materializer_for()
+    with pytest.raises(BCSSourceContractError):
+        client.materialize(evidence_id)
+    assert backend.calls == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        signed_url_body(evidence_id=8),
+        signed_url_body(schema_version="other"),
+        json.dumps({"schema_version": "bcs-source-v1", "evidence_id": 7}).encode(),
+        signed_url_body(signed_url="http://remote.example/object?sig=abc"),
+        signed_url_body(signed_url=1),
+        signed_url_body(signed_url="https://user:pass@r2.example/object?sig=abc"),
+        signed_url_body(signed_url=r"https://r2.example/object\escape?sig=abc"),
+        signed_url_body(signed_url="https://r2.example/object#fragment"),
+        signed_url_body(signed_url="https://r2.example/object"),
+        signed_url_body(signed_url="https://r2.example:bad/object?sig=abc"),
+        signed_url_body(expiry=0),
+    ],
+)
+def test_signed_response_domain_is_strict(body):
+    client, _, download = materializer_for(FakeResponse(body))
+    with pytest.raises(BCSSourceContractError):
+        client.materialize(7)
+    assert download.calls == []
+
+
+def test_loopback_http_signed_url_is_allowed():
+    local, _, local_download = materializer_for(
+        FakeResponse(signed_url_body(signed_url="http://127.0.0.1:9000/object?sig=abc"))
+    )
+    assert local.materialize(7).payload == b"image-bytes"
+    assert local_download.calls[0][0].startswith("http://127.0.0.1:9000/")
+
+
+def test_signed_and_download_http_failures_are_closed_and_sanitized():
+    backend_response = FakeResponse(b"secret-token", status_code=503)
+    client, _, _ = materializer_for(backend_response)
+    with pytest.raises(BCSSourceHTTPError) as failure:
+        client.materialize(7)
+    assert backend_response.closed
+    assert "secret-token" not in str(failure.value)
+    download_response = FakeResponse(b"secret-token", status_code=302)
+    client, _, _ = materializer_for(download_response=download_response)
+    with pytest.raises(BCSSourceHTTPError) as failure:
+        client.materialize(7)
+    assert download_response.closed
+    assert "secret-token" not in str(failure.value)
+
+
+def test_download_declared_limit_rejects_before_reading():
+    response = FakeResponse(b"secret-token", headers={"Content-Length": "12"})
+    client, _, _ = materializer_for(download_response=response, max_image_bytes=8)
+    with pytest.raises(BCSSourceResponseTooLargeError) as failure:
+        client.materialize(7)
+    assert response.closed
+    assert response.iter_content_calls == 0
+    assert "secret-token" not in str(failure.value)
+
+
+def test_download_chunk_limit_and_framing_reject_and_close():
+    cases = [
+        (
+            FakeResponse(b"", chunks=[b"safe", b"secret-token"]),
+            BCSSourceResponseTooLargeError,
+        ),
+        (
+            FakeResponse(b"image", headers={"Content-Length": "4"}),
+            BCSSourceTransportError,
+        ),
+        (FakeResponse(b""), BCSSourceContractError),
+    ]
+    for response, error_type in cases:
+        client, _, _ = materializer_for(download_response=response, max_image_bytes=8)
+        with pytest.raises(error_type) as failure:
+            client.materialize(7)
+        assert response.closed
+        assert "secret-token" not in str(failure.value)
+
+
+def test_materializer_closes_only_owned_sessions(monkeypatch):
+    injected_backend, injected_download = FakeTransport(), FakeTransport()
+    BCSEvidenceMaterializer(
+        "https://backend.example",
+        "token",
+        1,
+        backend_transport=injected_backend,
+        download_transport=injected_download,
+    ).close()
+    assert injected_backend.close_calls == injected_download.close_calls == 0
+    owned_download = FakeTransport()
+    monkeypatch.setattr(
+        source_client_module.requests, "Session", lambda: owned_download
+    )
+    with BCSEvidenceMaterializer(
+        "https://backend.example", "token", 1, backend_transport=injected_backend
+    ):
+        pass
+    assert owned_download.close_calls == 1
