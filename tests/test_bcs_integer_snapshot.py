@@ -32,7 +32,10 @@ from vacca_bcs.integer_snapshot import (
     IntegerSnapshotMaterializationError,
     IntegerSnapshotOutputError,
     IntegerSnapshotPublicationError,
+    IntegerSnapshotLegacyManifestError,
+    IntegerSnapshotManifestValidationError,
     build_integer_snapshot,
+    load_integer_snapshot_manifest,
 )
 
 
@@ -88,7 +91,7 @@ def test_builds_jpeg_png_layout_manifest_counts_and_safe_provenance(tmp_path: Pa
         path.relative_to(snapshot.output_root).as_posix()
         for path in snapshot.output_root.rglob("*.png")
     ) == ["train/2/2.png"]
-    assert manifest["manifest_schema_version"] == "bcs-integer-snapshot-v1"
+    assert manifest["manifest_schema_version"] == "bcs-integer-snapshot-v2"
     assert manifest["counts"] == {"train": [1, 1, 0, 0, 0], "val": [0, 0, 0, 0, 0]}
     assert manifest["exclusions"] == []
     assert [record["relative_path"] for record in manifest["records"]] == [
@@ -101,6 +104,99 @@ def test_builds_jpeg_png_layout_manifest_counts_and_safe_provenance(tmp_path: Pa
     assert "unsafe" not in snapshot.manifest_json
     assert "unsafe" not in repr(snapshot)
 
+
+def _manifest_for_validation(tmp_path: Path) -> tuple[Path, dict]:
+    payload = image_bytes("JPEG")
+    snapshot = build_integer_snapshot(
+        split_plan(
+            candidate(8, 1),
+            exclusions=(SourceExclusion(109, 9, 3, "empty_storage_key"),),
+        ),
+        tmp_path / "snapshot",
+        materializer({8: payload}),
+    )
+    return snapshot.output_root / "manifest.json", json.loads(snapshot.manifest_json)
+
+def test_v2_manifest_round_trips_complete_lineage_without_storage_keys(tmp_path: Path):
+    path, manifest = _manifest_for_validation(tmp_path)
+
+    assert tuple(manifest[key] for key in ("domain_id", "class_values", "source_schema")) == (
+        "bcs-integer-1-5",
+        [1, 2, 3, 4, 5],
+        "bcs-source-v1",
+    )
+    assert manifest["class_mapping"] == {str(score): index for index, score in enumerate(range(1, 6))}
+    assert [manifest[key] for key in ("score_min", "score_max", "score_base", "score_step", "num_classes", "num_thresholds")] == [1, 5, 1, 1, 5, 4]
+    assert manifest["split_plan"]["candidate_evidence_ids"] == [8]
+    assert manifest["split_plan"]["excluded_evidence_ids"] == [9]
+    assert manifest["split_plan"]["canonical_val_ratio"] == "0"
+    assert load_integer_snapshot_manifest(path) == manifest
+    assert "safe-8" not in path.read_text(encoding="utf-8")
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("domain_id", "other-domain"),
+        ("class_values", [1, 2, 3, 4, 6]),
+        ("class_mapping", {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5}),
+        ("score_min", 0),
+        ("num_classes", 4),
+        ("num_thresholds", 5),
+        ("source_schema", "bcs-source-v2"),
+    ],
+)
+def test_manifest_rejects_tampered_domain_scale_and_source_lineage(
+    tmp_path: Path, field: str, value: object
+):
+    _, manifest = _manifest_for_validation(tmp_path)
+    manifest[field] = value
+
+    with pytest.raises(IntegerSnapshotManifestValidationError):
+        load_integer_snapshot_manifest(manifest)
+
+@pytest.mark.parametrize("legacy_classes", (["1", "2", "3", "4", "5"], [3.25, 3.5, 3.75, 4.0, 4.25]))
+def test_manifest_rejects_integer_v1_and_fractional_legacy_manifests(
+    tmp_path: Path, legacy_classes: list[object]
+):
+    _, manifest = _manifest_for_validation(tmp_path)
+    manifest["manifest_schema_version"] = "bcs-integer-snapshot-v1"
+    manifest["class_values"] = legacy_classes
+
+    with pytest.raises(IntegerSnapshotLegacyManifestError) as failure:
+        load_integer_snapshot_manifest(manifest)
+    assert "safe-8" not in str(failure.value)
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        lambda m: m["records"][0].update(relative_path="../1/8.jpg"),
+        lambda m: m["records"][0].update(relative_path="train/2/8.jpg"),
+        lambda m: m["records"][0].update(sha256="x" * 64),
+        lambda m: m["records"][0].update(evidence_id=9),
+        lambda m: m["records"][0]["provenance"][0].update(evaluation_id=0),
+        lambda m: m["counts"]["train"].__setitem__(0, 2),
+        lambda m: m.update(num_classes=True),
+        lambda m: m["class_values"].__setitem__(0, True),
+        lambda m: m["records"][0].update(bcs_score=True),
+        lambda m: m["records"][0].update(evidence_id=True),
+        lambda m: m["counts"]["train"].__setitem__(0, False),
+        lambda m: m["records"][0]["provenance"][0].update(evidence_id=True),
+        lambda m: m["split_plan"].update(identity_digest="0" * 63),
+        lambda m: m["split_plan"].update(seed=True),
+        lambda m: m["split_plan"].update(canonical_val_ratio="0.0"),
+        lambda m: m["split_plan"].update(candidate_evidence_ids=[999]),
+        lambda m: m["split_plan"].update(excluded_evidence_ids=[]),
+        lambda m: m["split_plan"].update(counts={"train": [0] * 5, "val": [0] * 5}),
+        lambda m: m.update(unexpected=None),
+        lambda m: m.pop("records"),
+    ],
+)
+def test_manifest_rejects_path_count_digest_provenance_and_bool_edges(tmp_path: Path, tamper):
+    _, manifest = _manifest_for_validation(tmp_path)
+    tamper(manifest)
+
+    with pytest.raises(IntegerSnapshotManifestValidationError):
+        load_integer_snapshot_manifest(manifest)
 
 def test_manifest_and_bytes_are_deterministic_across_output_roots(tmp_path: Path):
     payloads = {1: image_bytes("JPEG"), 2: image_bytes("PNG")}
