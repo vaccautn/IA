@@ -134,6 +134,15 @@ def _require_keys(value: dict[str, Any], expected: set[str], name: str) -> None:
         raise BCSSourceContractError(f"{name} has an invalid field set")
 
 
+def _reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise BCSSourceContractError("duplicate JSON object member")
+        result[key] = value
+    return result
+
+
 def _parse_export(payload: Any) -> BCSSourceExport:
     source = _require_object(payload, "source export")
     _require_keys(source, _SOURCE_KEYS, "source export")
@@ -178,12 +187,17 @@ def _read_response_body(response: Any, maximum: int) -> bytes:
     try:
         declared = response.headers.get("Content-Length")
         if declared is not None:
-            if type(declared) is not str or not declared.isdigit():
+            if (
+                type(declared) is not str
+                or not declared.isascii()
+                or not declared.isdigit()
+            ):
                 raise BCSSourceTransportError("invalid Content-Length response header")
             if int(declared) > maximum:
                 raise BCSSourceResponseTooLargeError(
                     "bcs source response exceeds configured maximum"
                 )
+        declared_length = None if declared is None else int(declared)
         body = bytearray()
         for chunk in response.iter_content(chunk_size=64 * 1024):
             if type(chunk) is not bytes:
@@ -195,6 +209,10 @@ def _read_response_body(response: Any, maximum: int) -> bytes:
                 raise BCSSourceResponseTooLargeError(
                     "bcs source response exceeds configured maximum"
                 )
+        if declared_length is not None and len(body) != declared_length:
+            raise BCSSourceTransportError(
+                "response length did not match Content-Length"
+            )
         return bytes(body)
     except BCSSourceClientError:
         raise
@@ -236,13 +254,24 @@ class BCSSourceClient:
         self._timeout = float(timeout)
         self._max_response_bytes = max_response_bytes
         self._transport = transport if transport is not None else requests.Session()
+        self._owns_transport = transport is None
+
+    def close(self) -> None:
+        if self._owns_transport:
+            _close_response(self._transport)
+
+    def __enter__(self) -> BCSSourceClient:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
 
     @staticmethod
     def _normalize_base_url(base_url: str) -> str:
         if type(base_url) is not str or not base_url.strip():
             raise BCSSourceConfigurationError("base URL must be non-empty")
-        value = base_url.strip().rstrip("/")
-        if any(char.isspace() for char in value):
+        value = base_url.strip()
+        if any(char.isspace() or char == "\\" for char in value):
             raise BCSSourceConfigurationError("base URL is malformed")
         try:
             parsed = urlsplit(value)
@@ -256,6 +285,7 @@ class BCSSourceClient:
             or parsed.netloc.endswith(":")
             or parsed.username
             or parsed.password
+            or "@" in value
         ):
             raise BCSSourceConfigurationError("base URL is malformed")
         if (
@@ -271,12 +301,13 @@ class BCSSourceClient:
             "::1",
         }:
             raise BCSSourceConfigurationError("insecure remote base URL is not allowed")
-        return value
+        return value[:-1] if parsed.path == "/" else value
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(base_url={self._base_url!r}, timeout={self._timeout!r})"
 
     def fetch(self) -> BCSSourceExport:
+        response = None
         try:
             response = self._transport.get(
                 f"{self._base_url}{SOURCE_PATH}",
@@ -290,18 +321,25 @@ class BCSSourceClient:
             )
             status_code = response.status_code
         except Exception as exc:
+            _close_response(response)
             raise BCSSourceTransportError(
                 f"bcs source transport failed with {type(exc).__name__}"
             ) from None
-        if type(status_code) is not int or not 200 <= status_code < 300:
+        if type(status_code) is not int:
+            _close_response(response)
+            raise BCSSourceTransportError("invalid HTTP status code")
+        if not 200 <= status_code < 300:
             _close_response(response)
             raise BCSSourceHTTPError(status_code)
         try:
             payload = json.loads(
-                _read_response_body(response, self._max_response_bytes)
+                _read_response_body(response, self._max_response_bytes),
+                object_pairs_hook=_reject_duplicate_members,
             )
         except BCSSourceClientError:
             raise
+        except RecursionError:
+            raise BCSSourceContractError("JSON nesting is too deep") from None
         except (TypeError, ValueError):
             raise BCSSourceJSONError("bcs source response was not valid JSON") from None
         return _parse_export(payload)

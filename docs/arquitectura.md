@@ -94,7 +94,7 @@ El PRD establece que el prototipo de IA es independiente del backend actual y qu
 
 - The constructor requires an origin-only `base_url`, a Bearer token, a finite positive `timeout`, and accepts an injectable HTTP transport. `max_response_bytes` defaults to 64 MiB and is configurable as a positive integer.
 - The client requests the exact versioned path with `Authorization: Bearer ...`, disables redirects, streams the response, and rejects oversized declared or actual bodies before JSON parsing.
-- HTTP uses HTTPS except for localhost loopback development (`localhost`, `127.0.0.1`, or `::1`). Paths, query strings, fragments, userinfo, and malformed hosts/ports are rejected.
+- HTTP uses HTTPS except for localhost loopback development (`localhost`, `127.0.0.1`, or `::1`). Only an empty path or exactly `/` is accepted; backslashes, query strings, fragments, userinfo, and malformed hosts/ports are rejected.
 - `fetch()` returns frozen, tuple-backed `BCSSourceExport`, `BCSSourceEvaluationRow`, and `BCSSourceEvidence` values. Valid exports preserve empty storage keys and do not deduplicate repeated keys.
 - Configuration, transport, HTTP, JSON, response-size, and contract failures use typed exceptions. Tokens and full response payloads are never included in exception messages or the client representation.
 - This client does not download images, materialize storage keys, migrate integer datasets, or connect the client to the `/bcs` serving placeholder.

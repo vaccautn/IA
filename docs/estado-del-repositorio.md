@@ -42,14 +42,14 @@ La presencia de un archivo o commit demuestra su existencia en el repositorio, n
 |---|---|---|
 | Builder focalizado | Inventario: 38 tests; ejecución registrada: `38 passed` | Comando documentado: `.venv\Scripts\python -m pytest tests/test_bcs_dataset_topology.py tests/test_bcs_dataset_plan.py tests/test_bcs_dataset_snapshot.py tests/test_bcs_dataset_recovery.py tests/test_bcs_dataset_publish.py tests/test_bcs_cli.py`. Alcance: módulos y tests comprometidos del builder. |
 | BCS/API y builder focalizados | `163 passed`, 2 warnings | `.venv\Scripts\python -m pytest tests/test_vacca_bcs.py tests/test_vacca_api_contract.py tests/test_bcs_cli.py tests/test_bcs_dataset_plan.py tests/test_bcs_dataset_publish.py tests/test_bcs_dataset_recovery.py tests/test_bcs_dataset_snapshot.py tests/test_bcs_dataset_topology.py`. Incluye los caminos reales temporales y provenance/config/run-info. |
-| Suite completa | `276 passed`, 2 warnings y 65 subtests | `.venv\Scripts\python -m pytest -q` ejecutado sobre este worktree. No accedió a datos/outputs reales ni ejecutó entrenamiento real. |
+| Suite completa | `298 passed`, 2 warnings y 65 subtests | `.venv\Scripts\python -m pytest -q` ejecutado sobre este worktree. No accedió a datos/outputs reales ni ejecutó entrenamiento real. |
 | Servidor FastAPI | Ejecución local no registrada | La evidencia de esta documentación no incluye un arranque de servidor ni una llamada HTTP. |
 | Helper directo de detector/esquemas | Ejecución local no registrada | `scripts/smoke_test_api.py` no prueba HTTP: requiere datos y el peso local de `outputs/training/combined-finetune/weights/best.pt`. |
 | BCS ordinal real-path | `Verificado` con temporales | Las pruebas generan imágenes Pillow en carpetas de clase, ejecutan transforms/dataset, hacen forward/predict y un paso real de modelo/optimizer en CPU. |
 | Trainer ordinal real | No ejecutado | La cobertura usa tensores/imágenes controlados y no constituye un entrenamiento real ni una métrica de dataset real. |
 | Datos y outputs reales | No tocados | Esta documentación no creó, modificó ni publicó datasets, checkpoints o resultados. |
 
-El resultado `276 passed` corresponde a la suite actual de este worktree y es reproducible con el comando indicado. Las advertencias son deprecaciones de FastAPI (`on_event`), no bloquean esta transición. Ningún resultado de tests constituye evidencia de entrenamiento real o rendimiento productivo.
+El resultado `298 passed` corresponde a la suite actual de este worktree y es reproducible con el comando indicado. Las advertencias son deprecaciones de FastAPI (`on_event`), no bloquean esta transición. Ningún resultado de tests constituye evidencia de entrenamiento real o rendimiento productivo.
 
 ## Riesgos y deuda actual
 

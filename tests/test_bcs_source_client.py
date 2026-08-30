@@ -4,6 +4,7 @@ import json
 
 import requests
 import pytest
+import vacca_bcs.source_client as source_client_module
 
 from vacca_bcs.source_client import (
     BCSSourceClient,
@@ -23,6 +24,7 @@ class FakeResponse:
         self.status_code = status_code
         self.headers = headers or {}
         self.closed = False
+        self.iter_content_calls = 0
         self._chunks = (
             chunks
             if chunks is not None
@@ -38,7 +40,34 @@ class FakeResponse:
         )
 
     def iter_content(self, chunk_size):
+        self.iter_content_calls += 1
         return iter(self._chunks)
+
+    def close(self):
+        self.closed = True
+
+
+class BrokenStatusResponse:
+    def __init__(self):
+        self.closed = False
+
+    @property
+    def status_code(self):
+        raise RuntimeError("secret-token")
+
+    def close(self):
+        self.closed = True
+
+
+class BrokenHeadersResponse:
+    def __init__(self):
+        self.closed = False
+
+    status_code = 200
+
+    @property
+    def headers(self):
+        raise RuntimeError("secret-token")
 
     def close(self):
         self.closed = True
@@ -46,13 +75,16 @@ class FakeResponse:
 
 class FakeTransport:
     def __init__(self, response=None, error=None):
-        self.response, self.error, self.calls = response, error, []
+        self.response, self.error, self.calls, self.close_calls = response, error, [], 0
 
     def get(self, url, *, headers, timeout, stream, allow_redirects):
         self.calls.append((url, headers, timeout, stream, allow_redirects))
         if self.error:
             raise self.error
         return self.response
+
+    def close(self):
+        self.close_calls += 1
 
 
 _DEFAULT = object()
@@ -156,12 +188,13 @@ def test_http_and_transport_failures_are_typed_without_sensitive_data():
 
 
 def test_invalid_json_is_typed_and_payload_is_not_disclosed():
-    client, _ = client_for(payload=ValueError("secret-token"))
+    client, transport = client_for(payload=ValueError("secret-token"))
 
     with pytest.raises(BCSSourceJSONError) as failure:
         client.fetch()
 
     assert "secret-token" not in str(failure.value)
+    assert transport.response.closed
 
 
 def test_redirect_status_is_not_followed():
@@ -184,10 +217,105 @@ def test_declared_or_chunked_response_over_limit_fails_without_disclosure():
         {"response_kwargs": {"chunks": [b"safe", b"secret-token"]}},
     ]
     for case in cases:
-        client, _ = client_for(max_response_bytes=8, **case)
+        client, transport = client_for(max_response_bytes=8, **case)
         with pytest.raises(BCSSourceResponseTooLargeError) as failure:
             client.fetch()
         assert "secret-token" not in str(failure.value)
+        if "headers" in case["response_kwargs"]:
+            assert transport.response.iter_content_calls == 0
+
+
+def test_content_length_must_match_streamed_bytes():
+    client, transport = client_for(
+        response_kwargs={"body": b"{}", "headers": {"Content-Length": "1"}}
+    )
+
+    with pytest.raises(BCSSourceTransportError):
+        client.fetch()
+
+    assert transport.response.closed
+
+
+@pytest.mark.parametrize("content_length", ["-1", "invalid", 1])
+def test_invalid_content_length_fails_closed(content_length):
+    client, transport = client_for(
+        response_kwargs={"body": b"{}", "headers": {"Content-Length": content_length}}
+    )
+
+    with pytest.raises(BCSSourceTransportError):
+        client.fetch()
+
+    assert transport.response.closed
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"schema_version":"bcs-source-v1","schema_version":"bcs-source-v1","rows":[]}',
+        b'{"schema_version":"bcs-source-v1","rows":[{"evaluation_id":1,"evaluation_id":1,"session_id":1,"animal_id":1,"valor_cc":1,"evidence":[]}]}',
+        b'{"schema_version":"bcs-source-v1","rows":[{"evaluation_id":1,"session_id":1,"animal_id":1,"valor_cc":1,"evidence":[{"evidence_id":1,"storage_key":"a","storage_key":"secret-token"}]}]}',
+    ],
+)
+def test_duplicate_json_members_at_every_nesting_level_are_rejected(body):
+    client, transport = client_for(response_kwargs={"body": body})
+
+    with pytest.raises(BCSSourceContractError) as failure:
+        client.fetch()
+
+    assert "secret-token" not in str(failure.value)
+    assert transport.response.closed
+
+
+def test_deep_json_failure_is_a_sanitized_contract_error():
+    client, transport = client_for(response_kwargs={"body": b"[" * 1100 + b"]" * 1100})
+
+    with pytest.raises(BCSSourceContractError) as failure:
+        client.fetch()
+
+    assert "secret-token" not in str(failure.value)
+    assert transport.response.closed
+
+
+def test_response_closes_when_status_or_headers_fail():
+    for response in (BrokenStatusResponse(), BrokenHeadersResponse()):
+        transport = FakeTransport(response=response)
+        client = BCSSourceClient("https://api.test", "secret-token", 1, transport)
+        with pytest.raises(BCSSourceTransportError) as failure:
+            client.fetch()
+        assert "secret-token" not in str(failure.value)
+        assert response.closed
+
+
+def test_response_closes_when_streaming_fails():
+    client, transport = client_for(response_kwargs={"chunks": [b"safe", object()]})
+
+    with pytest.raises(BCSSourceTransportError):
+        client.fetch()
+
+    assert transport.response.closed
+
+
+@pytest.mark.parametrize("status_code", [True, False, "200", object()])
+def test_status_code_must_be_a_strict_integer(status_code):
+    client, transport = client_for(status_code=status_code)
+
+    with pytest.raises(BCSSourceTransportError) as failure:
+        client.fetch()
+
+    assert "secret-token" not in str(failure.value)
+    assert transport.response.closed
+
+
+def test_client_closes_only_owned_sessions_and_supports_context_manager(monkeypatch):
+    injected = FakeTransport()
+    BCSSourceClient("https://api.test", "token", 1, injected).close()
+    assert injected.close_calls == 0
+
+    owned = FakeTransport()
+    monkeypatch.setattr(source_client_module.requests, "Session", lambda: owned)
+    with BCSSourceClient("https://api.test", "token", 1):
+        pass
+    assert owned.close_calls == 1
 
 
 @pytest.mark.parametrize("payload", [None, [], {"schema_version": "other", "rows": []}])
@@ -297,9 +425,13 @@ def test_storage_key_must_be_a_string():
         ("ftp://example.test", "token", 1),
         ("https://", "token", 1),
         ("https://api.test/path", "token", 1),
+        (r"https://api.test\escape", "token", 1),
         ("https://api.test?", "token", 1),
         ("https://api.test#", "token", 1),
+        ("https://@api.test", "token", 1),
+        ("https://:@api.test", "token", 1),
         ("https://user:pass@api.test", "token", 1),
+        ("https://api.test//", "token", 1),
         ("https://[::1", "token", 1),
         ("https://api.test:bad", "token", 1),
         ("https://api.test:", "token", 1),
