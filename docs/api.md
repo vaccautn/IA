@@ -2,7 +2,7 @@
 
 **BCS hoy:** `POST /bcs` sigue siendo un placeholder y siempre devuelve `bcs_score: null`; no ejecuta inferencia BCS.
 
-Esta es la guía operativa del servicio FastAPI que existe hoy. La detección de Fase 1 está implementada; la integración futura con el backend aceptará scores finitos en el rango inclusivo `1..5` y usará un score entero con redondeo decimal half-down (los empates exactos `.5` bajan, por ejemplo `3.5 → 3`), sin clamp ni cambio de la precisión fraccionaria del modelo. Esa inferencia futura todavía no está implementada.
+Esta es la guía operativa del servicio FastAPI que existe hoy. La detección de Fase 1 está implementada; `vacca_bcs.source_client` ya consume el export humano versionado del backend. La inferencia BCS futura aceptará scores finitos en el rango inclusivo `1..5` y usará un score entero con redondeo decimal half-down (los empates exactos `.5` bajan, por ejemplo `3.5 → 3`), sin clamp ni cambio de la precisión fraccionaria del modelo. Esa inferencia todavía no está implementada.
 
 ## Camino rápido
 
@@ -148,5 +148,5 @@ Este script no inicia FastAPI ni realiza solicitudes HTTP. Importa directamente 
 | Detección local por HTTP | Hay launcher, rutas y esquema; requiere dependencias manuales y un output local. | `Operativo` como prototipo local; no verificado mediante un arranque registrado en este documento. |
 | Modelo portable/versionado para esta API | Hay un artefacto versionado, pero no está conectado a `MODEL_PATH`. | `Bloqueado` hasta resolver selección/configuración de peso. |
 | BCS ordinal por HTTP | Sólo hay respuesta placeholder. | `Placeholder`. |
-| Integración backend autenticada | No hay código ni contrato implementado en `IA`. | `Bloqueado`. |
+| Integración backend autenticada | `vacca_bcs.source_client` consume `GET /api/bcs-source-v1` con Bearer; no descarga imágenes ni migra datasets. | `En desarrollo`. |
 | Helper directo de detector/esquemas | Existe `scripts/smoke_test_api.py`; usa datos y `outputs/training/combined-finetune/weights/best.pt`. | No es una prueba HTTP/FastAPI y no basta para verificar el modelo activo, startup, rutas, multipart ni errores de la API; no tiene una ejecución local registrada en este documento. |

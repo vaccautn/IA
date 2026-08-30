@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
@@ -12,6 +13,7 @@ SOURCE_PATH = "/api/bcs-source-v1"
 _SOURCE_KEYS = {"schema_version", "rows"}
 _ROW_KEYS = {"evaluation_id", "session_id", "animal_id", "valor_cc", "evidence"}
 _EVIDENCE_KEYS = {"evidence_id", "storage_key"}
+DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 class BCSSourceClientError(Exception):
@@ -33,6 +35,10 @@ class BCSSourceHTTPError(BCSSourceClientError):
 
 
 class BCSSourceJSONError(BCSSourceClientError):
+    pass
+
+
+class BCSSourceResponseTooLargeError(BCSSourceClientError):
     pass
 
 
@@ -66,12 +72,18 @@ class BCSSourceEvaluationRow:
             if type(value) is not int or value <= 0:
                 raise BCSSourceContractError(f"{name} must be a positive integer")
         if type(self.valor_cc) is not int or not 1 <= self.valor_cc <= 5:
-            raise BCSSourceContractError("valor_cc must be an integer in the range 1..5")
+            raise BCSSourceContractError(
+                "valor_cc must be an integer in the range 1..5"
+            )
         evidence = tuple(self.evidence)
         if any(type(item) is not BCSSourceEvidence for item in evidence):
             raise BCSSourceContractError("evidence must contain source evidence values")
-        if [item.evidence_id for item in evidence] != sorted({item.evidence_id for item in evidence}):
-            raise BCSSourceContractError("evidence must be strictly ordered by evidence_id")
+        if [item.evidence_id for item in evidence] != sorted(
+            {item.evidence_id for item in evidence}
+        ):
+            raise BCSSourceContractError(
+                "evidence must be strictly ordered by evidence_id"
+            )
         object.__setattr__(self, "evidence", evidence)
 
 
@@ -89,7 +101,9 @@ class BCSSourceExport:
         evaluation_ids = [row.evaluation_id for row in rows]
         evidence_ids = [item.evidence_id for row in rows for item in row.evidence]
         if evaluation_ids != sorted(set(evaluation_ids)):
-            raise BCSSourceContractError("rows must be strictly ordered by evaluation_id")
+            raise BCSSourceContractError(
+                "rows must be strictly ordered by evaluation_id"
+            )
         if len(evaluation_ids) != len(set(evaluation_ids)):
             raise BCSSourceContractError("duplicate evaluation_id")
         if len(evidence_ids) != len(set(evidence_ids)):
@@ -99,7 +113,13 @@ class BCSSourceExport:
 
 class HTTPTransport(Protocol):
     def get(
-        self, url: str, *, headers: Mapping[str, str], timeout: float
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout: float,
+        stream: bool,
+        allow_redirects: bool,
     ) -> Any: ...
 
 
@@ -147,6 +167,45 @@ def _parse_export(payload: Any) -> BCSSourceExport:
     return BCSSourceExport(SCHEMA_VERSION, tuple(rows))
 
 
+def _close_response(response: Any) -> None:
+    try:
+        response.close()
+    except Exception:
+        pass
+
+
+def _read_response_body(response: Any, maximum: int) -> bytes:
+    try:
+        declared = response.headers.get("Content-Length")
+        if declared is not None:
+            if type(declared) is not str or not declared.isdigit():
+                raise BCSSourceTransportError("invalid Content-Length response header")
+            if int(declared) > maximum:
+                raise BCSSourceResponseTooLargeError(
+                    "bcs source response exceeds configured maximum"
+                )
+        body = bytearray()
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if type(chunk) is not bytes:
+                raise BCSSourceTransportError(
+                    "bcs source response contained an invalid chunk"
+                )
+            body.extend(chunk)
+            if len(body) > maximum:
+                raise BCSSourceResponseTooLargeError(
+                    "bcs source response exceeds configured maximum"
+                )
+        return bytes(body)
+    except BCSSourceClientError:
+        raise
+    except Exception as exc:
+        raise BCSSourceTransportError(
+            f"bcs source transport failed with {type(exc).__name__}"
+        ) from None
+    finally:
+        _close_response(response)
+
+
 class BCSSourceClient:
     def __init__(
         self,
@@ -154,16 +213,28 @@ class BCSSourceClient:
         bearer_token: str,
         timeout: float,
         transport: HTTPTransport | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         self._base_url = self._normalize_base_url(base_url)
-        if type(bearer_token) is not str or not bearer_token.strip() or any(
-            char.isspace() for char in bearer_token
+        if (
+            type(bearer_token) is not str
+            or not bearer_token.strip()
+            or any(char.isspace() for char in bearer_token)
         ):
             raise BCSSourceConfigurationError("bearer token must be a non-empty token")
-        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        if (
+            type(timeout) not in (int, float)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise BCSSourceConfigurationError("timeout must be finite and positive")
+        if type(max_response_bytes) is not int or max_response_bytes <= 0:
+            raise BCSSourceConfigurationError(
+                "max_response_bytes must be a positive integer"
+            )
         self._bearer_token = bearer_token
         self._timeout = float(timeout)
+        self._max_response_bytes = max_response_bytes
         self._transport = transport if transport is not None else requests.Session()
 
     @staticmethod
@@ -179,11 +250,26 @@ class BCSSourceClient:
             _ = parsed.port
         except ValueError:
             raise BCSSourceConfigurationError("base URL is malformed") from None
-        if not hostname or not parsed.netloc or parsed.username or parsed.password:
+        if (
+            not hostname
+            or not parsed.netloc
+            or parsed.netloc.endswith(":")
+            or parsed.username
+            or parsed.password
+        ):
             raise BCSSourceConfigurationError("base URL is malformed")
-        if parsed.query or parsed.fragment or parsed.scheme.lower() not in {"http", "https"}:
+        if (
+            parsed.path not in ("", "/")
+            or "?" in value
+            or "#" in value
+            or parsed.scheme.lower() not in {"http", "https"}
+        ):
             raise BCSSourceConfigurationError("base URL is malformed")
-        if parsed.scheme.lower() == "http" and hostname.lower() not in {"localhost", "127.0.0.1", "::1"}:
+        if parsed.scheme.lower() == "http" and hostname.lower() not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
             raise BCSSourceConfigurationError("insecure remote base URL is not allowed")
         return value
 
@@ -194,8 +280,13 @@ class BCSSourceClient:
         try:
             response = self._transport.get(
                 f"{self._base_url}{SOURCE_PATH}",
-                headers={"Authorization": f"Bearer {self._bearer_token}", "Accept": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {self._bearer_token}",
+                    "Accept": "application/json",
+                },
                 timeout=self._timeout,
+                stream=True,
+                allow_redirects=False,
             )
             status_code = response.status_code
         except Exception as exc:
@@ -203,9 +294,14 @@ class BCSSourceClient:
                 f"bcs source transport failed with {type(exc).__name__}"
             ) from None
         if type(status_code) is not int or not 200 <= status_code < 300:
+            _close_response(response)
             raise BCSSourceHTTPError(status_code)
         try:
-            payload = response.json()
-        except Exception:
+            payload = json.loads(
+                _read_response_body(response, self._max_response_bytes)
+            )
+        except BCSSourceClientError:
+            raise
+        except (TypeError, ValueError):
             raise BCSSourceJSONError("bcs source response was not valid JSON") from None
         return _parse_export(payload)

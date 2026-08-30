@@ -10,6 +10,7 @@
 | `src/vacca_vision/` | Contratos de detección, validación de imágenes, reglas de aptitud y adaptador Ultralytics. | `contracts.py`, `image_validation.py`, `pipeline.py`, `ultralytics_adapter.py` |
 | `scripts/run_baseline.py` | Ejecuta el camino validado por manifiesto: snapshot, detector, pipeline y salida JSON. | `configs/baseline_manifest.json` |
 | `src/vacca_bcs/` comprometido | Dataset ordinal seguro y pipeline de modelo/transformaciones. | `constants.py`, `dataset.py`, `model.py` y módulos `dataset_*` |
+| Cliente de fuente BCS | Cliente HTTP autenticado y estricto para consumir el export humano versionado. | `source_client.py` y `tests/test_bcs_source_client.py` |
 | Modelo ordinal BCS | Versionado y probado con fixtures temporales; no es serving HTTP. | `BCSOrdinalModel`, `CORALHead`, `coral_loss` y `predict` en `model.py` |
 | Entrenamiento y reanudación ordinales | Código, configuración y pruebas versionados; no hay una ejecución real comprometida. | `scripts/train_bcs_ordinal.py`, `configs/training_bcs_ordinal.yaml` y artefactos `weights/last.pt`/`run_info.json` sólo cuando una operación local los genera |
 | `tests/` | Gates de contratos, baseline, pipeline, builder y BCS ordinal. | Archivos `test_*.py` versionados en la rama, incluidos los caminos reales temporales |
@@ -81,11 +82,22 @@ La integración futura aprobada sólo podrá exponer un score entero en `1..5`, 
 
 ## Relación con el backend
 
-El PRD establece que el prototipo de IA es independiente del backend actual y que la integración definitiva está fuera del alcance de Fase 1. En el estado observado:
+El PRD establece que el prototipo de IA es independiente del backend actual y que la integración definitiva está fuera del alcance de Fase 1. La rama ahora incluye un cliente acotado para el export humano `bcs-source-v1`, pero no una integración completa de serving o datasets. En el estado observado:
 
 - IA ejecuta la inferencia de visión en el servicio local de detección.
-- No hay código en este repositorio para autenticación, persistencia de dominio u orquestación del backend.
-- Es razonable que el backend conserve esas responsabilidades en una integración futura, pero esa frontera es una intención de arquitectura, no una integración existente.
+- `vacca_bcs.source_client` envía autenticación Bearer y consume el export; no implementa persistencia de dominio ni orquestación del backend.
+- El serving BCS, la materialización de imágenes y la migración de etiquetas siguen siendo trabajo futuro.
+
+## BCS source export client
+
+`src/vacca_bcs/source_client.py` exposes `BCSSourceClient` for the admin-only backend contract `GET /api/bcs-source-v1`.
+
+- The constructor requires an origin-only `base_url`, a Bearer token, a finite positive `timeout`, and accepts an injectable HTTP transport. `max_response_bytes` defaults to 64 MiB and is configurable as a positive integer.
+- The client requests the exact versioned path with `Authorization: Bearer ...`, disables redirects, streams the response, and rejects oversized declared or actual bodies before JSON parsing.
+- HTTP uses HTTPS except for localhost loopback development (`localhost`, `127.0.0.1`, or `::1`). Paths, query strings, fragments, userinfo, and malformed hosts/ports are rejected.
+- `fetch()` returns frozen, tuple-backed `BCSSourceExport`, `BCSSourceEvaluationRow`, and `BCSSourceEvidence` values. Valid exports preserve empty storage keys and do not deduplicate repeated keys.
+- Configuration, transport, HTTP, JSON, response-size, and contract failures use typed exceptions. Tokens and full response payloads are never included in exception messages or the client representation.
+- This client does not download images, materialize storage keys, migrate integer datasets, or connect the client to the `/bcs` serving placeholder.
 
 ## Límites de artefactos y datos
 
