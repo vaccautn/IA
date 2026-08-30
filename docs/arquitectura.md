@@ -97,7 +97,7 @@ El PRD establece que el prototipo de IA es independiente del backend actual y qu
 - HTTP uses HTTPS except for localhost loopback development (`localhost`, `127.0.0.1`, or `::1`). Only an empty path or exactly `/` is accepted; backslashes, query strings, fragments, userinfo, and malformed hosts/ports are rejected.
 - `fetch()` returns frozen, tuple-backed `BCSSourceExport`, `BCSSourceEvaluationRow`, and `BCSSourceEvidence` values. Valid exports preserve empty storage keys and do not deduplicate repeated keys.
 - Configuration, transport, HTTP, JSON, response-size, and contract failures use typed exceptions. Tokens and full response payloads are never included in exception messages or the client representation.
-- `BCSEvidenceMaterializer.materialize(evidence_id)` resolves one signed URL and returns bytes plus SHA-256 without retaining the signed URL; neither class writes files, decodes images, migrates integer datasets, assigns labels, or connects the client to the `/bcs` serving placeholder.
+- `BCSEvidenceMaterializer.materialize(evidence_id)` resolves one signed URL and returns bytes plus SHA-256 without retaining the signed URL; neither class writes files, decodes images, migrates integer datasets, assigns labels, or connects the client to the `/bcs` serving placeholder. Requests may canonicalize percent-escape case; byte-identical wire encoding is not guaranteed.
 
 ## Límites de artefactos y datos
 

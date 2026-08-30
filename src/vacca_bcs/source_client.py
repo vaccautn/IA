@@ -246,7 +246,13 @@ def _read_response_body(response: Any, maximum: int) -> bytes:
 
 
 def _request_response(
-    transport: HTTPTransport, url: str, headers: Mapping[str, str], timeout: float
+    transport: HTTPTransport,
+    url: str,
+    headers: Mapping[str, str],
+    timeout: float,
+    *,
+    expected_status: int | None = None,
+    reject_content_range: bool = False,
 ) -> Any:
     response = None
     try:
@@ -266,9 +272,24 @@ def _request_response(
     if type(status_code) is not int:
         _close_response(response)
         raise BCSSourceTransportError("invalid HTTP status code")
-    if not 200 <= status_code < 300:
+    if expected_status is not None and status_code != expected_status:
         _close_response(response)
         raise BCSSourceHTTPError(status_code)
+    if expected_status is None and not 200 <= status_code < 300:
+        _close_response(response)
+        raise BCSSourceHTTPError(status_code)
+    if reject_content_range:
+        try:
+            if any(str(key).lower() == "content-range" for key in response.headers):
+                _close_response(response)
+                raise BCSSourceHTTPError(status_code)
+        except BCSSourceClientError:
+            raise
+        except Exception as exc:
+            _close_response(response)
+            raise BCSSourceTransportError(
+                f"bcs source transport failed with {type(exc).__name__}"
+            ) from None
     return response
 
 
@@ -287,7 +308,7 @@ def _decode_json_response(response: Any, maximum: int) -> Any:
 
 
 def _validate_signed_url(value: str) -> None:
-    if not value or any(char.isspace() or char in r"\@#" for char in value):
+    if not value or any(char.isspace() or char in r"\#" for char in value):
         raise BCSSourceContractError("signed_url is malformed")
     try:
         parsed = urlsplit(value)
@@ -301,6 +322,7 @@ def _validate_signed_url(value: str) -> None:
         or parsed.netloc.endswith(":")
         or parsed.username
         or parsed.password
+        or "@" in parsed.netloc
         or not parsed.query
         or parsed.scheme.lower() not in {"http", "https"}
     ):
@@ -440,11 +462,11 @@ class BCSEvidenceMaterializer(BCSSourceClient):
         download_transport: HTTPTransport | None = None,
         max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
     ) -> None:
-        super().__init__(backend_base_url, bearer_token, timeout, backend_transport)
         if type(max_image_bytes) is not int or max_image_bytes <= 0:
             raise BCSSourceConfigurationError(
                 "max_image_bytes must be a positive integer"
             )
+        super().__init__(backend_base_url, bearer_token, timeout, backend_transport)
         self._max_image_bytes = max_image_bytes
         self._download_transport = (
             download_transport if download_transport is not None else requests.Session()
@@ -478,7 +500,12 @@ class BCSEvidenceMaterializer(BCSSourceClient):
             _decode_json_response(signed_response, 64 * 1024), evidence_id
         )
         download_response = _request_response(
-            self._download_transport, signed_url, {}, self._timeout
+            self._download_transport,
+            signed_url,
+            {},
+            self._timeout,
+            expected_status=200,
+            reject_content_range=True,
         )
         payload = _read_response_body(download_response, self._max_image_bytes)
         if not payload:

@@ -478,7 +478,7 @@ def test_client_rejects_invalid_response_limit(max_response_bytes):
 
 def signed_url_body(
     evidence_id=7,
-    signed_url="https://r2.example/object?sig=abc",
+    signed_url="https://r2.example/object?sig=a@b",
     expiry=3600,
     schema_version="bcs-source-v1",
 ):
@@ -531,7 +531,7 @@ def test_materialize_resolves_signed_url_and_keeps_credentials_separate():
         False,
     )
     assert download.calls[0] == (
-        "https://r2.example/object?sig=abc",
+        "https://r2.example/object?sig=a@b",
         {},
         2.5,
         True,
@@ -596,6 +596,18 @@ def test_signed_and_download_http_failures_are_closed_and_sanitized():
     assert "secret-token" not in str(failure.value)
 
 
+@pytest.mark.parametrize(
+    "status_code,headers", [(206, {}), (200, {"Content-Range": "bytes 0-5/10"})]
+)
+def test_partial_downloads_are_rejected_before_payload_return(status_code, headers):
+    response = FakeResponse(b"partial", status_code=status_code, headers=headers)
+    client, _, _ = materializer_for(download_response=response)
+    with pytest.raises(BCSSourceHTTPError):
+        client.materialize(7)
+    assert response.closed
+    assert response.iter_content_calls == 0
+
+
 def test_download_declared_limit_rejects_before_reading():
     response = FakeResponse(b"secret-token", headers={"Content-Length": "12"})
     client, _, _ = materializer_for(download_response=response, max_image_bytes=8)
@@ -645,3 +657,15 @@ def test_materializer_closes_only_owned_sessions(monkeypatch):
     ):
         pass
     assert owned_download.close_calls == 1
+
+
+def test_invalid_image_limit_creates_no_owned_session(monkeypatch):
+    created = []
+    monkeypatch.setattr(
+        source_client_module.requests, "Session", lambda: created.append(True)
+    )
+    with pytest.raises(BCSSourceConfigurationError):
+        BCSEvidenceMaterializer(
+            "https://backend.example", "token", 1, max_image_bytes=0
+        )
+    assert created == []
