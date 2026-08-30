@@ -103,6 +103,8 @@ El PRD establece que el prototipo de IA es independiente del backend actual y qu
 
 `src/vacca_bcs/source_plan.py` provides the pure `normalize_source_export` function. It excludes empty or whitespace-only storage keys with explicit reasons, rejects surrounding whitespace in non-empty keys, collapses exact-key same-label records using the lowest evidence ID, and fails on conflicts using stable evidence/evaluation provenance without exposing key text. Each candidate carries immutable provenance records that preserve evidence/evaluation correspondence, sorted by IDs. Its immutable output is ordered by `(bcs_score, evidence_id)` with counts for classes `1..5`; it performs no download, filesystem write, image decode, split, hash, or label migration.
 
+`src/vacca_bcs/source_split_plan.py` creates the pure integer train/validation layout. It sorts each class canonically before using an independent seed, applies `floor(n * ratio)` clamped to `[1, n - 1]` for eligible classes, keeps singletons in training, and preserves source exclusions. Assignments expose only evidence-ID-based relative path stems; this module does not materialize, write files, decode images, split fractional datasets, or migrate domain labels.
+
 ## Límites de artefactos y datos
 
 | Contenido | Tratamiento |
