@@ -10,6 +10,7 @@ from vacca_bcs.source_client import (
 from vacca_bcs.source_plan import (
     SourcePlanConflictError,
     SourcePlanIntegrityError,
+    SourceProvenance,
     normalize_source_export,
 )
 
@@ -67,28 +68,47 @@ def test_whitespace_only_keys_are_excluded_but_trimmed_identity_fails_closed():
 
 
 def test_same_key_and_label_collapses_with_sorted_full_provenance():
-    first = row(10, 4, (9, "same-key"))
-    second = row(3, 4, (2, "same-key"))
+    first = row(20, 4, (2, "same-key"))
+    second = row(3, 4, (9, "same-key"))
 
     plan = normalize_source_export((first, second))
 
     candidate = plan.candidates[0]
-    assert (candidate.evidence_id, candidate.evaluation_id) == (2, 3)
-    assert candidate.evidence_ids == (2, 9)
-    assert candidate.evaluation_ids == (3, 10)
+    assert (candidate.evidence_id, candidate.evaluation_id) == (2, 20)
+    assert candidate.provenance == (
+        SourceProvenance(evidence_id=2, evaluation_id=20),
+        SourceProvenance(evidence_id=9, evaluation_id=3),
+    )
+    with pytest.raises((AttributeError, TypeError)):
+        candidate.provenance = ()
     assert plan.class_counts == (0, 0, 0, 1, 0)
 
 
-def test_conflicting_labels_fail_without_disclosing_storage_key():
-    with pytest.raises(SourcePlanConflictError) as failure:
-        normalize_source_export(
-            (row(10, 3, (9, "secret-key")), row(11, 4, (12, "secret-key")))
-        )
+def test_multiple_conflicts_report_same_stable_details_in_any_input_order():
+    conflicts = (
+        row(30, 3, (1, "first-secret-key")),
+        row(31, 4, (7, "first-secret-key")),
+        row(20, 3, (2, "second-secret-key")),
+        row(21, 4, (8, "second-secret-key")),
+    )
 
-    message = str(failure.value)
-    assert "secret-key" not in message
-    assert "9" in message and "12" in message
-    assert "10" in message and "11" in message
+    def conflict_details(rows):
+        with pytest.raises(SourcePlanConflictError) as failure:
+            normalize_source_export(rows)
+        error = failure.value
+        return type(error), error.evidence_ids, error.evaluation_ids, str(error)
+
+    first = conflict_details(conflicts)
+    reversed_input = conflict_details(tuple(reversed(conflicts)))
+
+    assert first == reversed_input
+    assert first[1:] == (
+        (1, 7),
+        (30, 31),
+        "conflicting labels for evidence_ids=(1, 7), evaluation_ids=(30, 31)",
+    )
+
+    assert "secret-key" not in first[3]
 
 
 def test_manual_duplicate_ids_are_rejected_deterministically():

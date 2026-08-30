@@ -19,7 +19,20 @@ class SourcePlanIntegrityError(SourcePlanError):
 
 
 class SourcePlanConflictError(SourcePlanError):
-    pass
+    def __init__(self, provenance: tuple[SourceProvenance, ...]) -> None:
+        self.provenance = tuple(provenance)
+        self.evidence_ids = tuple(item.evidence_id for item in self.provenance)
+        self.evaluation_ids = tuple(item.evaluation_id for item in self.provenance)
+        super().__init__(
+            "conflicting labels for "
+            f"evidence_ids={self.evidence_ids}, evaluation_ids={self.evaluation_ids}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SourceProvenance:
+    evidence_id: int
+    evaluation_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,14 +43,13 @@ class SourceCandidate:
     evidence_id: int
     storage_key: str
     bcs_score: int
-    evidence_ids: tuple[int, ...]
-    evaluation_ids: tuple[int, ...]
+    provenance: tuple[SourceProvenance, ...]
 
     def __repr__(self) -> str:
         return (
             f"{type(self).__name__}(evaluation_id={self.evaluation_id!r}, "
             f"evidence_id={self.evidence_id!r}, bcs_score={self.bcs_score!r}, "
-            f"evidence_ids={self.evidence_ids!r}, evaluation_ids={self.evaluation_ids!r})"
+            f"provenance={self.provenance!r})"
         )
 
 
@@ -75,6 +87,23 @@ def _rows_from(
 def _duplicate_ids(values: Iterable[int]) -> tuple[int, ...]:
     items = tuple(values)
     return tuple(sorted(value for value in set(items) if items.count(value) > 1))
+
+
+def _provenance(
+    records: Iterable[tuple[BCSSourceEvaluationRow, BCSSourceEvidence]],
+) -> tuple[SourceProvenance, ...]:
+    return tuple(
+        sorted(
+            (
+                SourceProvenance(
+                    evidence_id=evidence.evidence_id,
+                    evaluation_id=row.evaluation_id,
+                )
+                for row, evidence in records
+            ),
+            key=lambda item: (item.evidence_id, item.evaluation_id),
+        )
+    )
 
 
 def normalize_source_export(
@@ -124,17 +153,12 @@ def normalize_source_export(
                 groups.setdefault(key, []).append((row, evidence))
 
     candidates: list[SourceCandidate] = []
+    conflicts: list[tuple[SourceProvenance, ...]] = []
     for records in groups.values():
         labels = {row.valor_cc for row, _ in records}
         if len(labels) > 1:
-            evidence_ids = tuple(
-                sorted(evidence.evidence_id for _, evidence in records)
-            )
-            evaluation_ids = tuple(sorted(row.evaluation_id for row, _ in records))
-            raise SourcePlanConflictError(
-                "conflicting labels for "
-                f"evidence_ids={evidence_ids}, evaluation_ids={evaluation_ids}"
-            )
+            conflicts.append(_provenance(records))
+            continue
         canonical_row, canonical_evidence = min(
             records,
             key=lambda item: (item[1].evidence_id, item[0].evaluation_id),
@@ -147,8 +171,17 @@ def normalize_source_export(
                 canonical_evidence.evidence_id,
                 canonical_evidence.storage_key,
                 canonical_row.valor_cc,
-                tuple(sorted(evidence.evidence_id for _, evidence in records)),
-                tuple(sorted(row.evaluation_id for row, _ in records)),
+                _provenance(records),
+            )
+        )
+
+    if conflicts:
+        raise SourcePlanConflictError(
+            min(
+                conflicts,
+                key=lambda group: tuple(
+                    (item.evidence_id, item.evaluation_id) for item in group
+                ),
             )
         )
 
