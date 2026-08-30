@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+import hashlib
+import json
+from collections import Counter
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from numbers import Real
 
 from .source_plan import SourceCandidate, SourceExclusion, SourcePlan, SourceProvenance
@@ -31,10 +35,13 @@ class IntegerSplitInputError(IntegerSplitPlanError):
 class IntegerSplitConfig:
     seed: int
     val_ratio: float
+    canonical_val_ratio: str = field(init=False)
 
     def __post_init__(self) -> None:
         _validate_seed(self.seed)
-        object.__setattr__(self, "val_ratio", _validate_ratio(self.val_ratio))
+        ratio, canonical_ratio = _validate_ratio(self.val_ratio)
+        object.__setattr__(self, "val_ratio", ratio)
+        object.__setattr__(self, "canonical_val_ratio", canonical_ratio)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,13 +70,23 @@ class IntegerSplitAssignment:
     def __post_init__(self) -> None:
         object.__setattr__(self, "provenance", tuple(self.provenance))
 
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(split={self.split!r}, "
+            f"bcs_score={self.bcs_score!r}, evidence_id={self.evidence_id!r}, "
+            f"provenance={self.provenance!r}, "
+            f"relative_path_stem={self.relative_path_stem!r})"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class IntegerSplitPlanIdentity:
     seed: int
     val_ratio: float
+    canonical_val_ratio: str
     candidate_evidence_ids: tuple[int, ...]
     excluded_evidence_ids: tuple[int, ...]
+    digest: str
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -101,13 +118,19 @@ def _validate_seed(seed: int) -> None:
         raise IntegerSplitConfigError("seed must be an integer, not bool")
 
 
-def _validate_ratio(val_ratio: Real) -> float:
+def _validate_ratio(val_ratio: Real) -> tuple[float, str]:
     if isinstance(val_ratio, bool) or not isinstance(val_ratio, Real):
         raise IntegerSplitConfigError("val_ratio must be a finite real number")
     ratio = float(val_ratio)
     if not math.isfinite(ratio) or not 0.0 <= ratio < 1.0:
         raise IntegerSplitConfigError("val_ratio must be finite and in [0, 1)")
-    return ratio
+    try:
+        decimal_ratio = Decimal(str(val_ratio))
+    except InvalidOperation:
+        decimal_ratio = Decimal(str(ratio))
+    if decimal_ratio == 0:
+        decimal_ratio = Decimal(0)
+    return ratio, format(decimal_ratio.normalize(), "f")
 
 
 def _validate_input(source_plan: BCSIntegerSourcePlan) -> tuple[SourceCandidate, ...]:
@@ -119,6 +142,19 @@ def _validate_input(source_plan: BCSIntegerSourcePlan) -> tuple[SourceCandidate,
         raise IntegerSplitInputError(
             "normalized source plan has duplicate evidence IDs"
         )
+    exclusion_ids = [item.evidence_id for item in source_plan.exclusions]
+    duplicate_exclusions = tuple(
+        sorted(item for item, count in Counter(exclusion_ids).items() if count > 1)
+    )
+    if duplicate_exclusions:
+        raise IntegerSplitInputError(
+            f"duplicate exclusion evidence IDs: {duplicate_exclusions}"
+        )
+    overlap = tuple(sorted(set(evidence_ids).intersection(exclusion_ids)))
+    if overlap:
+        raise IntegerSplitInputError(
+            f"evidence IDs appear in both candidates and exclusions: {overlap}"
+        )
     for candidate in candidates:
         if type(candidate.bcs_score) is not int or not 1 <= candidate.bcs_score <= 5:
             raise IntegerSplitInputError(
@@ -129,10 +165,12 @@ def _validate_input(source_plan: BCSIntegerSourcePlan) -> tuple[SourceCandidate,
     return candidates
 
 
-def _validation_count(size: int, ratio: float) -> int:
+def _validation_count(size: int, canonical_ratio: str) -> int:
+    ratio = Decimal(canonical_ratio)
     if ratio == 0.0 or size < 2:
         return 0
-    return min(size - 1, max(1, math.floor(size * ratio)))
+    floor_count = int((Decimal(size) * ratio).to_integral_value(rounding=ROUND_FLOOR))
+    return min(size - 1, max(1, floor_count))
 
 
 def _assignment(
@@ -147,6 +185,57 @@ def _assignment(
         storage_key=candidate.storage_key,
         relative_path_stem=f"{split}/{candidate.bcs_score}/{candidate.evidence_id}",
     )
+
+
+def _identity_digest(
+    config: IntegerSplitConfig,
+    candidates: tuple[SourceCandidate, ...],
+    exclusions: tuple[SourceExclusion, ...],
+    assignments: tuple[IntegerSplitAssignment, ...],
+    counts: IntegerSplitCounts,
+) -> str:
+    payload = {
+        "assignments": [
+            (
+                item.split,
+                item.bcs_score,
+                item.evidence_id,
+                tuple((p.evidence_id, p.evaluation_id) for p in item.provenance),
+                item.storage_key,
+                item.relative_path_stem,
+            )
+            for item in assignments
+        ],
+        "candidates": [
+            (
+                item.evaluation_id,
+                item.session_id,
+                item.animal_id,
+                item.evidence_id,
+                item.storage_key,
+                item.bcs_score,
+                tuple((p.evidence_id, p.evaluation_id) for p in item.provenance),
+            )
+            for item in sorted(
+                candidates, key=lambda item: (item.bcs_score, item.evidence_id)
+            )
+        ],
+        "config": (config.seed, config.canonical_val_ratio),
+        "counts": {"train": counts.train, "val": counts.val},
+        "exclusions": sorted(
+            (
+                item.evidence_id,
+                item.evaluation_id,
+                item.bcs_score,
+                item.reason,
+            )
+            for item in exclusions
+        ),
+    }
+    serialized = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def create_integer_split_plan(
@@ -170,7 +259,7 @@ def create_integer_split_plan(
     for score in range(1, 6):
         class_candidates = by_score[score]
         random.Random(config.seed + score).shuffle(class_candidates)
-        val_count = _validation_count(len(class_candidates), config.val_ratio)
+        val_count = _validation_count(len(class_candidates), config.canonical_val_ratio)
         for index, candidate in enumerate(class_candidates):
             split = "val" if index < val_count else "train"
             assignments.append(_assignment(candidate, split))
@@ -187,10 +276,12 @@ def create_integer_split_plan(
             ),
         )
     )
+    counts = IntegerSplitCounts(tuple(train_counts), tuple(val_counts))
     excluded_ids = tuple(sorted(item.evidence_id for item in source_plan.exclusions))
     identity = IntegerSplitPlanIdentity(
         seed=config.seed,
         val_ratio=config.val_ratio,
+        canonical_val_ratio=config.canonical_val_ratio,
         candidate_evidence_ids=tuple(
             item.evidence_id
             for item in sorted(
@@ -198,11 +289,18 @@ def create_integer_split_plan(
             )
         ),
         excluded_evidence_ids=excluded_ids,
+        digest=_identity_digest(
+            config,
+            candidates,
+            source_plan.exclusions,
+            ordered_assignments,
+            counts,
+        ),
     )
     return IntegerSplitPlan(
         assignments=ordered_assignments,
         exclusions=source_plan.exclusions,
-        counts=IntegerSplitCounts(tuple(train_counts), tuple(val_counts)),
+        counts=counts,
         config=config,
         identity=identity,
     )

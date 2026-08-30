@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -32,10 +33,17 @@ def candidate(evidence_id: int, score: int) -> SourceCandidate:
     )
 
 
-def plan(*candidates: SourceCandidate) -> SourcePlan:
+def plan(
+    *candidates: SourceCandidate,
+    exclusions: tuple[SourceExclusion, ...] = (),
+) -> SourcePlan:
     return SourcePlan(
-        candidates=tuple(candidates), exclusions=(), class_counts=(0,) * 5
+        candidates=tuple(candidates), exclusions=exclusions, class_counts=(0,) * 5
     )
+
+
+def digest(source: SourcePlan, seed: int = 7, ratio: float = 0.5) -> str:
+    return create_integer_split_plan(source, seed=seed, val_ratio=ratio).identity.digest
 
 
 def test_ratio_zero_and_stratified_boundary_counts_keep_small_classes_in_train():
@@ -54,6 +62,18 @@ def test_ratio_zero_and_stratified_boundary_counts_keep_small_classes_in_train()
         item.split == "train"
         for item in create_integer_split_plan(source, seed=7, val_ratio=0).assignments
     )
+
+
+def test_decimal_floor_boundaries_and_clamps_are_exact():
+    hundred = plan(*(candidate(evidence_id, 1) for evidence_id in range(100)))
+    assert (
+        create_integer_split_plan(hundred, seed=7, val_ratio=0.29).counts.val[0] == 29
+    )
+
+    three = plan(*(candidate(evidence_id, 2) for evidence_id in range(3)))
+    assert create_integer_split_plan(three, seed=7, val_ratio=0.01).counts.val[1] == 1
+    two = plan(candidate(1, 3), candidate(2, 3))
+    assert create_integer_split_plan(two, seed=7, val_ratio=0.99).counts.val[2] == 1
 
 
 @pytest.mark.parametrize("ratio", [True, math.nan, math.inf, -0.01, 1.0, "0.5"])
@@ -147,3 +167,64 @@ def test_provenance_and_outputs_are_immutable_and_fractional_labels_are_rejected
 
     with pytest.raises(IntegerSplitInputError):
         create_integer_split_plan(plan(candidate(1, 3.5)), seed=1, val_ratio=0)
+
+
+def test_duplicate_and_overlapping_exclusion_ids_are_typed_and_order_independent():
+    duplicate = (
+        SourceExclusion(10, 9, 1, "empty_storage_key"),
+        SourceExclusion(11, 9, 1, "whitespace_storage_key"),
+    )
+    overlap = (SourceExclusion(10, 1, 1, "empty_storage_key"),)
+
+    def error_text(source):
+        with pytest.raises(IntegerSplitInputError) as failure:
+            create_integer_split_plan(source, seed=1, val_ratio=0)
+        return type(failure.value), str(failure.value)
+
+    first = error_text(plan(candidate(1, 1), exclusions=duplicate))
+    second = error_text(plan(candidate(1, 1), exclusions=tuple(reversed(duplicate))))
+    assert first == second
+
+    assert error_text(plan(candidate(1, 1), exclusions=overlap))[1] == (
+        "evidence IDs appear in both candidates and exclusions: (1,)"
+    )
+
+
+def test_identity_digest_changes_for_contract_relevant_inputs_and_hides_storage_keys():
+    base_candidate = candidate(2, 2)
+    base_exclusion = SourceExclusion(90, 900, 4, "empty_storage_key")
+    base = plan(base_candidate, candidate(5, 3), exclusions=(base_exclusion,))
+    base_digest = digest(base)
+
+    candidate_changes = (
+        replace(base_candidate, bcs_score=1),
+        replace(base_candidate, evidence_id=3),
+        replace(base_candidate, session_id=999),
+        replace(base_candidate, animal_id=999),
+        replace(base_candidate, evaluation_id=999),
+        replace(base_candidate, storage_key="changed-key"),
+        replace(base_candidate, provenance=(SourceProvenance(2, 999),)),
+    )
+    assert all(
+        digest(plan(changed, candidate(5, 3), exclusions=(base_exclusion,)))
+        != base_digest
+        for changed in candidate_changes
+    )
+
+    exclusion_changes = (
+        replace(base_exclusion, evidence_id=91),
+        replace(base_exclusion, bcs_score=5),
+        replace(base_exclusion, reason="whitespace_storage_key"),
+    )
+    assert all(
+        digest(plan(base_candidate, candidate(5, 3), exclusions=(changed,)))
+        != base_digest
+        for changed in exclusion_changes
+    )
+
+    assert digest(base, seed=8) != base_digest
+    assert digest(base, ratio=0.25) != base_digest
+    changed_plan = create_integer_split_plan(
+        plan(replace(base_candidate, storage_key="changed-key")), seed=7, val_ratio=0
+    )
+    assert "changed-key" not in repr(changed_plan)
