@@ -15,6 +15,7 @@ dependencies = ["Pillow"]
 yolo = ["ultralytics==8.4.115"]
 bcs = [
   "PyYAML>=6.0",
+  "requests>=2.34.2,<3",
   "torch>=2.6",
   "torchvision>=0.21",
 ]
