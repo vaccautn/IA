@@ -178,13 +178,15 @@ def test_http_and_transport_failures_are_typed_without_sensitive_data():
         (requests.Timeout("secret-token"), BCSSourceTransportError),
         (requests.ConnectionError("secret-token"), BCSSourceTransportError),
     ]:
-        client, _ = client_for(
+        client, transport = client_for(
             payload={"error": "do not disclose"}, status_code=503, error=error
         )
         with pytest.raises(expected) as failure:
             client.fetch()
         assert "secret-token" not in str(failure.value)
         assert "do not disclose" not in str(failure.value)
+        if error is None:
+            assert transport.response.closed
 
 
 def test_invalid_json_is_typed_and_payload_is_not_disclosed():
@@ -203,6 +205,7 @@ def test_redirect_status_is_not_followed():
     with pytest.raises(BCSSourceHTTPError):
         client.fetch()
 
+    assert transport.response.closed
     assert transport.calls[0][3:] == (True, False)
 
 
