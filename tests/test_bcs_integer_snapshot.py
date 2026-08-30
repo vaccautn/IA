@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,11 +18,20 @@ from vacca_bcs.source_plan import (
     SourcePlan,
     SourceProvenance,
 )
-from vacca_bcs.source_split_plan import create_integer_split_plan
+from vacca_bcs.source_split_plan import (
+    IntegerSplitInputError,
+    create_integer_split_plan,
+    validate_integer_split_plan,
+)
 from vacca_bcs.integer_snapshot import (
+    IntegerSnapshotCleanupError,
+    IntegerSnapshotDurabilityError,
     IntegerSnapshotImageError,
+    IntegerSnapshotLockCleanupError,
+    IntegerSnapshotLockError,
     IntegerSnapshotMaterializationError,
     IntegerSnapshotOutputError,
+    IntegerSnapshotPublicationError,
     build_integer_snapshot,
 )
 
@@ -109,6 +121,11 @@ def test_empty_plan_preserves_exclusions_and_creates_empty_class_dirs(tmp_path: 
     assert snapshot.records == ()
     assert manifest["records"] == []
     assert manifest["exclusions"][0]["reason"] == "empty_storage_key"
+    assert all(
+        (tmp_path / "empty" / split / str(score)).is_dir()
+        for split in ("train", "val")
+        for score in range(1, 6)
+    )
 
 
 @pytest.mark.parametrize(
@@ -170,3 +187,158 @@ def test_existing_output_is_refused_and_midway_failure_cleans_staging(tmp_path: 
         )
     assert not (tmp_path / "partial").exists()
     assert not list(tmp_path.glob(".partial.staging-*"))
+
+
+def test_malformed_plan_fails_validation_before_materialization(tmp_path: Path):
+    source = split_plan(candidate(1, 1))
+    calls = 0
+
+    def materialize(evidence_id: int):
+        nonlocal calls
+        calls += 1
+        return BCSEvidencePayload(evidence_id, image_bytes("JPEG"), "wrong")
+
+    malformed = (
+        replace(source, counts=replace(source.counts, train=(0, 0, 0, 0, 0))),
+        replace(source, identity=replace(source.identity, digest="0" * 64)),
+    )
+    for invalid in malformed:
+        with pytest.raises(IntegerSplitInputError):
+            validate_integer_split_plan(invalid)
+        with pytest.raises(IntegerSplitInputError):
+            build_integer_snapshot(invalid, tmp_path / f"bad-{calls}", materialize)
+    assert calls == 0
+
+
+def test_dangling_final_symlink_is_refused_when_supported(tmp_path: Path):
+    target = tmp_path / "dangling"
+    try:
+        os.symlink(tmp_path / "missing", target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are unavailable")
+    with pytest.raises(IntegerSnapshotOutputError):
+        build_integer_snapshot(
+            split_plan(candidate(1, 1)),
+            target,
+            materializer({1: image_bytes("JPEG")}),
+        )
+
+
+def test_sibling_lock_prevents_concurrent_publication_and_is_released(tmp_path: Path):
+    lock = tmp_path / ".locked.lock"
+    lock.write_bytes(b"held")
+    with pytest.raises(IntegerSnapshotLockError):
+        build_integer_snapshot(
+            split_plan(candidate(1, 1)),
+            tmp_path / "locked",
+            materializer({1: image_bytes("JPEG")}),
+        )
+    lock.unlink()
+    build_integer_snapshot(
+        split_plan(candidate(1, 1)),
+        tmp_path / "locked",
+        materializer({1: image_bytes("JPEG")}),
+    )
+    assert not lock.exists()
+
+
+def test_publication_rechecks_final_target_after_staging(tmp_path: Path, monkeypatch):
+    import vacca_bcs.integer_snapshot as snapshot_module
+
+    target = tmp_path / "raced"
+    real_lexists = snapshot_module.os.path.lexists
+    checks = 0
+
+    def raced_lexists(path):
+        nonlocal checks
+        if Path(path) == target:
+            checks += 1
+            if checks >= 3:
+                return True
+        return real_lexists(path)
+
+    monkeypatch.setattr(snapshot_module.os.path, "lexists", raced_lexists)
+    with pytest.raises(IntegerSnapshotOutputError):
+        build_integer_snapshot(
+            split_plan(candidate(1, 1)), target, materializer({1: image_bytes("JPEG")})
+        )
+    assert not list(tmp_path.glob(".raced.lock"))
+
+
+def test_durability_and_rename_failures_leave_no_published_root(
+    tmp_path: Path, monkeypatch
+):
+    import vacca_bcs.integer_snapshot as snapshot_module
+
+    monkeypatch.setattr(
+        snapshot_module.os,
+        "fsync",
+        lambda _: (_ for _ in ()).throw(OSError("fsync")),
+    )
+    with pytest.raises(IntegerSnapshotDurabilityError):
+        build_integer_snapshot(
+            split_plan(candidate(1, 1)),
+            tmp_path / "fsync",
+            materializer({1: image_bytes("JPEG")}),
+        )
+    assert not (tmp_path / "fsync").exists()
+    monkeypatch.undo()
+
+    monkeypatch.setattr(
+        snapshot_module.os,
+        "rename",
+        lambda *args: (_ for _ in ()).throw(OSError("rename")),
+    )
+    with pytest.raises(IntegerSnapshotPublicationError):
+        build_integer_snapshot(
+            split_plan(candidate(1, 1)),
+            tmp_path / "rename",
+            materializer({1: image_bytes("JPEG")}),
+        )
+    assert not (tmp_path / "rename").exists()
+
+
+def test_cleanup_failure_is_typed_visible_and_chains_original_failure(
+    tmp_path: Path, monkeypatch
+):
+    import vacca_bcs.integer_snapshot as snapshot_module
+
+    real_remove = shutil.rmtree
+    monkeypatch.setattr(
+        snapshot_module.shutil,
+        "rmtree",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cleanup")),
+    )
+    with pytest.raises(IntegerSnapshotCleanupError) as failure:
+        build_integer_snapshot(
+            split_plan(candidate(1, 1, "secret-key")),
+            tmp_path / "cleanup",
+            lambda _: (_ for _ in ()).throw(RuntimeError("payload")),
+        )
+    assert ".cleanup.staging-" in str(failure.value)
+    assert any("original failure" in note for note in failure.value.__notes__)
+    assert "secret-key" not in str(failure.value)
+    monkeypatch.undo()
+    for staging in tmp_path.glob(".cleanup.staging-*"):
+        real_remove(staging)
+
+
+def test_lock_cleanup_failure_is_typed_after_publication(tmp_path: Path, monkeypatch):
+    import vacca_bcs.integer_snapshot as snapshot_module
+
+    real_unlink = snapshot_module.os.unlink
+    monkeypatch.setattr(
+        snapshot_module.os,
+        "unlink",
+        lambda path: (_ for _ in ()).throw(OSError("lock cleanup")),
+    )
+    with pytest.raises(IntegerSnapshotLockCleanupError):
+        build_integer_snapshot(
+            split_plan(candidate(1, 1)),
+            tmp_path / "lock-cleanup",
+            materializer({1: image_bytes("JPEG")}),
+        )
+    assert (tmp_path / "lock-cleanup").exists()
+    monkeypatch.undo()
+    real_unlink(tmp_path / ".lock-cleanup.lock")
+    shutil.rmtree(tmp_path / "lock-cleanup")

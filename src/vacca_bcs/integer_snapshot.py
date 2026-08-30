@@ -1,4 +1,4 @@
-"""Transactional snapshots; empty train/val class directories are retained."""
+"""Transactional snapshots; Windows directory fsync is unsupported, external mutation is out of contract."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from .source_split_plan import (
     IntegerSplitAssignment,
     IntegerSplitCounts,
     IntegerSplitPlan,
+    validate_integer_split_plan,
 )
 
 SNAPSHOT_SCHEMA_VERSION = "bcs-integer-snapshot-v1"
@@ -50,6 +51,26 @@ class IntegerSnapshotImageError(IntegerSnapshotMaterializationError):
 
 
 class IntegerSnapshotOutputError(IntegerSnapshotError):
+    pass
+
+
+class IntegerSnapshotLockError(IntegerSnapshotError):
+    pass
+
+
+class IntegerSnapshotLockCleanupError(IntegerSnapshotError):
+    pass
+
+
+class IntegerSnapshotCleanupError(IntegerSnapshotError):
+    pass
+
+
+class IntegerSnapshotDurabilityError(IntegerSnapshotError):
+    pass
+
+
+class IntegerSnapshotPublicationError(IntegerSnapshotError):
     pass
 
 
@@ -127,10 +148,87 @@ def _materialize(
 
 
 def _write_file(path: Path, content: bytes) -> None:
-    with path.open("wb") as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        with path.open("wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        raise IntegerSnapshotDurabilityError(
+            "snapshot file durability failed"
+        ) from None
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise IntegerSnapshotDurabilityError(
+            "snapshot directory durability failed"
+        ) from None
+
+
+def _lock_path(output_root: Path) -> Path:
+    return output_root.parent / f".{output_root.name}.lock"
+
+
+def _acquire_lock(output_root: Path) -> Path:
+    lock = _lock_path(output_root)
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(descriptor)
+    except FileExistsError:
+        raise IntegerSnapshotLockError("output reservation already exists") from None
+    except OSError:
+        raise IntegerSnapshotLockError("could not reserve output") from None
+    return lock
+
+
+def _release_lock(lock: Path) -> None:
+    try:
+        os.unlink(lock)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise IntegerSnapshotLockCleanupError(
+            f"failed to release output reservation {lock.name}"
+        ) from exc
+
+
+def _cleanup_after_failure(
+    staging: Path | None, lock: Path, original: BaseException
+) -> None:
+    failures: list[tuple[str, BaseException]] = []
+    if staging is not None and os.path.lexists(staging):
+        try:
+            shutil.rmtree(staging)
+        except BaseException as exc:
+            failures.append(("staging", exc))
+    try:
+        _release_lock(lock)
+    except BaseException as exc:
+        failures.append(("lock", exc))
+    if not failures:
+        return
+    kind, cause = failures[0]
+    error_type = (
+        IntegerSnapshotCleanupError
+        if kind == "staging"
+        else IntegerSnapshotLockCleanupError
+    )
+    error = error_type(
+        f"failed to clean {kind} for {staging.name if kind == 'staging' and staging else lock.name}"
+    )
+    error.add_note(f"original failure: {type(original).__name__}")
+    for failure_kind, failure in failures:
+        error.add_note(f"{failure_kind} cleanup failure: {type(failure).__name__}")
+    raise error from cause
 
 
 def _manifest(
@@ -163,6 +261,8 @@ def _check_assignment(assignment: IntegerSplitAssignment) -> None:
     if (
         assignment.split not in {"train", "val"}
         or not 1 <= assignment.bcs_score <= 5
+        or type(assignment.evidence_id) is not int
+        or assignment.evidence_id <= 0
         or assignment.relative_path_stem != expected
     ):
         raise IntegerSnapshotInputError("split plan contains an invalid assignment")
@@ -176,16 +276,24 @@ def build_integer_snapshot(
     """Materialize and atomically publish one immutable integer snapshot."""
     if not isinstance(plan, IntegerSplitPlan):
         raise IntegerSnapshotInputError("input must be an integer split plan")
+    validate_integer_split_plan(plan)
+    validate_integer_split_plan(plan)
     output_root = Path(output_root)
-    if output_root.exists():
+    if os.path.lexists(output_root):
         raise IntegerSnapshotOutputError("output root already exists")
     output_root.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{output_root.name}.staging-", dir=output_root.parent)
-    )
+    lock = _acquire_lock(output_root)
+    staging: Path | None = None
     records: list[IntegerSnapshotRecord] = []
     seen: set[int] = set()
     try:
+        if os.path.lexists(output_root):
+            raise IntegerSnapshotOutputError("output root already exists")
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{output_root.name}.staging-", dir=output_root.parent
+            )
+        )
         for split in ("train", "val"):
             for score in range(1, 6):
                 (staging / split / str(score)).mkdir(parents=True, exist_ok=True)
@@ -214,7 +322,21 @@ def build_integer_snapshot(
         records_tuple = tuple(records)
         manifest_json = _manifest(plan, records_tuple)
         _write_file(staging / "manifest.json", manifest_json.encode("utf-8"))
-        os.rename(staging, output_root)
+        for split in ("train", "val"):
+            for score in range(1, 6):
+                _fsync_directory(staging / split / str(score))
+        _fsync_directory(staging)
+        if os.path.lexists(output_root):
+            raise IntegerSnapshotOutputError("output root already exists")
+        try:
+            os.rename(staging, output_root)
+        except OSError:
+            raise IntegerSnapshotPublicationError(
+                "snapshot publication failed"
+            ) from None
+        _fsync_directory(output_root)
+        _fsync_directory(output_root.parent)
+        _release_lock(lock)
         return IntegerDatasetSnapshot(
             output_root,
             records_tuple,
@@ -222,6 +344,6 @@ def build_integer_snapshot(
             plan.counts,
             manifest_json,
         )
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+    except BaseException as original:
+        _cleanup_after_failure(staging, lock, original)
         raise

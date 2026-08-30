@@ -104,10 +104,12 @@ class IntegerSplitPlan:
     counts: IntegerSplitCounts
     config: IntegerSplitConfig
     identity: IntegerSplitPlanIdentity
+    source_candidates: tuple[SourceCandidate, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "assignments", tuple(self.assignments))
         object.__setattr__(self, "exclusions", tuple(self.exclusions))
+        object.__setattr__(self, "source_candidates", tuple(self.source_candidates))
 
 
 BCSIntegerSourcePlan = SourcePlan
@@ -303,7 +305,27 @@ def create_integer_split_plan(
         counts=counts,
         config=config,
         identity=identity,
+        source_candidates=tuple(
+            sorted(candidates, key=lambda item: (item.bcs_score, item.evidence_id))
+        ),
     )
 
 
 plan_integer_splits = create_integer_split_plan
+
+
+def validate_integer_split_plan(plan: IntegerSplitPlan) -> None:
+    """Recompute and validate every contract-relevant part of a split plan."""
+    if not isinstance(plan, IntegerSplitPlan):
+        raise IntegerSplitInputError("input must be an integer split plan")
+    source = SourcePlan(plan.source_candidates, plan.exclusions, (0,) * 5)
+    expected = create_integer_split_plan(
+        source, seed=plan.config.seed, val_ratio=plan.config.val_ratio
+    )
+    if (
+        plan.assignments != expected.assignments
+        or plan.exclusions != expected.exclusions
+        or plan.counts != expected.counts
+        or plan.identity != expected.identity
+    ):
+        raise IntegerSplitInputError("integer split plan integrity validation failed")
