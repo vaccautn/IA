@@ -19,6 +19,29 @@ La detección de Fase 1 tiene un camino local de prototipo. El builder, el núcl
 - GPU NVIDIA con CUDA 12.4 (opcional, funciona en CPU pero más lento)
 - ~3 GB de espacio para el modelo y dependencias
 
+## Artefactos versionados y política de lint
+
+Estos artefactos son intencionalmente versionados para reproducibilidad y despliegue:
+
+- `models/deploy/vacca-yolo26n-v1.pt`: modelo destinado al despliegue.
+- `fixtures/cow_female_black_white.jpg`: fixture reproducible de inferencia.
+- `configs/baseline_manifest.json`: manifiesto de configuración y procedencia.
+- `reports/baseline-inference-2026-08-02.md`: evidencia del baseline reproducible.
+
+Los reportes generados bajo `reports/generated/` (excepto el baseline indicado),
+checkpoints, datasets, runs, outputs y pesos locales permanecen ignorados por Git.
+Los archivos de código o documentación bajo `models/` no quedan ocultos por esta
+política.
+
+Ruff está fijado como dependencia opcional de desarrollo y analiza sólo el código
+versionado de `src/`, `scripts/` y `tests/`. Después de crear el entorno, instalalo
+y ejecutá el chequeo desde el entorno del proyecto:
+
+```powershell
+.venv\Scripts\python -m pip install -e ".[dev]"
+.venv\Scripts\python -m ruff check src scripts tests
+```
+
 ## Setup rápido
 
 ```powershell

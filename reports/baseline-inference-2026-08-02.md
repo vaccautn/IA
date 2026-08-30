@@ -29,7 +29,7 @@ Installation used the official PyTorch CPU index for the `+cpu` wheels and PyPI 
 | Fixture | Wikimedia Commons revision `1202221419`, USDA ARS image by Keith Weller, `PD-USGov-USDA-ARS` |
 | Fixture evidence | 908,691 bytes, SHA-256 `e0972384d3151174d1450cff81bb19d1fc89519a5d1f6fc7ade5d710a89e56d8` |
 
-The `.pt` file was loaded only after exact size and digest verification. The fixture digest and size were checked against the same immutable byte snapshot used for inference, before detector construction. The release provides no independent signature, and a matching digest does not make an unknown source trustworthy. Binary model, fixture, settings, and run outputs remain Git-ignored.
+The `.pt` file was loaded only after exact size and digest verification. The fixture digest and size were checked against the same immutable byte snapshot used for inference, before detector construction. The release provides no independent signature, and a matching digest does not make an unknown source trustworthy. The deploy model, fixture, baseline manifest, and this report are intentionally versioned reproducibility/deployment artifacts. Generated reports, checkpoints, datasets, runs, outputs, and local weights remain Git-ignored.
 
 ## Command
 

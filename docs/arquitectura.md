@@ -91,8 +91,9 @@ El PRD establece que el prototipo de IA es independiente del backend actual y qu
 
 | Contenido | Tratamiento |
 |---|---|
-| Código, tests, configs, PRD, reportes y `models/deploy/` | Versionables según el estado del archivo. |
-| `data/`, datasets, imágenes y archivos de imagen generados | Ignorados por `.gitignore`; no son parte del checkout portable. |
-| `outputs/`, `runs/`, `artifacts/`, `mlruns/` | Resultados locales ignorados; incluyen pesos de entrenamiento no garantizados. |
-| `models/*` salvo `models/deploy/*.pt` | Ignorado por `.gitignore`; el peso de deploy versionado es una excepción explícita. |
-| `.venv/`, caches y archivos `.env*` | Entorno/configuración local ignorados; no deben copiarse a documentación ni commits. |
+| `models/deploy/vacca-yolo26n-v1.pt`, `fixtures/cow_female_black_white.jpg`, `configs/baseline_manifest.json` y `reports/baseline-inference-2026-08-02.md` | Artefactos intencionalmente versionados para reproducibilidad y despliegue. |
+| Código, tests, configs, PRD y documentación | Versionables; el código y la documentación bajo `models/` también permanecen visibles para Git. |
+| `data/`, datasets, imágenes y archivos de imagen generados | Ignorados por `.gitignore`; no son parte del checkout portable, excepto el fixture versionado explícitamente. |
+| `outputs/`, `runs/`, `artifacts/`, `mlruns/`, `reports/generated/` y checkpoints | Resultados locales ignorados; incluyen pesos de entrenamiento no garantizados. |
+| Pesos locales bajo `models/checkpoints/` o `models/weights/` y formatos de peso exportados | Ignorados por `.gitignore`; el modelo de deploy tiene una excepción explícita. |
+| `.venv/`, caches y archivos `.env*` salvo `.env.example` | Entorno/configuración local ignorados; `.env.example` permanece disponible para documentar configuración. |

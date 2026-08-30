@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 .coverage
 .coverage.*
+coverage.xml
+coverage.json
 .hypothesis/
 .mypy_cache/
 .pytest_cache/
@@ -28,6 +30,25 @@ Thumbs.db
 .env.*
 !.env.example
 
+# Logs, temporary files, backups, and editor swap files
+logs/
+*.log
+temp/
+tmp/
+backups/
+*.tmp
+*.temp
+*.bak
+*.backup
+*~
+*.swp
+*.swo
+
+# Test and notebook tool state
+.tox/
+.nox/
+.ipynb_checkpoints/
+
 # Private datasets and images
 data/
 dataset/
@@ -41,7 +62,8 @@ images/
 *.tif
 *.tiff
 *.webp
-!fixtures/*
+!fixtures/
+!fixtures/**
 
 # Compressed archives (datasets, releases)
 *.7z
@@ -52,7 +74,8 @@ images/
 
 # Checkpoints, weights, and exported models
 checkpoints/
-models/*
+models/checkpoints/
+models/weights/
 weights/
 *.ckpt
 *.onnx
@@ -67,7 +90,9 @@ outputs/
 runs/
 artifacts/
 mlruns/
+reports/generated/
+reports/generated-*
 
 # Deployment model (versioned exception for server deploys)
 !models/deploy/
-!models/deploy/*.pt
+!models/deploy/vacca-yolo26n-v1.pt
