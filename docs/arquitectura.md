@@ -99,6 +99,10 @@ El PRD establece que el prototipo de IA es independiente del backend actual y qu
 - Configuration, transport, HTTP, JSON, response-size, and contract failures use typed exceptions. Tokens and full response payloads are never included in exception messages or the client representation.
 - `BCSEvidenceMaterializer.materialize(evidence_id)` resolves one signed URL and returns bytes plus SHA-256 without retaining the signed URL; neither class writes files, decodes images, migrates integer datasets, assigns labels, or connects the client to the `/bcs` serving placeholder. Requests may canonicalize percent-escape case; byte-identical wire encoding is not guaranteed.
 
+## Deterministic integer source plan
+
+`src/vacca_bcs/source_plan.py` provides the pure `normalize_source_export` function. It excludes empty or whitespace-only storage keys with explicit reasons, rejects surrounding whitespace in non-empty keys, collapses exact-key same-label records using the lowest evidence ID, and fails on conflicting labels without exposing key text. Its immutable output is ordered by `(bcs_score, evidence_id)` with counts for classes `1..5`; it performs no download, filesystem write, image decode, split, hash, or label migration.
+
 ## Límites de artefactos y datos
 
 | Contenido | Tratamiento |
