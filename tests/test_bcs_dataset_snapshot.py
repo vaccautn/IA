@@ -46,7 +46,7 @@ def test_manifest_is_deterministic_relative_and_hashes_installed_snapshot(tmp_pa
     manifest = json.loads(first_bytes)
     assert manifest["manifest_schema_version"] == 1
     assert manifest["builder_inputs"] == {"max_per_class": 4, "seed": 7, "val_ratio": 0.25}
-    assert manifest["class_values"] == CLASS_NAMES
+    assert manifest["class_values"] == list(CLASS_NAMES)
     assert manifest["class_mapping"] == {name: index for index, name in enumerate(CLASS_NAMES)}
     entries = manifest["selected_files"]
     assert [entry["destination"] for entry in entries] == sorted(
@@ -105,7 +105,7 @@ import sys
 import vacca_bcs.dataset_build_plan
 import vacca_bcs.dataset_snapshot
 from vacca_bcs.constants import CLASS_NAMES
-assert CLASS_NAMES == ["3.25", "3.5", "3.75", "4.0", "4.25"]
+assert CLASS_NAMES == ("1", "2", "3", "4", "5")
 for name in ("torch", "torchvision", "vacca_bcs.model", "vacca_bcs.dataset"):
     assert name not in sys.modules, name
 """

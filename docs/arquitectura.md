@@ -10,7 +10,7 @@
 | `src/vacca_vision/` | Contratos de detección, validación de imágenes, reglas de aptitud y adaptador Ultralytics. | `contracts.py`, `image_validation.py`, `pipeline.py`, `ultralytics_adapter.py` |
 | `scripts/run_baseline.py` | Ejecuta el camino validado por manifiesto: snapshot, detector, pipeline y salida JSON. | `configs/baseline_manifest.json` |
 | `src/vacca_bcs/` comprometido | Dataset ordinal seguro y pipeline de modelo/transformaciones. | `constants.py`, `dataset.py`, `model.py` y módulos `dataset_*` |
-| Cliente de fuente BCS | Cliente HTTP autenticado y estricto para consumir el export humano versionado. | `source_client.py` y `tests/test_bcs_source_client.py` |
+| Cliente de fuente BCS | Cliente HTTP autenticado y estricto para consumir el export versionado de la fuente. | `source_client.py` y `tests/test_bcs_source_client.py` |
 | Modelo ordinal BCS | Versionado y probado con fixtures temporales; no es serving HTTP. | `BCSOrdinalModel`, `CORALHead`, `coral_loss` y `predict` en `model.py` |
 | Entrenamiento y reanudación ordinales | Código, configuración y pruebas versionados; no hay una ejecución real comprometida. | `scripts/train_bcs_ordinal.py`, `configs/training_bcs_ordinal.yaml` y artefactos `weights/last.pt`/`run_info.json` sólo cuando una operación local los genera |
 | `tests/` | Gates de contratos, baseline, pipeline, builder y BCS ordinal. | Archivos `test_*.py` versionados en la rama, incluidos los caminos reales temporales |
@@ -43,7 +43,7 @@ El endpoint HTTP no usa `AptitudePipeline`, `ImageValidationConfig` ni `Classifi
 ## Flujo del builder de dataset BCS
 
 ```text
-data/bcs/dataset/{3.25,3.5,3.75,4.0,4.25}
+data/bcs-integer-v1/{1,2,3,4,5}
     ↓
 topología y seguridad de rutas
     ↓
@@ -59,7 +59,7 @@ data/bcs-cls/{train,val,...}
     ↓
 Letterbox + normalización → ResNet18 + cabeza CORAL
     ↓
-score BCS fraccionario → results.csv / best.pt / last.pt / run_info.json
+    continuous model estimate → canonical integer BCS score 1..5
 ```
 
 - `dataset_topology.py` rechaza solapamientos entre fuente y destino y puntos de reanálisis inseguros.
@@ -70,19 +70,19 @@ score BCS fraccionario → results.csv / best.pt / last.pt / run_info.json
 
 El manifiesto registra entradas de builder, escala y mapeo de clases, archivos seleccionados con fuente/destino/digest, y conteos por split y clase. `data/` está ignorado por Git: tanto el dataset generado como `data/bcs-cls/manifest.json` permanecen fuera del seguimiento Git aunque su esquema tenga versión.
 
-El builder comprometido usa exactamente `3.25`, `3.5`, `3.75`, `4.0` y `4.25` como etiquetas de clase del dataset. El modelo ordinal versionado consume ese orden; ni el builder ni el modelo implementan todavía el contrato HTTP de `/bcs`.
+El builder comprometido usa exactamente `1`, `2`, `3`, `4` y `5` como etiquetas de clase del dataset. El modelo ordinal versionado consume esos cinco índices; ni el builder ni el modelo implementan todavía el contrato HTTP de `/bcs`.
 
-El dataset por carpetas conserva esas cinco clases ordenadas. `dataset.py` aplica letterbox cuadrado, aumentos sólo en entrenamiento y normalización ImageNet; `model.py` usa ResNet18 sin pesos descargados en las pruebas y una cabeza CORAL con umbrales ordenados. El modelo y el trainer mantienen scores fraccionarios en pasos de `0.25`. El trainer registra la configuración, el manifiesto vivo y la identidad real del runtime —Python, Torch, Torchvision, CUDA/cuDNN y GPU cuando corresponde— para rechazar resumes incompatibles.
+El dataset por carpetas conserva esas cinco clases ordenadas. `dataset.py` aplica letterbox cuadrado, aumentos sólo en entrenamiento y normalización ImageNet; `model.py` usa ResNet18 sin pesos descargados en las pruebas y una cabeza CORAL con umbrales ordenados. El modelo puede usar tensores flotantes durante el cálculo, pero su proyección semántica de clase es el score entero `1..5`. El trainer registra la configuración, el manifiesto vivo y la identidad real del runtime —Python, Torch, Torchvision, CUDA/cuDNN y GPU cuando corresponde— para rechazar resumes incompatibles.
 
 ## Frontera BCS futura
 
 La frontera de serving BCS todavía no está implementada. El código actual sólo deja `POST /bcs` como placeholder; no carga `BCSOrdinalModel` ni calcula un score.
 
-La integración futura aprobada sólo podrá exponer un score entero en `1..5`, con redondeo decimal half-down en el límite del endpoint (un empate exacto `.5` baja, por ejemplo `3.5 → 3`). Ese contrato no cambia la escala fraccionaria interna ni implementa todavía `/bcs`.
+La integración futura aprobada sólo podrá exponer un score entero en `1..5`, con redondeo decimal half-down en el límite del endpoint (un empate exacto `.5` baja, por ejemplo `3.5 → 3`). Ese límite conserva cualquier cálculo flotante interno y no implementa todavía `/bcs`.
 
 ## Relación con el backend
 
-El PRD establece que el prototipo de IA es independiente del backend actual y que la integración definitiva está fuera del alcance de Fase 1. La rama ahora incluye un cliente acotado para el export humano `bcs-source-v1`, pero no una integración completa de serving o datasets. En el estado observado:
+El PRD establece que el prototipo de IA es independiente del backend actual y que la integración definitiva está fuera del alcance de Fase 1. La rama ahora incluye un cliente acotado para el export versionado `bcs-source-v1`, pero no una integración completa de serving o datasets. En el estado observado:
 
 - IA ejecuta la inferencia de visión en el servicio local de detección.
 - `vacca_bcs.source_client` envía autenticación Bearer y consume el export; no implementa persistencia de dominio ni orquestación del backend.

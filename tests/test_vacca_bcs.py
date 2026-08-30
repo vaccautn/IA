@@ -39,7 +39,17 @@ from scripts.train_bcs_ordinal import (  # noqa: E402
 )
 from scripts.train_bcs_ordinal import main as train_main  # noqa: E402
 import scripts.train_bcs_ordinal as trainer  # noqa: E402
-from vacca_bcs.constants import CLASS_NAMES  # noqa: E402
+from vacca_bcs.constants import (  # noqa: E402
+    BCS_CLASS_SCORES,
+    BCS_DOMAIN_ID,
+    CLASS_NAMES,
+    NUM_CLASSES,
+    NUM_THRESHOLDS,
+    SCORE_BASE,
+    SCORE_MAX,
+    SCORE_MIN,
+    SCORE_STEP,
+)
 from vacca_bcs.dataset import BCSFolderDataset, Letterbox, build_transforms  # noqa: E402
 from vacca_bcs.model import (  # noqa: E402
     BCSOrdinalModel,
@@ -65,6 +75,22 @@ def test_coral_level_encoding_for_all_classes() -> None:
     assert torch.equal(encode_levels(levels), expected)
 
 
+def test_integer_domain_constants_reject_fractional_class_names() -> None:
+    assert BCS_DOMAIN_ID == "bcs-integer-1-5"
+    assert BCS_CLASS_SCORES == (1, 2, 3, 4, 5)
+    assert CLASS_NAMES == ("1", "2", "3", "4", "5")
+    assert (SCORE_MIN, SCORE_MAX, SCORE_BASE, SCORE_STEP) == (1, 5, 1, 1)
+    assert (NUM_CLASSES, NUM_THRESHOLDS) == (5, 4)
+    assert not {"3.25", "3.5", "3.75", "4.0", "4.25"}.intersection(CLASS_NAMES)
+
+
+def test_dataset_rejects_fractional_class_folders(tmp_path: Path) -> None:
+    for class_name in ("3.25", "3.5", "3.75", "4.0", "4.25"):
+        (tmp_path / class_name).mkdir()
+    with pytest.raises(FileNotFoundError, match="Class directory"):
+        BCSFolderDataset(tmp_path)
+
+
 def test_predict_maps_passed_thresholds_to_class_and_score() -> None:
     logits = torch.tensor(
         [
@@ -77,7 +103,7 @@ def test_predict_maps_passed_thresholds_to_class_and_score() -> None:
     )
     class_idx, scores = predict(logits)
     assert torch.equal(class_idx, torch.arange(5))
-    assert torch.equal(scores, torch.tensor([3.25, 3.5, 3.75, 4.0, 4.25]))
+    assert torch.equal(scores, torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]))
 
 
 def test_coral_loss_is_finite_and_lower_for_correct_levels() -> None:
@@ -112,7 +138,7 @@ def test_coral_head_produces_ordered_logits() -> None:
 
     class_idx, scores = predict(logits)
     assert torch.all((class_idx >= 0) & (class_idx < len(CLASS_NAMES)))
-    assert torch.all((scores >= 3.25) & (scores <= 4.25))
+    assert torch.all((scores >= 1.0) & (scores <= 5.0))
 
 
 def test_real_dataset_transforms_and_model_training_step(tmp_path: Path) -> None:
@@ -159,7 +185,7 @@ def test_real_dataset_transforms_and_model_training_step(tmp_path: Path) -> None
     assert scores.shape == (2,)
     assert torch.isfinite(logits).all()
     assert torch.is_floating_point(scores)
-    assert torch.equal(scores, torch.full((2,), 3.25))
+    assert torch.equal(scores, torch.full((2,), 1.0))
 
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
@@ -690,7 +716,7 @@ def test_reconcile_discards_partial_one_row_crash_suffix(tmp_path: Path) -> None
         ("train_loss", "nan"),
         ("val_exact_acc", "1.1"),
         ("val_pm1_acc", "-0.1"),
-        ("val_mae", "1.1"),
+        ("val_mae", "4.1"),
     ],
 )
 def test_reconcile_rejects_invalid_complete_expected_suffix(
@@ -896,21 +922,17 @@ def test_reconcile_rejects_invalid_or_impossible_metrics(
         _reconcile_results_csv(results_path, checkpoint_epoch=1)
 
 
-def test_validate_computes_mae_with_canonical_score_step(monkeypatch) -> None:
+def test_validate_computes_mae_with_canonical_integer_score_step() -> None:
     import scripts.train_bcs_ordinal as trainer
 
     class _FixedLogitsModel(torch.nn.Module):
         def forward(self, images: torch.Tensor) -> torch.Tensor:
             return torch.tensor([[-8.0, -8.0, -8.0, -8.0], [8.0, 8.0, 8.0, 8.0]])
 
-    # Two samples, both off by 4 class indices: MAE = SCORE_STEP * 8 / 2.
+    # Two samples, both off by 4 class indices: canonical integer MAE is 4.
     loader = [(torch.zeros(2, 3, 8, 8), torch.tensor([4, 0]))]
     metrics = trainer._validate(_FixedLogitsModel(), loader, torch.device("cpu"))
-    assert metrics["mae"] == pytest.approx(1.0)
-
-    monkeypatch.setattr(trainer, "SCORE_STEP", 0.5)
-    metrics = trainer._validate(_FixedLogitsModel(), loader, torch.device("cpu"))
-    assert metrics["mae"] == pytest.approx(2.0)
+    assert metrics["mae"] == pytest.approx(4.0)
 
 
 def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -> dict[str, object]:

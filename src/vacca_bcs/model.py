@@ -1,14 +1,12 @@
 """CORAL ordinal ResNet model for Body Condition Score prediction."""
+
 from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
 from torchvision.models import resnet18
 
-from .constants import CLASS_NAMES, SCORE_BASE, SCORE_STEP
-
-NUM_CLASSES = len(CLASS_NAMES)
-NUM_THRESHOLDS = NUM_CLASSES - 1
+from .constants import NUM_CLASSES, NUM_THRESHOLDS, SCORE_MIN, SCORE_STEP
 
 
 def encode_levels(levels: Tensor, num_classes: int = NUM_CLASSES) -> Tensor:
@@ -36,7 +34,7 @@ def predict(logits: Tensor) -> tuple[Tensor, Tensor]:
     if logits.ndim != 2 or logits.shape[1] != NUM_THRESHOLDS:
         raise ValueError(f"logits must have shape (batch, {NUM_THRESHOLDS})")
     class_idx = (torch.sigmoid(logits) > 0.5).sum(dim=1).to(torch.long)
-    scores = SCORE_BASE + SCORE_STEP * class_idx.to(dtype=logits.dtype)
+    scores = SCORE_MIN + SCORE_STEP * class_idx.to(dtype=logits.dtype)
     return class_idx, scores
 
 

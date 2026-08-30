@@ -36,7 +36,7 @@ def test_main_success_formats_result_at_cli_boundary(monkeypatch, capsys, tmp_pa
         cli,
         "build_dataset",
         lambda *args, **kwargs: (
-            {"3.25": {"selected": 1, "train": 1, "val": 0, "staged": 1, "added": 1, "updated": 0, "unchanged": 0, "stale": 0}},
+            {"1": {"selected": 1, "train": 1, "val": 0, "staged": 1, "added": 1, "updated": 0, "unchanged": 0, "stale": 0}},
             {"selected": 1, "train": 1, "val": 0, "staged": 1, "added": 1, "updated": 0, "unchanged": 0, "stale": 0},
         ),
     )
@@ -56,7 +56,7 @@ def test_cli_import_boundary_excludes_training_modules() -> None:
 import sys
 import scripts.build_bcs_cls
 from vacca_bcs.constants import CLASS_NAMES
-assert CLASS_NAMES == ["3.25", "3.5", "3.75", "4.0", "4.25"]
+assert CLASS_NAMES == ("1", "2", "3", "4", "5")
 for name in ("torch", "torchvision", "vacca_bcs.model", "vacca_bcs.dataset"):
     assert name not in sys.modules, name
 """

@@ -2,7 +2,7 @@
 
 **BCS hoy:** `POST /bcs` sigue siendo un placeholder y siempre devuelve `bcs_score: null`; no ejecuta inferencia BCS.
 
-Esta es la guía operativa del servicio FastAPI que existe hoy. La detección de Fase 1 está implementada; `vacca_bcs.source_client` ya consume el export humano versionado del backend. La inferencia BCS futura aceptará scores finitos en el rango inclusivo `1..5` y usará un score entero con redondeo decimal half-down (los empates exactos `.5` bajan, por ejemplo `3.5 → 3`), sin clamp ni cambio de la precisión fraccionaria del modelo. Esa inferencia todavía no está implementada.
+Esta es la guía operativa del servicio FastAPI que existe hoy. La detección de Fase 1 está implementada; `vacca_bcs.source_client` ya consume el export versionado del backend. La inferencia BCS futura aceptará scores finitos en el rango inclusivo `1..5` y usará un score entero con redondeo decimal half-down (los empates exactos `.5` bajan, por ejemplo `3.5 → 3`), sin clamp ni cambio de la precisión flotante del modelo. Esa inferencia todavía no está implementada.
 
 ## Camino rápido
 
