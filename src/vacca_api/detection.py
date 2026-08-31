@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-import numpy as np
 from PIL import Image
 
 from .schemas import BoundingBox, Detection
@@ -66,7 +65,6 @@ class VACCADetector:
             boxes = r.boxes
             if boxes is not None and len(boxes) > 0:
                 for box in boxes:
-                    cls_id = int(box.cls[0].item())
                     conf_val = float(box.conf[0].item())
                     xywh = box.xywh[0].tolist()  # [x_center, y_center, w, h] in pixels
 
