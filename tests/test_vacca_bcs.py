@@ -19,7 +19,9 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.train_bcs_ordinal import (  # noqa: E402
+    CHECKPOINT_SCHEMA_VERSION,
     RESULTS_FIELDNAMES,
+    RESULTS_LINEAGE_FILENAME,
     RESUMABLE_CHECKPOINT_FIELDS,
     _build_last_checkpoint,
     _build_provenance,
@@ -323,6 +325,8 @@ def test_last_checkpoint_roundtrip_restores_training_state(tmp_path: Path) -> No
         config={"epochs": 4},
     )
     assert RESUMABLE_CHECKPOINT_FIELDS.issubset(checkpoint)
+    assert checkpoint["checkpoint_schema_version"] == CHECKPOINT_SCHEMA_VERSION
+    assert checkpoint["domain_id"] == BCS_DOMAIN_ID
 
     path = tmp_path / "last.pt"
     torch.save(checkpoint, path)
@@ -1166,6 +1170,44 @@ def test_integer_snapshot_rejects_root_structure_tampering(tmp_path: Path, mutat
         _build_provenance(config, data_dir=root, output_dir=Path(config["output"]), device=torch.device("cpu"))
 
 
+def _lineage_checkpoint(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    config = _tiny_training_config(tmp_path, tmp_path / "out")
+    provenance = _build_provenance(
+        config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]),
+        device=torch.device("cpu"), run_id="a" * 32,
+    )
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    checkpoint = _build_last_checkpoint(
+        model, optimizer, epoch=1, best_mae=0.5, epochs_without_improvement=0,
+        config=config, provenance=provenance,
+    )
+    path = tmp_path / "last.pt"
+    torch.save(checkpoint, path)
+    return path, provenance
+
+
+@pytest.mark.parametrize("field,value", [
+    ("checkpoint_schema_version", "old-checkpoint"), ("domain_id", "fractional"),
+    ("classes", ["3.25", "3.5", "3.75", "4.0", "4.25"]),
+    ("score_step", True), ("snapshot_schema", "bcs-integer-snapshot-v1"),
+    ("snapshot_identity", "b" * 64), ("dataset_manifest_digest", "c" * 64),
+    ("run_id", "d" * 32),
+])
+def test_resume_rejects_checkpoint_lineage_tampering_before_model_use(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    path, provenance = _lineage_checkpoint(tmp_path)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    checkpoint[field] = value
+    torch.save(checkpoint, path)
+    with pytest.raises(ValueError):
+        _load_resume_checkpoint(
+            path, expected_classes=list(CLASS_NAMES), total_epochs=3,
+            expected_provenance=provenance,
+        )
+
+
 def _seed_prior_training_artifacts(output: Path) -> dict[Path, bytes]:
     artifacts = {
         output / "results.csv": b"prior-results",
@@ -1277,6 +1319,26 @@ def test_public_resume_rejects_changed_dataset_manifest(tmp_path: Path, monkeypa
         trainer.train(config, resume=output / "weights" / "last.pt")
 
 
+def test_resume_rejects_stale_run_info_and_legacy_results_lineage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output)
+    _install_tiny_training_fakes(monkeypatch, [])
+    trainer.train(config, overwrite=True)
+    resume = output / "weights" / "last.pt"
+    run_info_path = output / "run_info.json"
+    run_info = json.loads(run_info_path.read_text(encoding="utf-8"))
+    run_info["run_id"] = "e" * 32
+    run_info_path.write_text(json.dumps(run_info), encoding="utf-8")
+    with pytest.raises(ValueError, match="run lineage"):
+        trainer.train(config, resume=resume)
+    run_info_path.unlink()
+    (output / RESULTS_LINEAGE_FILENAME).unlink()
+    with pytest.raises(ValueError, match="results lineage"):
+        trainer.train(config, resume=resume)
+
+
 def test_interrupted_and_resumed_workflow_matches_uninterrupted_run(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1298,6 +1360,13 @@ def test_interrupted_and_resumed_workflow_matches_uninterrupted_run(
     run_info = json.loads((baseline_output / "run_info.json").read_text())
     assert run_info["domain_id"] == BCS_DOMAIN_ID
     assert run_info["class_values"] == list(BCS_CLASS_SCORES)
+    checkpoint = torch.load(
+        baseline_output / "weights" / "last.pt", map_location="cpu", weights_only=True
+    )
+    lineage = json.loads(
+        (baseline_output / RESULTS_LINEAGE_FILENAME).read_text(encoding="utf-8")
+    )
+    assert checkpoint["run_id"] == run_info["run_id"] == lineage["run_id"]
 
     resumed_calls.clear()
     _install_tiny_training_fakes(monkeypatch, resumed_calls)
@@ -1358,6 +1427,10 @@ def test_resume_stops_at_restored_patience_boundary(tmp_path: Path, monkeypatch)
     )
     _atomic_torch_save(checkpoint, output / "weights" / "last.pt")
     _write_results_history(output / "results.csv", [1])
+    _atomic_write_json(
+        trainer._results_lineage(provenance, provenance["run_id"]),
+        output / RESULTS_LINEAGE_FILENAME,
+    )
 
     result = trainer.train(config, resume=output / "weights" / "last.pt")
 

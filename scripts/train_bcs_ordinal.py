@@ -13,6 +13,7 @@ import random
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TextIO
@@ -50,12 +51,23 @@ from vacca_bcs.constants import (  # noqa: E402
     BCS_DOMAIN_ID,
     CLASS_NAMES,
     MANIFEST_FILENAME,
+    NUM_CLASSES,
+    NUM_THRESHOLDS,
+    SCORE_BASE,
+    SCORE_MAX,
+    SCORE_MIN,
     SCORE_STEP,
     SPLITS,
 )
 from vacca_bcs.dataset import BCSFolderDataset  # noqa: E402
 from vacca_bcs.integer_snapshot import load_integer_snapshot_manifest  # noqa: E402
 from vacca_bcs.model import BCSOrdinalModel, coral_loss, predict  # noqa: E402
+
+CHECKPOINT_SCHEMA_VERSION = "bcs-ordinal-integer-checkpoint-v1"
+RESULTS_LINEAGE_FILENAME = "results_lineage.json"
+RESULTS_LINEAGE_SCHEMA_VERSION = "bcs-ordinal-integer-results-v1"
+_DEFAULT_RUN_ID = "0" * 32
+_DEFAULT_SNAPSHOT_ID = "0" * 64
 
 RESULTS_FIELDNAMES = [
     "epoch",
@@ -67,6 +79,20 @@ RESULTS_FIELDNAMES = [
 ]
 
 RESUMABLE_CHECKPOINT_FIELDS = {
+    "checkpoint_schema_version",
+    "domain_id",
+    "classes",
+    "class_mapping",
+    "score_min",
+    "score_max",
+    "score_base",
+    "score_step",
+    "num_classes",
+    "num_thresholds",
+    "snapshot_schema",
+    "snapshot_identity",
+    "dataset_manifest_digest",
+    "run_id",
     "model_state_dict",
     "optimizer_state_dict",
     "epoch",
@@ -269,13 +295,15 @@ def _dataset_manifest_provenance(data_dir: Path) -> dict[str, Any]:
         "schema_version": manifest["manifest_schema_version"],
         "domain_id": manifest["domain_id"],
         "source_schema": manifest["source_schema"],
+        "split_identity": manifest["split_plan"]["identity_digest"],
         "sha256": _sha256_text(_canonical_json(manifest)),
         "live_sha256": _sha256_text(_canonical_json(live_entries)),
     }
 
 
 def _build_provenance(
-    config: dict[str, Any], *, data_dir: Path, output_dir: Path, device: torch.device
+    config: dict[str, Any], *, data_dir: Path, output_dir: Path, device: torch.device,
+    run_id: str = _DEFAULT_RUN_ID,
 ) -> dict[str, Any]:
     config_for_hash = {
         key: value for key, value in config.items() if not key.startswith("_")
@@ -285,6 +313,7 @@ def _build_provenance(
     runtime = _runtime_identity(device)
     return {
         "config_sha256": _sha256_text(_canonical_json(config_for_hash)),
+        "run_id": run_id,
         "domain_id": BCS_DOMAIN_ID,
         "data_dir": str(data_dir.resolve()),
         "output_dir": str(output_dir.resolve()),
@@ -297,6 +326,116 @@ def _build_provenance(
     }
 
 
+def _checkpoint_lineage(provenance: dict[str, Any], run_id: str) -> dict[str, Any]:
+    manifest = provenance.get("dataset_manifest", {})
+    return {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "domain_id": BCS_DOMAIN_ID,
+        "classes": list(CLASS_NAMES),
+        "class_mapping": {name: index for index, name in enumerate(CLASS_NAMES)},
+        "score_min": SCORE_MIN,
+        "score_max": SCORE_MAX,
+        "score_base": SCORE_BASE,
+        "score_step": SCORE_STEP,
+        "num_classes": NUM_CLASSES,
+        "num_thresholds": NUM_THRESHOLDS,
+        "snapshot_schema": manifest.get("schema_version", "bcs-integer-snapshot-v2"),
+        "snapshot_identity": manifest.get("split_identity", _DEFAULT_SNAPSHOT_ID),
+        "dataset_manifest_digest": manifest.get("sha256", _DEFAULT_SNAPSHOT_ID),
+        "run_id": run_id,
+    }
+
+
+def _results_lineage(provenance: dict[str, Any], run_id: str) -> dict[str, Any]:
+    checkpoint = _checkpoint_lineage(provenance, run_id)
+    return {
+        "lineage_schema_version": RESULTS_LINEAGE_SCHEMA_VERSION,
+        "run_id": checkpoint["run_id"],
+        "domain_id": checkpoint["domain_id"],
+        "snapshot_schema": checkpoint["snapshot_schema"],
+        "snapshot_identity": checkpoint["snapshot_identity"],
+        "dataset_manifest_digest": checkpoint["dataset_manifest_digest"],
+    }
+
+
+def _valid_hex(value: object, length: int) -> bool:
+    return (
+        type(value) is str
+        and len(value) == length
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_checkpoint_lineage(
+    checkpoint: dict[str, Any], *, path: Path, expected: dict[str, Any] | None = None
+) -> None:
+    if checkpoint.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError(f"Checkpoint {path} has an unsupported integer schema")
+    if checkpoint.get("domain_id") != BCS_DOMAIN_ID:
+        raise ValueError(f"Checkpoint {path} has an invalid integer domain")
+    if (
+        type(checkpoint.get("classes")) is not list
+        or any(type(value) is not str for value in checkpoint["classes"])
+        or checkpoint["classes"] != list(CLASS_NAMES)
+    ):
+        raise ValueError(f"Checkpoint {path} classes must be a list of integer classes")
+    if (
+        type(checkpoint.get("class_mapping")) is not dict
+        or any(type(value) is not int for value in checkpoint["class_mapping"].values())
+        or checkpoint["class_mapping"]
+        != {name: index for index, name in enumerate(CLASS_NAMES)}
+    ):
+        raise ValueError(f"Checkpoint {path} class mapping is invalid")
+    if any(
+        type(checkpoint.get(field)) is not int or checkpoint[field] != value
+        for field, value in (
+            ("score_min", SCORE_MIN),
+            ("score_max", SCORE_MAX),
+            ("score_base", SCORE_BASE),
+            ("score_step", SCORE_STEP),
+            ("num_classes", NUM_CLASSES),
+            ("num_thresholds", NUM_THRESHOLDS),
+        )
+    ):
+        raise ValueError(f"Checkpoint {path} scale is invalid")
+    if (
+        checkpoint.get("snapshot_schema") != "bcs-integer-snapshot-v2"
+        or not _valid_hex(checkpoint.get("snapshot_identity"), 64)
+        or not _valid_hex(checkpoint.get("dataset_manifest_digest"), 64)
+        or not _valid_hex(checkpoint.get("run_id"), 32)
+    ):
+        raise ValueError(f"Checkpoint {path} snapshot or run lineage is invalid")
+    if expected is not None:
+        expected_lineage = _checkpoint_lineage(expected, expected["run_id"])
+        if any(checkpoint.get(field) != value for field, value in expected_lineage.items()):
+            raise ValueError(f"Checkpoint {path} has an invalid integer lineage field")
+    return
+
+
+def _validate_lineage_file(path: Path, expected: dict[str, Any], label: str) -> None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError(f"{label} lineage is unreadable") from None
+    if (
+        type(value) is not dict
+        or (label == "results" and set(value) != set(expected))
+        or any(value.get(key) != expected[key] for key in expected)
+    ):
+        raise ValueError(f"{label} lineage does not match the active run lineage")
+
+
+def _validate_existing_run_lineage(output_dir: Path, expected: dict[str, Any]) -> None:
+    run_info = output_dir / "run_info.json"
+    if run_info.is_file():
+        _validate_lineage_file(run_info, expected, "run")
+    results_lineage = output_dir / RESULTS_LINEAGE_FILENAME
+    if not results_lineage.is_file():
+        raise ValueError("results lineage is missing")
+    _validate_lineage_file(results_lineage, expected, "results")
+
+
 def _validate_provenance(
     checkpoint: dict[str, Any], expected: dict[str, Any], path: Path
 ) -> None:
@@ -306,8 +445,7 @@ def _validate_provenance(
     for key in expected:
         if saved.get(key) != expected[key]:
             raise ValueError(
-                f"Resume provenance mismatch for {key}: checkpoint has {saved.get(key)!r}, "
-                f"active run has {expected[key]!r}. Use the matching config and dataset manifest."
+                f"Resume provenance mismatch for {key}; use the matching config and dataset manifest."
             )
 
 
@@ -415,7 +553,11 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
 
 def _existing_run_artifacts(output_dir: Path) -> list[Path]:
     """List run artifacts whose presence marks the output dir as an existing run."""
-    candidates = [output_dir / "results.csv", output_dir / "run_info.json"]
+    candidates = [
+        output_dir / "results.csv",
+        output_dir / "run_info.json",
+        output_dir / RESULTS_LINEAGE_FILENAME,
+    ]
     weights_dir = output_dir / "weights"
     if weights_dir.is_dir():
         candidates.extend(sorted(weights_dir.glob("*.pt")))
@@ -430,7 +572,7 @@ def _atomic_write_json(payload: dict[str, Any], path: Path) -> None:
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = -1
-            handle.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
             _flush_and_fsync(handle)
         os.replace(temp_path, path)
         _fsync_directory(path.parent)
@@ -453,6 +595,7 @@ class RunInfoContext:
     output_dir: Path
     device: torch.device
     provenance: dict[str, Any]
+    run_id: str
     train_dataset: BCSFolderDataset
     val_dataset: BCSFolderDataset
     started_at: str
@@ -465,6 +608,7 @@ class RunInfoContext:
 def _build_run_info(context: RunInfoContext) -> dict[str, Any]:
     """Build serialized run metadata from one cohesive execution context."""
     run_info: dict[str, Any] = {
+        **_results_lineage(context.provenance, context.run_id),
         "started_at_utc": context.started_at,
         "finished_at_utc": _utc_now(),
         "config_file": str(context.config["_config_path"]),
@@ -683,7 +827,10 @@ def _build_last_checkpoint(
     provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the resumable checkpoint saved as weights/last.pt every epoch."""
-    return {
+    active_provenance = provenance or {}
+    run_id = active_provenance.get("run_id", _DEFAULT_RUN_ID)
+    payload = {
+        **_checkpoint_lineage(active_provenance, run_id),
         "model_state_dict": {
             key: value.detach().cpu() for key, value in model.state_dict().items()
         },
@@ -693,9 +840,10 @@ def _build_last_checkpoint(
         "epochs_without_improvement": int(epochs_without_improvement),
         "config": config,
         "classes": list(CLASS_NAMES),
-        "provenance": provenance or {},
+        "provenance": active_provenance,
         "rng_state": _capture_rng_state(),
     }
+    return payload
 
 
 def _validate_checkpoint_metadata(
@@ -704,9 +852,7 @@ def _validate_checkpoint_metadata(
     for field in ("model_state_dict", "optimizer_state_dict", "config", "provenance", "rng_state"):
         if not isinstance(checkpoint[field], dict):
             raise ValueError(f"Checkpoint {path} field {field!r} must be an object")
-    classes = checkpoint["classes"]
-    if not isinstance(classes, list) or not all(isinstance(value, str) for value in classes):
-        raise ValueError(f"Checkpoint {path} classes must be a list of strings")
+    _validate_checkpoint_lineage(checkpoint, path=path)
     epoch = checkpoint["epoch"]
     if type(epoch) is not int or epoch < 1:
         raise ValueError(f"Checkpoint {path} epoch must be a non-negative integer >= 1")
@@ -779,6 +925,8 @@ def _load_resume_checkpoint(
             f"Checkpoint {path} is missing required fields:"
             f" {', '.join(missing)}.{hint}"
         )
+    if set(checkpoint).difference(RESUMABLE_CHECKPOINT_FIELDS):
+        raise ValueError(f"Checkpoint {path} has unexpected fields")
     _validate_checkpoint_metadata(checkpoint, path=path, total_epochs=total_epochs)
     classes = list(checkpoint["classes"])
     if classes != list(expected_classes):
@@ -787,6 +935,7 @@ def _load_resume_checkpoint(
             f" classes {list(expected_classes)}"
         )
     if expected_provenance is not None:
+        _validate_checkpoint_lineage(checkpoint, path=path, expected=expected_provenance)
         _validate_provenance(checkpoint, expected_provenance, path)
     completed_epochs = int(checkpoint["epoch"])
     if completed_epochs < 1:
@@ -917,7 +1066,6 @@ def train(
 ) -> dict[str, Any]:
     _validate_training_config(config)
     total_epochs = int(config["epochs"])
-    set_seed(int(config["seed"]))
     device = resolve_device(str(config["device"]))
     data_dir = _resolve_path(config["data_dir"])
     output_dir = _resolve_path(config["output"])
@@ -929,22 +1077,28 @@ def train(
 
     if resume is None and _existing_run_artifacts(output_dir) and not overwrite:
         _prepare_output_dir(output_dir, overwrite=False)
+    if resume is not None:
+        checkpoint = _load_resume_checkpoint(
+            resume, expected_classes=list(CLASS_NAMES), total_epochs=total_epochs
+        )
+        run_id = checkpoint["run_id"]
+    else:
+        run_id = uuid.uuid4().hex
     provenance = _build_provenance(
-        config, data_dir=data_dir, output_dir=output_dir, device=device
+        config, data_dir=data_dir, output_dir=output_dir, device=device, run_id=run_id
     )
+    if resume is not None:
+        _validate_checkpoint_lineage(checkpoint, path=resume, expected=provenance)
+        _validate_provenance(checkpoint, provenance, resume)
+        _validate_existing_run_lineage(output_dir, _results_lineage(provenance, run_id))
     if resume is None:
         if _existing_run_artifacts(output_dir):
             _prepare_output_dir(output_dir, overwrite=True)
         output_dir.mkdir(parents=True, exist_ok=True)
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(int(config["seed"]))
     if resume is not None:
-        checkpoint = _load_resume_checkpoint(
-            resume,
-            expected_classes=list(CLASS_NAMES),
-            total_epochs=total_epochs,
-            expected_provenance=provenance,
-        )
         _restore_rng_state(checkpoint)
         start_epoch = int(checkpoint["epoch"])
         best_mae = float(checkpoint["best_mae"])
@@ -970,6 +1124,7 @@ def train(
         output_dir=output_dir,
         device=device,
         provenance=provenance,
+        run_id=run_id,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         started_at=started_at,
@@ -1014,6 +1169,9 @@ def train(
         _restore_rng_state(checkpoint)
     if resume is None:
         _prepare_output_dir(output_dir, overwrite=overwrite)
+        _atomic_write_json(
+            _results_lineage(provenance, run_id), output_dir / RESULTS_LINEAGE_FILENAME
+        )
     weights_dir.mkdir(parents=True, exist_ok=True)
     epoch_range = range(start_epoch, total_epochs)
     if checkpoint is not None and epochs_without_improvement >= int(config["patience"]):
@@ -1072,6 +1230,7 @@ def train(
                 }
                 _atomic_torch_save(
                     {
+                        **_checkpoint_lineage(provenance, run_id),
                         "model_state_dict": state_dict,
                         "config": config,
                         "classes": list(CLASS_NAMES),

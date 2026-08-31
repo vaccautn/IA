@@ -185,7 +185,7 @@ The builder is intentionally split into reviewable functional slices: `dataset_t
 
 ## Phase 2 — Entrenamiento ordinal BCS
 
-El núcleo ordinal y el trainer están versionados y cubiertos por pruebas con imágenes y tensores controlados. El modelo conserva la escala fraccionaria `3.25, 3.5, 3.75, 4.0, 4.25`; cualquier redondeo entero queda fuera del modelo y se reserva para el contrato futuro del backend. `/bcs` sigue siendo placeholder; el contrato futuro aprobado sólo permite un entero `1..5` en el borde del endpoint, con redondeo decimal half-down (un empate exacto `.5` baja, por ejemplo `3.5 → 3`).
+El núcleo ordinal y el trainer están versionados y cubiertos por pruebas con imágenes y tensores controlados. El modelo usa la escala entera `1..5` y sus checkpoints sólo son compatibles con el manifiesto de snapshot entero validado; los artefactos fraccionarios o legacy no se migran ni redondean. `/bcs` sigue siendo placeholder; el contrato futuro aprobado sólo permite un entero `1..5` en el borde del endpoint.
 
 ### Prerrequisitos y ejecución
 
@@ -200,7 +200,7 @@ Para iniciar una ejecución operativa, usar:
 .venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
 ```
 
-El directorio configurado (`outputs/bcs-ordinal-integer-v1/`) contiene `results.csv`, `run_info.json`, `weights/best.pt` y el checkpoint reanudable `weights/last.pt`. Una ejecución fresca rechaza artefactos existentes; `--overwrite` permite reemplazarlos después de las validaciones previas. `--resume outputs/bcs-ordinal-integer-v1/weights/last.pt` exige compatibilidad de configuración, manifiesto/dataset vivo e identidad del runtime, y no es un mecanismo para mezclar entornos.
+El directorio configurado (`outputs/bcs-ordinal-integer-v1/`) contiene `results.csv`, `run_info.json`, `weights/best.pt` y el checkpoint reanudable `weights/last.pt`. Una ejecución fresca rechaza artefactos existentes; `--overwrite` permite reemplazarlos después de las validaciones previas. `--resume outputs/bcs-ordinal-integer-v1/weights/last.pt` exige compatibilidad de configuración, manifiesto/dataset vivo, identidad de snapshot, dominio y `run_id`; no migra artefactos antiguos ni mezcla entornos.
 
 La evidencia comprometida de esta transición se limita a pruebas deterministas con imágenes Pillow temporales y tensores pequeños. No se ejecutó entrenamiento real, no se descargaron pesos y no se accedió ni se generaron datos o outputs reales para producir esta documentación.
 
