@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,7 @@ from pydantic import ValidationError
 
 from vacca_api import main
 from vacca_api.bcs import BCSScoreValidationError, round_bcs_score_for_backend
-from vacca_api.schemas import BCSResponse
+from vacca_api.schemas import BCSReadinessResponse, BCSResponse
 from vacca_bcs.serving import BCSInferenceExecutionError, BCSInferenceInputError
 
 
@@ -241,18 +242,29 @@ def test_bcs_rounding_failure_is_sanitized_500(monkeypatch) -> None:
     assert "secret" not in str(captured.value)
 
 
-@pytest.mark.parametrize("status", ["unconfigured", "not_loaded", "ready", "unavailable"])
-def test_bcs_readiness_reports_status_without_loading(monkeypatch, status: str) -> None:
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        ("unconfigured", "BCS capability is not configured."),
+        ("not_loaded", "BCS capability is configured but not loaded."),
+        ("ready", "BCS capability is ready."),
+        ("unavailable", "BCS capability is unavailable."),
+    ],
+)
+def test_bcs_readiness_reports_exact_body_without_loading(
+    monkeypatch, status: str, message: str
+) -> None:
     runtime = _FakeRuntime(status=status)
     monkeypatch.setattr(main, "get_bcs_runtime", lambda: runtime)
     if status == "ready":
         response = main.bcs_readiness()
-        assert response.status == status
+        body = response.model_dump()
     else:
-        with pytest.raises(HTTPException) as captured:
-            main.bcs_readiness()
-        assert captured.value.status_code == 503
-        assert captured.value.detail.startswith("BCS capability")
+        response = main.bcs_readiness()
+        assert response.status_code == 503
+        body = json.loads(response.body)
+    assert body == {"status": status, "message": message}
+    assert BCSReadinessResponse.model_validate(body).model_dump() == body
     assert runtime.get_calls == 0
 
 

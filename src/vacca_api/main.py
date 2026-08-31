@@ -16,7 +16,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from .detection import get_detector
 from .bcs import round_bcs_score_for_backend
@@ -134,7 +134,7 @@ def _is_bcs_input_error(error: Exception) -> bool:
     response_model=BCSReadinessResponse,
     responses={503: {"model": BCSReadinessResponse}},
 )
-def bcs_readiness() -> BCSReadinessResponse:
+def bcs_readiness() -> BCSReadinessResponse | JSONResponse:
     """Report BCS capability state without triggering lazy loading."""
     runtime = get_bcs_runtime()
     raw_status = runtime.status
@@ -146,9 +146,12 @@ def bcs_readiness() -> BCSReadinessResponse:
         "unavailable": "BCS capability is unavailable.",
     }
     message = messages.get(status, "BCS capability is unavailable.")
+    response = BCSReadinessResponse(
+        status=status if status in messages else "unavailable", message=message
+    )
     if status != "ready":
-        raise HTTPException(status_code=503, detail=message)
-    return BCSReadinessResponse(status="ready", message=message)
+        return JSONResponse(status_code=503, content=response.model_dump())
+    return response
 
 
 # ============================================================
