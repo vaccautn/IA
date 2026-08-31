@@ -196,7 +196,7 @@ conversión ni fallback desde artefactos fraccionales o antiguos.
 - Usá `file` como nombre exacto del campo multipart.
 - Ejecutá la suite con `.venv\Scripts\python.exe -m pytest -q`.
 
-La suite verificada para este estado de la rama terminó con `431 passed, 2
+La suite verificada para este estado de la rama terminó con `435 passed, 2
 skipped, 2 warnings` y `65 subtests`; las advertencias son deprecaciones
 conocidas de FastAPI `on_event`. Ruff global `0.15.20` terminó con `0 diagnostics`;
 este `.venv` no contiene Ruff, por lo que se usó el ejecutable global configurado.

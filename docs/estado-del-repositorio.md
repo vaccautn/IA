@@ -49,7 +49,7 @@ conversión ni un fallback ejecutable desde artefactos antiguos.
 
 | Gate | Resultado | Alcance |
 |---|---|---|
-| Suite completa | `431 passed`, `2 skipped`, `2 warnings`, `65 subtests` | `.venv\Scripts\python.exe -m pytest -q` en el estado documentado de esta rama; sin datos BCS reales ni entrenamiento. |
+| Suite completa | `435 passed`, `2 skipped`, `2 warnings`, `65 subtests` | `.venv\Scripts\python.exe -m pytest -q` en el estado documentado de esta rama; sin datos BCS reales ni entrenamiento. |
 | Contrato API/serving | Cubierto por pruebas | Upload compartido, `/bcs`, readiness, OpenAPI, redondeo, sanitización y aislamiento de `/health`/`/detect`. |
 | Pipeline BCS | Cubierto con temporales | Imágenes controladas, snapshot, transforms, forward/predict, optimizer, checkpoint y lineage en CPU. |
 | Ruff | Limpio | Ruff global configurado `0.15.20`: `0 diagnostics`. El `.venv` no contiene Ruff; se usó el fallback global. El extra `dev` lo fija para una instalación reproducible. |
@@ -82,3 +82,26 @@ signed URLs a documentación, commits o archivos de configuración versionados.
 
 Hasta completar esos pasos, el estado correcto es “código implementado y
 probado; operación BCS real pendiente”.
+
+## Runbook overnight (preparado, no ejecutado)
+
+El script es inerte hasta invocarlo, no inicia la API y deja salidas en el directorio
+ignorado `logs/bcs-overnight/<run-id>/`. Ejecutar desde `IA`:
+
+```powershell
+# Preflight sin build, entrenamiento, red ni datos
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --preflight-only
+# Noche nueva
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py
+# Reanudar sin reconstruir snapshot
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --skip-build --resume
+```
+Por la mañana, revisar `weights/best.pt`, configurar el entorno, arrancar la API
+manualmente y comprobar `/ready/bcs` y `/bcs`:
+
+```powershell
+$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-integer-v1\weights\best.pt").Path
+.venv\Scripts\python.exe scripts/run_api.py
+Invoke-RestMethod http://127.0.0.1:8000/ready/bcs
+Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs -Method Post -Form @{file=Get-Item "vaca.jpg"}
+```

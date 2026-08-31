@@ -9,6 +9,7 @@ coverage.json
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.codegraph/
 htmlcov/
 
 # Local environments and packaging output

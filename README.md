@@ -245,8 +245,31 @@ artifacts; `--overwrite` allows replacement after validation. `--resume
 outputs/bcs-ordinal-integer-v1/weights/last.pt` requires compatible configuration,
 live manifest/dataset, snapshot identity, domain, and `run_id`.
 
+### Orquestación overnight (preparada, no ejecutada)
+
+Valida rutas, entorno y artefactos antes de iniciar cualquier CLI; no inicia la API
+y conserva logs en el directorio ignorado `logs/bcs-overnight/`.
+
+```powershell
+# Preflight (sin build, entrenamiento, red ni datos)
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --preflight-only
+# Noche nueva
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py
+# Reanudar (conserva el snapshot y usa weights/last.pt)
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --skip-build --resume
+```
+Por la mañana, revisar el log y el `weights/best.pt` compatible; configurar el
+checkpoint, iniciar la API manualmente y verificar las dos rutas:
+
+```powershell
+$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-integer-v1\weights\best.pt").Path
+.venv\Scripts\python.exe scripts/run_api.py
+Invoke-RestMethod http://127.0.0.1:8000/ready/bcs
+Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs -Method Post -Form @{file=Get-Item "vaca.jpg"}
+```
+
 Verification for this branch state: `.venv\Scripts\python.exe -m pytest -q`
-reports `431 passed, 2 skipped, 2 warnings, 65 subtests passed`. The warnings are the
+reports `435 passed, 2 skipped, 2 warnings, 65 subtests passed`. The warnings are the
 known FastAPI `on_event` deprecations. This verification did not access real BCS
 data, outputs, model weights, or run training.
 
