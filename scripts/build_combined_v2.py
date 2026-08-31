@@ -31,7 +31,6 @@ def xml_to_yolo(xml_path: Path, img_w: int = 1024, img_h: int = 576) -> list[str
 
     lines: list[str] = []
     for obj in root_elem.findall("object"):
-        name = obj.find("name").text  # type: ignore[union-attr]
         # Map all BCS scores -> class 0 (cow)
         bbox = obj.find("bndbox")
         xmin = float(bbox.find("xmin").text)  # type: ignore[union-attr]
