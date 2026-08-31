@@ -52,7 +52,7 @@ conversión ni un fallback ejecutable desde artefactos antiguos.
 | Suite completa | `430 passed`, `2 skipped`, `2 warnings`, `65 subtests` | `.venv\Scripts\python -m pytest -q` en el worktree de `ff7ac78`; sin datos BCS reales ni entrenamiento. |
 | Contrato API/serving | Cubierto por pruebas | Upload compartido, `/bcs`, readiness, OpenAPI, redondeo, sanitización y aislamiento de `/health`/`/detect`. |
 | Pipeline BCS | Cubierto con temporales | Imágenes controladas, snapshot, transforms, forward/predict, optimizer, checkpoint y lineage en CPU. |
-| Ruff | No globalmente verde | Código reemplazado/tocado limpio; quedan diez diagnósticos no relacionados en archivos de Fase 1. |
+| Ruff | No globalmente verde | Código reemplazado/tocado limpio; quedan siete diagnósticos no relacionados en archivos de Fase 1. |
 
 Las dos omisiones y las advertencias pertenecen a la ejecución verificada; las
 advertencias son las deprecaciones conocidas de FastAPI `on_event`. Ningún test
