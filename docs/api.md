@@ -194,10 +194,10 @@ conversión ni fallback desde artefactos fraccionales o antiguos.
 - Si `/bcs` devuelve `503`, no lo interpretes como score: falta una capacidad
   BCS operable.
 - Usá `file` como nombre exacto del campo multipart.
-- Ejecutá la suite con `.venv\Scripts\python -m pytest -q`.
+- Ejecutá la suite con `.venv\Scripts\python.exe -m pytest -q`.
 
-La suite verificada para este estado de la rama terminó con `430 passed, 2
+La suite verificada para este estado de la rama terminó con `431 passed, 2
 skipped, 2 warnings` y `65 subtests`; las advertencias son deprecaciones
-conocidas de FastAPI `on_event`. El chequeo Ruff del código tocado está limpio,
-pero el repositorio completo conserva siete diagnósticos no relacionados de Fase
-1; no se afirma Ruff globalmente verde.
+conocidas de FastAPI `on_event`. Ruff global `0.15.20` terminó con `0 diagnostics`;
+este `.venv` no contiene Ruff, por lo que se usó el ejecutable global configurado.
+El extra `dev` mantiene la instalación reproducible.

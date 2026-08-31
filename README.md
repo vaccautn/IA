@@ -39,14 +39,19 @@ checkpoints, datasets, runs, outputs y pesos locales permanecen ignorados por Gi
 Los archivos de código o documentación bajo `models/` no quedan ocultos por esta
 política.
 
-Ruff está fijado como dependencia opcional de desarrollo y analiza sólo el código
-versionado de `src/`, `scripts/` y `tests/`. Después de crear el entorno, instalalo
-y ejecutá el chequeo desde el entorno del proyecto:
+Ruff está fijado como dependencia opcional de desarrollo (`0.15.20`) y analiza
+sólo el código versionado de `src/`, `scripts/` y `tests/`. Para una instalación
+reproducible, después de crear el entorno instalalo y ejecutá el chequeo desde el
+entorno del proyecto:
 
 ```powershell
 .venv\Scripts\python -m pip install -e ".[dev]"
 .venv\Scripts\python -m ruff check src scripts tests
 ```
+
+La verificación actual usó el fallback global configurado `ruff 0.15.20` porque
+este `.venv` no contiene Ruff; el resultado fue `0 diagnostics`. La instalación
+del extra `dev` sigue siendo el camino reproducible.
 
 ## Setup rápido
 
@@ -240,8 +245,8 @@ artifacts; `--overwrite` allows replacement after validation. `--resume
 outputs/bcs-ordinal-integer-v1/weights/last.pt` requires compatible configuration,
 live manifest/dataset, snapshot identity, domain, and `run_id`.
 
-Verification for this branch state: `.venv\Scripts\python -m pytest -q` reports
-`430 passed, 2 skipped, 2 warnings, 65 subtests passed`. The warnings are the
+Verification for this branch state: `.venv\Scripts\python.exe -m pytest -q`
+reports `431 passed, 2 skipped, 2 warnings, 65 subtests passed`. The warnings are the
 known FastAPI `on_event` deprecations. This verification did not access real BCS
 data, outputs, model weights, or run training.
 
