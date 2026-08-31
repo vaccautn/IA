@@ -173,6 +173,17 @@ If `data/bcs-cls/` is missing while `data/bcs-cls.backup-recovery/` exists, stop
 
 > `--val-ratio 0` intentionally leaves the `val/` split empty. It is supported for dataset inspection outside any training flow.
 
+### Materialize the integer snapshot from the backend
+
+The operator CLI fetches the authenticated `bcs-source-v1` export, normalizes it, creates the deterministic integer split, downloads evidence through the existing signed-URL client, and publishes `data/bcs-integer-v1/` as `bcs-integer-snapshot-v2`. It does not convert legacy or fractional datasets. Set the backend URL with `--base-url` or `VACCA_BACKEND_URL`; the superuser token must be provided only through `VACCA_BACKEND_TOKEN`.
+
+```powershell
+$env:VACCA_BACKEND_TOKEN = "<token-from-your-secret-store>"
+.venv\Scripts\python scripts/build_bcs_integer.py --base-url https://backend.example
+```
+
+The command requires the backend source-export and signed-evidence endpoints, refuses an existing output root, and reports only safe snapshot counts and identity. Use `--seed`, `--val-ratio`, `--timeout`, `--max-source-bytes`, and `--max-image-bytes` to make operational limits explicit.
+
 Run the focused builder tests after changing the dataset builder:
 
 ```powershell
