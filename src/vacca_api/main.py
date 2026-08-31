@@ -13,15 +13,14 @@ from __future__ import annotations
 
 import traceback
 from pathlib import Path
-from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 
 from .detection import get_detector
 from .schemas import BCSResponse, DetectResponse, HealthResponse
+from .upload_validation import read_uploaded_image
 
 # --- Configuration ---
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,16 +64,7 @@ def health() -> HealthResponse:
 @app.post("/detect", response_model=DetectResponse)
 async def detect(file: UploadFile = File(...)) -> DetectResponse:
     """Receive an image and return cow detections with bounding boxes."""
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image (JPEG, PNG, etc.)")
-
-    try:
-        image_bytes = await file.read()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Failed to read uploaded file")
-
-    if len(image_bytes) == 0:
-        raise HTTPException(status_code=400, detail="Empty file")
+    image_bytes = await read_uploaded_image(file)
 
     try:
         detector = get_detector()
@@ -97,9 +87,9 @@ async def detect(file: UploadFile = File(...)) -> DetectResponse:
 @app.post("/bcs", response_model=BCSResponse)
 async def bcs(file: UploadFile = File(...)) -> BCSResponse:
     """Placeholder for Body Condition Score estimation (Fase 2)."""
+    image_bytes = await read_uploaded_image(file)
     # For now, just run detection to confirm a cow is present
     try:
-        image_bytes = await file.read()
         detector = get_detector()
         detections, _, _, _ = detector.detect(image_bytes)
         cow_detected = len(detections) > 0
