@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -45,15 +45,22 @@ class DetectResponse(BaseModel):
 
 
 class BCSResponse(BaseModel):
-    """Response from POST /bcs — placeholder for future BCS scoring."""
+    """Response from POST /bcs."""
 
-    status: str = Field(default="not_implemented")
+    status: str = Field(default="ok")
     message: str = Field(
-        default="BCS scoring endpoint is not yet implemented. "
-        "Currently only cow detection is available at POST /detect."
+        default="BCS score computed successfully."
     )
     cow_detected: Optional[bool] = None
+    # Retained for response compatibility; failed requests use HTTP errors.
     bcs_score: Optional[BCSScore] = None
+
+
+class BCSReadinessResponse(BaseModel):
+    """Capability-specific BCS readiness response."""
+
+    status: Literal["unconfigured", "not_loaded", "ready", "unavailable"]
+    message: str
 
 
 class HealthResponse(BaseModel):

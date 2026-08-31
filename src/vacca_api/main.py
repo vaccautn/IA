@@ -3,7 +3,7 @@
 Endpoints:
     GET  /health          — service health + model info
     POST /detect          — cow detection with bounding boxes
-    POST /bcs             — BCS scoring (placeholder for Phase 2)
+    POST /bcs             — integer BCS scoring
 
 The test UI at /ui is for PROTOTYPE VALIDATION ONLY.
 Remove the /ui route and static/ directory before connecting to production backend.
@@ -19,7 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from .detection import get_detector
-from .schemas import BCSResponse, DetectResponse, HealthResponse
+from .bcs import round_bcs_score_for_backend
+from .schemas import BCSReadinessResponse, BCSResponse, DetectResponse, HealthResponse
 from .upload_validation import read_uploaded_image
 
 # --- Configuration ---
@@ -83,22 +84,71 @@ async def detect(file: UploadFile = File(...)) -> DetectResponse:
     )
 
 
-# --- BCS (placeholder) ---
+# --- BCS ---
 @app.post("/bcs", response_model=BCSResponse)
 async def bcs(file: UploadFile = File(...)) -> BCSResponse:
-    """Placeholder for Body Condition Score estimation (Fase 2)."""
+    """Estimate and expose the integer BCS score for one full image."""
     image_bytes = await read_uploaded_image(file)
-    # For now, just run detection to confirm a cow is present
     try:
-        detector = get_detector()
-        detections, _, _, _ = detector.detect(image_bytes)
-        cow_detected = len(detections) > 0
+        service = get_bcs_runtime().get_service()
     except Exception:
-        cow_detected = None
+        raise HTTPException(status_code=503, detail="BCS capability is unavailable") from None
+
+    try:
+        result = service.infer(image_bytes)
+    except Exception as exc:
+        if _is_bcs_input_error(exc):
+            raise HTTPException(status_code=400, detail="BCS image input is invalid") from None
+        raise HTTPException(status_code=500, detail="BCS inference failed") from None
+
+    try:
+        score = round_bcs_score_for_backend(result.continuous_score)
+    except Exception:
+        raise HTTPException(status_code=500, detail="BCS score could not be produced") from None
 
     return BCSResponse(
-        cow_detected=cow_detected,
+        status="ok",
+        message="BCS score computed successfully.",
+        cow_detected=None,
+        bcs_score=score,
     )
+
+
+def get_bcs_runtime():
+    """Resolve the optional BCS runtime only when a BCS operation asks for it."""
+    from .bcs_runtime import get_bcs_runtime as resolve_runtime
+
+    return resolve_runtime()
+
+
+def _is_bcs_input_error(error: Exception) -> bool:
+    try:
+        from vacca_bcs.serving import BCSInferenceInputError
+    except ImportError:
+        return False
+    return isinstance(error, BCSInferenceInputError)
+
+
+@app.get(
+    "/ready/bcs",
+    response_model=BCSReadinessResponse,
+    responses={503: {"model": BCSReadinessResponse}},
+)
+def bcs_readiness() -> BCSReadinessResponse:
+    """Report BCS capability state without triggering lazy loading."""
+    runtime = get_bcs_runtime()
+    raw_status = runtime.status
+    status = raw_status.value if hasattr(raw_status, "value") else raw_status
+    messages = {
+        "unconfigured": "BCS capability is not configured.",
+        "not_loaded": "BCS capability is configured but not loaded.",
+        "ready": "BCS capability is ready.",
+        "unavailable": "BCS capability is unavailable.",
+    }
+    message = messages.get(status, "BCS capability is unavailable.")
+    if status != "ready":
+        raise HTTPException(status_code=503, detail=message)
+    return BCSReadinessResponse(status="ready", message=message)
 
 
 # ============================================================
