@@ -1,17 +1,20 @@
 # Arquitectura
 
-`IA` contiene un prototipo de detección de bovinos, un núcleo de reglas desacoplado y un pipeline ordinal BCS versionado para preparar datos, entrenar un modelo CORAL y conservar checkpoints reanudables. La detección HTTP actual y los caminos `vacca_vision`/`vacca_bcs` son relacionados, pero no están conectados entre sí.
+`IA` contiene un prototipo de detección de bovinos y un pipeline ordinal BCS
+versionado para preparar datos, entrenar un modelo CORAL y servir un checkpoint
+validado. La detección HTTP de Fase 1 y el serving BCS son capacidades separadas;
+`/bcs` no usa YOLO ni el pipeline `vacca_vision`.
 
 ## Mapa de responsabilidades
 
 | Área | Responsabilidad actual | Referencias |
 |---|---|---|
-| `src/vacca_api/` | Adaptador FastAPI, carga del detector YOLO, esquemas HTTP y UI de prototipo. | `main.py`, `detection.py`, `schemas.py` |
+| `src/vacca_api/` | Adaptador FastAPI, carga del detector YOLO, runtime BCS lazy, esquemas HTTP, validación común y UI de prototipo. | `main.py`, `detection.py`, `bcs_runtime.py`, `bcs.py`, `schemas.py`, `upload_validation.py` |
 | `src/vacca_vision/` | Contratos de detección, validación de imágenes, reglas de aptitud y adaptador Ultralytics. | `contracts.py`, `image_validation.py`, `pipeline.py`, `ultralytics_adapter.py` |
 | `scripts/run_baseline.py` | Ejecuta el camino validado por manifiesto: snapshot, detector, pipeline y salida JSON. | `configs/baseline_manifest.json` |
 | `src/vacca_bcs/` comprometido | Integer snapshot, dataset ordinal y pipeline de modelo/transformaciones. | `constants.py`, `integer_snapshot.py`, `dataset.py`, `model.py` y source-plan modules |
 | Cliente de fuente BCS | Cliente HTTP autenticado y estricto para consumir el export versionado de la fuente. | `source_client.py` y `tests/test_bcs_source_client.py` |
-| Modelo ordinal BCS | Versionado y probado con fixtures temporales; no es serving HTTP. | `BCSOrdinalModel`, `CORALHead`, `coral_loss` y `predict` en `model.py` |
+| Modelo ordinal BCS | Versionado, probado con fixtures temporales y expuesto mediante un servicio de imagen completa cuando hay checkpoint. | `BCSOrdinalModel`, `CORALHead`, `coral_loss` y `predict` en `model.py`; `serving.py` |
 | Entrenamiento y reanudación ordinales | Código, configuración y pruebas versionados; no hay una ejecución real comprometida. | `scripts/train_bcs_ordinal.py`, `configs/training_bcs_ordinal.yaml` y artefactos `weights/last.pt`/`run_info.json` sólo cuando una operación local los genera |
 | `tests/` | Gates de contratos, baseline, Phase 1 pipeline y BCS ordinal. | Archivos `test_*.py` versionados en la rama, incluidos los caminos reales temporales |
 
@@ -34,7 +37,7 @@ DetectResponse JSON
 Detalles comprobables en el código:
 
 1. `scripts/run_api.py` añade `src/` al `sys.path` y entrega `vacca_api.main:app` a Uvicorn.
-2. El evento de startup llama `get_detector(model_path=MODEL_PATH)` y precarga `outputs/training/combined-v2-finetune/weights/best.pt`.
+2. El evento de startup llama `get_detector(model_path=MODEL_PATH)` y precarga el peso YOLO local `outputs/training/combined-v2-finetune/weights/best.pt`.
 3. `vacca_api.detection` abre los bytes con Pillow, convierte a RGB cuando corresponde y ejecuta YOLO con confianza `0.25`.
 4. `vacca_api.schemas` serializa `cow_detected`, `detection_count`, detecciones, dimensiones e `inference_time_ms`.
 
@@ -69,22 +72,42 @@ letterboxing, training-only augmentation, and ImageNet normalization; `model.py`
 uses ResNet18 with an ordered CORAL head. The model may use floating-point tensors
 internally, but its semantic class projection is the integer score `1..5`. The
 trainer records configuration, the live manifest, and runtime identity to reject
-incompatible resumes. Old fractional or stale-lineage artifacts are unsupported
+incompatible resumes. Unsupported legacy or stale-lineage artifacts are rejected
 and are not migrated.
 
-## Frontera BCS futura
+## Frontera de serving BCS
 
-La frontera de serving BCS todavía no está implementada. El código actual sólo deja `POST /bcs` como placeholder; no carga `BCSOrdinalModel` ni calcula un score.
+`bcs_runtime.py` mantiene un runtime por proceso con cuatro estados:
+`unconfigured`, `not_loaded`, `ready` y `unavailable`. La configuración se lee
+de `VACCA_BCS_CHECKPOINT` y `VACCA_BCS_DEVICE` (por defecto `cpu`). El runtime
+no carga al importar ni al consultar `/ready/bcs`; la primera solicitud `/bcs`
+dispara una carga única y cachea éxito o fallo.
 
-La integración futura aprobada sólo podrá exponer un score entero en `1..5`, con redondeo decimal half-down en el límite del endpoint (un empate exacto `.5` baja, por ejemplo `3.5 → 3`). Ese límite conserva cualquier cálculo flotante interno y no implementa todavía `/bcs`.
+`serving.py` valida el checkpoint `bcs-ordinal-integer-checkpoint-v1`, su dominio
+`bcs-integer-1-5`, escala/clases `1..5` y lineage del snapshot
+`bcs-integer-snapshot-v2`. Luego decodifica el upload como JPEG/PNG, aplica el
+preprocesamiento determinista de imagen completa y ejecuta CORAL. La expectativa
+continua se convierte a entero sólo en `vacca_api.bcs` con half-down (`3.5 → 3`);
+la API devuelve `cow_detected: null` y no devuelve confianza.
+
+Si el checkpoint falta o no es utilizable, `/bcs` devuelve `503` con un detalle
+sanitizado. Inputs inválidos devuelven `400`, fallos de inferencia `500`, y
+`/ready/bcs` devuelve el mismo `BCSReadinessResponse` con `503` salvo en `ready`.
+`/health` y `/detect` no consultan este runtime.
 
 ## Relación con el backend
 
-El PRD establece que el prototipo de IA es independiente del backend actual y que la integración definitiva está fuera del alcance de Fase 1. La rama ahora incluye un cliente acotado para el export versionado `bcs-source-v1`, pero no una integración completa de serving o datasets. En el estado observado:
+El PRD establece que el prototipo de IA es independiente del backend actual. La
+rama incluye un cliente acotado para el export versionado `bcs-source-v1` y el
+serving BCS local, pero no un despliegue final ni una operación real de datos o
+pesos. En el estado observado:
 
-- IA ejecuta la inferencia de visión en el servicio local de detección.
-- `vacca_bcs.source_client` envía autenticación Bearer y consume el export; no implementa persistencia de dominio ni orquestación del backend.
-- El serving BCS, la materialización de imágenes y la migración de etiquetas siguen siendo trabajo futuro.
+- IA ejecuta la detección YOLO y el serving ordinal en el servicio local.
+- El backend posee autenticación, persistencia y R2; `source_client` envía Bearer
+  sólo al backend, solicita signed URLs y descarga el objeto desde R2 sin reenviar
+  el token ni retener la URL.
+- El build materializa imágenes y snapshots; no migra etiquetas ni sustituye la
+  persistencia u orquestación del backend.
 
 ## BCS source export client
 
@@ -95,7 +118,7 @@ El PRD establece que el prototipo de IA es independiente del backend actual y qu
 - HTTP uses HTTPS except for localhost loopback development (`localhost`, `127.0.0.1`, or `::1`). Only an empty path or exactly `/` is accepted; backslashes, query strings, fragments, userinfo, and malformed hosts/ports are rejected.
 - `fetch()` returns frozen, tuple-backed `BCSSourceExport`, `BCSSourceEvaluationRow`, and `BCSSourceEvidence` values. Valid exports preserve empty storage keys and do not deduplicate repeated keys.
 - Configuration, transport, HTTP, JSON, response-size, and contract failures use typed exceptions. Tokens and full response payloads are never included in exception messages or the client representation.
-- `BCSEvidenceMaterializer.materialize(evidence_id)` resolves one signed URL and returns bytes plus SHA-256 without retaining the signed URL; neither class writes files, decodes images, migrates integer datasets, assigns labels, or connects the client to the `/bcs` serving placeholder. Requests may canonicalize percent-escape case; byte-identical wire encoding is not guaranteed.
+- `BCSEvidenceMaterializer.materialize(evidence_id)` resolves one signed URL and returns bytes plus SHA-256 without retaining the signed URL; the backend token is not sent to R2. El builder usa este materializador para escribir el snapshot, mientras que el serving BCS sólo consume checkpoints ya creados. Requests may canonicalize percent-escape case; byte-identical wire encoding is not guaranteed.
 
 ## Deterministic integer source plan
 

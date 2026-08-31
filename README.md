@@ -1,4 +1,4 @@
-# VACCA Vision — Cow Detection API (Fase 1)
+# VACCA Vision — Cow Detection API e BCS ordinal
 
 Microservicio de detección de bovinos con YOLO26n fine-tuneado sobre Navid HSM + BCS ScienceDB.  
 **mAP50: 0.974 · mAP50-95: 0.610 · Precision: 0.976 · Recall: 0.924**
@@ -11,7 +11,13 @@ Microservicio de detección de bovinos con YOLO26n fine-tuneado sobre Navid HSM 
 
 ## Estado actual
 
-La detección de Fase 1 tiene un camino local de prototipo. El pipeline de snapshot entero, el núcleo ordinal BCS, el trainer y sus pruebas están versionados en esta rama; `/bcs` sigue siendo un placeholder y no se afirma una ejecución real ni disponibilidad productiva. Ver el [estado detallado](docs/estado-del-repositorio.md) antes de operar o revisar Phase 2.
+La detección de Fase 1 mantiene un camino local de prototipo. El pipeline entero
+de fuente a snapshot, el núcleo ordinal BCS, el trainer y el serving BCS están
+implementados y cubiertos por pruebas deterministas. No se ha producido ni
+accedido todavía a un dataset, entrenamiento o checkpoint BCS real: sin
+`VACCA_BCS_CHECKPOINT`, `/bcs` responde `503` y `/ready/bcs` no está listo. Esto
+no representa un despliegue de usuario final. Ver el [estado detallado](docs/estado-del-repositorio.md)
+antes de operar o revisar Phase 2.
 
 ## Requisitos
 
@@ -45,16 +51,19 @@ y ejecutá el chequeo desde el entorno del proyecto:
 ## Setup rápido
 
 ```powershell
-# 1. Crear venv e instalar
+# 1. Crear venv e instalar dependencias del proyecto
 python -m venv .venv
-.venv\Scripts\python -m pip install -e .[yolo]
-.venv\Scripts\pip install fastapi uvicorn python-multipart
+.venv\Scripts\python -m pip install -e ".[api,bcs,dev,yolo]"
 
-# 2. Verificar que el modelo existe
+# 2. Verificar el peso local requerido por el detector de Fase 1
 dir outputs\training\combined-v2-finetune\weights\best.pt
 ```
 
-> Si no tenés el modelo entrenado, descargalo del release o entrenalo con `scripts/train.py`.
+El peso anterior es un output local generado por el flujo YOLO de Fase 1; no lo
+proporciona este checkout. El artefacto versionado
+`models/deploy/vacca-yolo26n-v1.pt` se conserva para reproducibilidad/despliegue,
+pero la API actual no lo selecciona automáticamente. El BCS no tiene pesos
+versionados.
 
 ## Arrancar el servidor
 
@@ -68,7 +77,8 @@ El servidor levanta en `http://127.0.0.1:8000` con estos endpoints:
 |--------|------|-------------|
 | `GET` | `/health` | Estado del servicio, GPU, modelo cargado |
 | `POST` | `/detect` | Recibe imagen → vacas detectadas con bounding boxes |
-| `POST` | `/bcs` | Placeholder para Body Condition Score (Fase 2) |
+| `POST` | `/bcs` | Score BCS entero `1..5` sobre la imagen completa; `503` si no está disponible |
+| `GET` | `/ready/bcs` | Estado de capacidad BCS sin cargar el checkpoint |
 | `GET` | `/ui` | UI de prueba drag-and-drop (prototipo) |
 | `GET` | `/docs` | Swagger interactivo |
 
@@ -95,7 +105,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/detect `
   -Method Post `
   -Form @{file=Get-Item "data\cow-detection-navids\valid\images\alguna.jpg"}
 
-# BCS (placeholder)
+# BCS (requiere un checkpoint BCS real configurado; de lo contrario devuelve 503)
 Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs `
   -Method Post `
   -Form @{file=Get-Item "data\cow-detection-navids\valid\images\alguna.jpg"}
@@ -115,11 +125,14 @@ for d in data["detections"]:
     print(f"  {d['confidence']:.1%} — bbox: [{d['x1']},{d['y1']},{d['x2']},{d['y2']}]")
 ```
 
-### Opción 5: Smoke test sin servidor
+### Opción 5: Comprobación directa del detector (sin servidor)
 
 ```powershell
 .venv\Scripts\python scripts/smoke_test_api.py
 ```
+
+Este helper no inicia FastAPI, no hace HTTP y no verifica `/bcs` ni
+`/ready/bcs`; requiere el dataset y el peso YOLO local.
 
 ## Re-entrenar el modelo
 
@@ -162,28 +175,51 @@ The supported Phase 2 workflow has exactly three stages:
 3. **Trainer:** validate that snapshot and train the ordinal model with `scripts/train_bcs_ordinal.py` into `outputs/bcs-ordinal-integer-v1/`.
 
 ```powershell
+$env:VACCA_BACKEND_URL = "https://backend.example"
 $env:VACCA_BACKEND_TOKEN = "<token-from-your-secret-store>"
-.venv\Scripts\python scripts/build_bcs_integer.py --base-url https://backend.example
+.venv\Scripts\python scripts/build_bcs_integer.py
 .venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
 ```
 
-The snapshot command requires the backend source-export and signed-evidence endpoints,
-refuses an existing output root, and reports safe snapshot counts and identity. Use
-`--seed`, `--val-ratio`, `--timeout`, `--max-source-bytes`, and `--max-image-bytes`
-to make operational limits explicit. The active domain is `bcs-integer-1-5` with
-classes `1..5`.
+The builder requires the backend source-export and signed-evidence endpoints,
+refuses an existing output root, and reports safe snapshot counts and identity.
+Use `--base-url` instead of `VACCA_BACKEND_URL` when appropriate, plus `--seed`,
+`--val-ratio`, `--timeout`, `--max-source-bytes`, and `--max-image-bytes` to make
+operational limits explicit. The token is read only from `VACCA_BACKEND_TOKEN`.
+The active domain is `bcs-integer-1-5` with classes `1..5`.
 
-Old integer, fractional, and stale-lineage artifacts are unsupported. The active
-loader and trainer reject them; they are not converted, migrated, or presented as
-an executable workflow.
+The backend owns authentication and R2. IA sends the Bearer token only to the
+backend, receives source metadata and signed evidence URLs, and downloads the
+evidence from those URLs without forwarding the token. Signed URLs are not
+retained. This workflow requires real backend access and is not run by the
+repository verification below.
+
+Artifacts with an unsupported schema or stale lineage are rejected by the active
+loader and trainer. There is no conversion, fallback, or legacy workflow.
 
 ### Training and verification
 
-The ordinal core and trainer are versioned and covered by deterministic tests using
-controlled images and tensors. A checkpoint is accepted only with a validated
-integer snapshot manifest, matching snapshot identity, domain, configuration, and
-run lineage. `/bcs` remains a placeholder; its approved future contract exposes
-only an integer score in `1..5`.
+The ordinal core, trainer, checkpoint loader, and API boundary are versioned and
+covered by deterministic tests using controlled images and tensors. A checkpoint
+is accepted only with a validated integer snapshot manifest, matching snapshot
+identity, domain, scale, configuration, and run lineage. The serving path uses
+the full image (no YOLO detection or crop), returns no confidence, and rounds its
+continuous CORAL expectation to the integer `1..5` only at the HTTP boundary;
+exact `.5` ties round down.
+
+### Serving BCS
+
+Configure a real, lineage-compatible checkpoint only when one exists:
+
+```powershell
+$env:VACCA_BCS_CHECKPOINT = "C:\secure\models\bcs-ordinal-integer-checkpoint-v1.pt"
+$env:VACCA_BCS_DEVICE = "cpu" # optional; cpu is the default
+.venv\Scripts\python scripts/run_api.py
+```
+
+The BCS loader is lazy and isolated from `/health` and `/detect`. `/ready/bcs`
+reports readiness without loading. Until a real checkpoint is configured and
+loaded, `/bcs` returns `503`; no end-user deployment is claimed.
 
 ### Prerrequisitos y ejecución
 
@@ -204,10 +240,10 @@ artifacts; `--overwrite` allows replacement after validation. `--resume
 outputs/bcs-ordinal-integer-v1/weights/last.pt` requires compatible configuration,
 live manifest/dataset, snapshot identity, domain, and `run_id`.
 
-Final repository verification: `.venv\Scripts\python -m pytest -q` reports
-`375 passed, 1 skipped, 2 warnings, 65 subtests passed`. The warnings are the
-known FastAPI `on_event` deprecations. No real data, outputs, model weights, or
-training run were accessed or generated for this documentation.
+Final repository verification at `ff7ac78`: `.venv\Scripts\python -m pytest -q`
+reports `430 passed, 2 skipped, 2 warnings, 65 subtests passed`. The warnings are
+the known FastAPI `on_event` deprecations. This verification did not access real
+BCS data, outputs, model weights, or run training.
 
 ## Resultados de entrenamiento
 
@@ -221,9 +257,12 @@ training run were accessed or generated for this documentation.
 ```
 IA/
 ├── src/vacca_api/           ← Microservicio FastAPI
-│   ├── main.py              ← Rutas: /detect, /bcs, /health, /ui
+│   ├── main.py              ← Rutas: /detect, /bcs, /ready/bcs, /health, /ui
 │   ├── detection.py         ← Wrapper YOLO (singleton)
+│   ├── bcs.py               ← Adaptación del score al contrato HTTP
 │   ├── schemas.py           ← Modelos Pydantic
+│   ├── bcs_runtime.py       ← Runtime BCS lazy y estados de readiness
+│   ├── upload_validation.py ← Validación compartida de uploads
 │   └── static/index.html    ← UI de prototipo (descartable)
 ├── src/vacca_bcs/           ← Integer ordinal BCS package
 │   ├── constants.py         ← Integer domain and shared constants
@@ -232,14 +271,16 @@ IA/
 │   ├── model.py             ← ResNet18 + CORAL ordinal model
 │   ├── source_client.py     ← Authenticated source export client
 │   ├── source_plan.py       ← Export normalization
-│   └── source_split_plan.py ← Deterministic train/validation split
+│   ├── source_split_plan.py ← Deterministic train/validation split
+│   └── serving.py           ← Validated checkpoint loader and full-image inference
 ├── scripts/
 │   ├── train.py             ← Phase 1 YOLO training
 │   ├── build_combined_v2.py ← Separate Phase 1 combined dataset
 │   ├── build_bcs_integer.py ← Source export to integer snapshot v2
 │   ├── train_bcs_ordinal.py ← Integer ordinal trainer
+│   ├── run_baseline.py       ← Reproducible Phase 1 baseline
 │   ├── run_api.py           ← API server launcher
-│   └── smoke_test_api.py    ← Direct API helper
+│   └── smoke_test_api.py    ← Comprobación directa de detector/esquemas
 ├── configs/                 ← YAMLs de entrenamiento
 ├── data/                    ← (gitignored)
 │   ├── bcs-integer-v1/      ← Canonical integer snapshot root
@@ -259,7 +300,7 @@ IA/
 ```json
 {
   "cow_detected": true,
-  "detection_count": 2,
+  "detection_count": 1,
   "detections": [
     {
       "class_name": "cow",
