@@ -669,3 +669,24 @@ def test_invalid_image_limit_creates_no_owned_session(monkeypatch):
             "https://backend.example", "token", 1, max_image_bytes=0
         )
     assert created == []
+
+
+def test_materializer_closes_owned_backend_if_download_session_creation_fails(monkeypatch):
+    backend = FakeTransport()
+    calls = 0
+
+    def session_factory():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return backend
+        raise RuntimeError("secret-token and signed-url")
+
+    monkeypatch.setattr(source_client_module.requests, "Session", session_factory)
+    with pytest.raises(BCSSourceConfigurationError) as failure:
+        BCSEvidenceMaterializer("https://backend.example", "secret-token", 1)
+
+    assert calls == 2
+    assert backend.close_calls == 1
+    assert "secret-token" not in str(failure.value)
+    assert "signed-url" not in str(failure.value)

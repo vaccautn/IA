@@ -465,12 +465,24 @@ class BCSEvidenceMaterializer(BCSSourceClient):
         if type(max_image_bytes) is not int or max_image_bytes <= 0:
             raise BCSSourceConfigurationError(
                 "max_image_bytes must be a positive integer"
-            )
+        )
         super().__init__(backend_base_url, bearer_token, timeout, backend_transport)
         self._max_image_bytes = max_image_bytes
-        self._download_transport = (
-            download_transport if download_transport is not None else requests.Session()
-        )
+        try:
+            created_download_transport = (
+                download_transport
+                if download_transport is not None
+                else requests.Session()
+            )
+        except Exception:
+            super().close()
+            raise BCSSourceConfigurationError(
+                "could not create the evidence download transport"
+            ) from None
+        except BaseException:
+            super().close()
+            raise
+        self._download_transport = created_download_transport
         self._owns_download_transport = download_transport is None
 
     def close(self) -> None:
