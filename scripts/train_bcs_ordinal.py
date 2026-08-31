@@ -36,24 +36,25 @@ def _configure_cublas_determinism() -> None:
 
 _configure_cublas_determinism()
 
-import torch
-import torchvision
-import yaml  # type: ignore[import-untyped]
-from torch import Tensor
-from torch.utils.data import DataLoader
+import torch  # noqa: E402
+import torchvision  # noqa: E402
+import yaml  # type: ignore[import-untyped]  # noqa: E402
+from torch import Tensor  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from vacca_bcs.constants import (  # noqa: E402
+    BCS_CLASS_SCORES,
+    BCS_DOMAIN_ID,
     CLASS_NAMES,
-    IMAGE_EXTENSIONS,
     MANIFEST_FILENAME,
-    MANIFEST_SCHEMA_VERSION,
     SCORE_STEP,
     SPLITS,
 )
 from vacca_bcs.dataset import BCSFolderDataset  # noqa: E402
+from vacca_bcs.integer_snapshot import load_integer_snapshot_manifest  # noqa: E402
 from vacca_bcs.model import BCSOrdinalModel, coral_loss, predict  # noqa: E402
 
 RESULTS_FIELDNAMES = [
@@ -225,154 +226,49 @@ def _runtime_identity(device: torch.device) -> dict[str, Any]:
     return identity
 
 
-def _manifest_relative_path(raw: Any, *, field: str, manifest_path: Path) -> Path:
-    if not isinstance(raw, str) or not raw:
-        raise ValueError(f"Dataset manifest {field} must be a non-empty relative path")
-    path = Path(raw)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise ValueError(
-            f"Dataset manifest {field} has an unsafe path {raw!r}: "
-            f"{manifest_path}"
-        )
-    return path
-
-
 def _dataset_manifest_provenance(data_dir: Path) -> dict[str, Any]:
     manifest_path = data_dir / MANIFEST_FILENAME
-    if not manifest_path.is_file():
-        raise FileNotFoundError(
-            "Cannot establish dataset provenance: manifest not found at "
-            f"{manifest_path}. Rebuild the dataset before starting or resuming training."
-        )
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Cannot read dataset manifest {manifest_path}: {exc}") from exc
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Dataset manifest must be a JSON object: {manifest_path}")
-    schema_version = manifest.get("manifest_schema_version")
-    if type(schema_version) is not int or schema_version != MANIFEST_SCHEMA_VERSION:
-        raise ValueError(
-            f"Unsupported dataset manifest schema {schema_version!r} at {manifest_path}; "
-            f"expected {MANIFEST_SCHEMA_VERSION}."
-        )
-    if manifest.get("class_values") != list(CLASS_NAMES):
-        raise ValueError(f"Dataset manifest class_values do not match BCS classes: {manifest_path}")
-    if manifest.get("class_mapping") != {
-        class_name: index for index, class_name in enumerate(CLASS_NAMES)
-    }:
-        raise ValueError(f"Dataset manifest class_mapping does not match BCS classes: {manifest_path}")
-    selected_files = manifest.get("selected_files")
-    if not isinstance(selected_files, list):
-        raise ValueError(f"Dataset manifest selected_files must be a list: {manifest_path}")
-
+    if not data_dir.is_dir() or not manifest_path.is_file():
+        raise FileNotFoundError("integer snapshot dataset or manifest is missing")
+    manifest = load_integer_snapshot_manifest(manifest_path)
     data_root = data_dir.resolve()
+    expected_dirs = set(SPLITS) | {
+        f"{split}/{name}" for split in SPLITS for name in CLASS_NAMES
+    }
+    actual_dirs: set[str] = set()
     actual_files: dict[str, Path] = {}
-    actual_counts = {split: {name: 0 for name in CLASS_NAMES} for split in SPLITS}
-    for split in SPLITS:
-        for class_name in CLASS_NAMES:
-            class_dir = data_root / split / class_name
-            if not class_dir.is_dir():
-                raise ValueError(f"Dataset class directory is missing: {class_dir}")
-            for path in sorted(class_dir.iterdir()):
-                if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
-                    continue
-                try:
-                    path.resolve().relative_to(data_root)
-                except ValueError:
-                    raise ValueError(
-                        f"Live dataset file escapes dataset root: {path}"
-                    ) from None
-                relative = path.relative_to(data_root).as_posix()
-                key = relative.casefold()
-                if key in actual_files:
-                    raise ValueError(f"Dataset contains duplicate live path: {relative}")
-                actual_files[key] = path
-                actual_counts[split][class_name] += 1
+    for path in data_root.rglob("*"):
+        relative = path.relative_to(data_root).as_posix()
+        if path.is_symlink():
+            raise ValueError("integer snapshot contains an unsafe filesystem entry")
+        if path.is_dir():
+            actual_dirs.add(relative)
+        elif path.is_file() and relative != MANIFEST_FILENAME:
+            key = relative.casefold()
+            if key in actual_files:
+                raise ValueError("integer snapshot contains duplicate live paths")
+            actual_files[key] = path
+    if actual_dirs != expected_dirs:
+        raise ValueError("integer snapshot root structure is inconsistent")
 
-    declared_files: dict[str, tuple[Path, str]] = {}
-    for index, entry in enumerate(selected_files):
-        if not isinstance(entry, dict):
-            raise ValueError(f"Dataset manifest selected_files[{index}] must be an object")
-        try:
-            destination = _manifest_relative_path(
-                entry["destination"], field=f"selected_files[{index}].destination", manifest_path=manifest_path
-            )
-            _manifest_relative_path(
-                entry["source"], field=f"selected_files[{index}].source", manifest_path=manifest_path
-            )
-            split = entry["split"]
-            declared_hash = entry["sha256"]
-        except KeyError as exc:
-            raise ValueError(
-                f"Dataset manifest selected_files[{index}] is missing {exc.args[0]!r}"
-            ) from None
-        if not isinstance(split, str) or split not in SPLITS:
-            raise ValueError(f"Dataset manifest selected_files[{index}] has invalid split {split!r}")
-        parts = destination.parts
-        if len(parts) != 3 or parts[0] != split or parts[1] not in CLASS_NAMES:
-            raise ValueError(
-                f"Dataset manifest selected_files[{index}] destination {destination.as_posix()!r} "
-                "does not identify a valid split/class file"
-            )
-        if destination.suffix.lower() not in IMAGE_EXTENSIONS:
-            raise ValueError(
-                f"Dataset manifest selected_files[{index}] destination is not an image: "
-                f"{destination.as_posix()}"
-            )
-        if (
-            not isinstance(declared_hash, str)
-            or len(declared_hash) != 64
-            or declared_hash.lower() != declared_hash
-            or any(character not in "0123456789abcdef" for character in declared_hash)
-        ):
-            raise ValueError(
-                f"Dataset manifest selected_files[{index}] has invalid sha256 for "
-                f"{destination.as_posix()}"
-            )
-        key = destination.as_posix().casefold()
-        if key in declared_files:
-            raise ValueError(f"Dataset manifest has duplicate destination: {destination.as_posix()}")
-        declared_files[key] = (destination, declared_hash)
-
-    missing = sorted(set(actual_files).difference(declared_files))
-    added = sorted(set(declared_files).difference(actual_files))
-    if missing or added:
-        details = []
-        if missing:
-            details.append(f"missing manifest entries for live files {missing}")
-        if added:
-            details.append(f"manifest entries do not exist in the live dataset {added}")
-        raise ValueError("Dataset manifest/live dataset membership mismatch: " + "; ".join(details))
+    declared_files = {
+        record["relative_path"].casefold(): (record["relative_path"], record["sha256"])
+        for record in manifest["records"]
+    }
+    if set(actual_files) != set(declared_files):
+        raise ValueError("integer snapshot manifest/live dataset membership mismatch")
 
     live_entries: list[dict[str, str]] = []
     for key, path in sorted(actual_files.items()):
         destination, declared_hash = declared_files[key]
         actual_hash = _sha256_file(path)
         if actual_hash != declared_hash:
-            raise ValueError(
-                f"Dataset file hash mismatch for {destination.as_posix()}: "
-                f"manifest={declared_hash}, live={actual_hash}"
-            )
-        live_entries.append({"destination": destination.as_posix(), "sha256": actual_hash})
-
-    counts = manifest.get("counts")
-    if not isinstance(counts, dict):
-        raise ValueError(f"Dataset manifest counts must be an object: {manifest_path}")
-    for split in SPLITS:
-        declared_counts = counts.get(split)
-        if not isinstance(declared_counts, dict):
-            raise ValueError(f"Dataset manifest counts.{split} must be an object")
-        for class_name in CLASS_NAMES:
-            value = declared_counts.get(class_name)
-            if type(value) is not int or value != actual_counts[split][class_name]:
-                raise ValueError(
-                    f"Dataset manifest count mismatch for {split}/{class_name}: "
-                    f"manifest={value!r}, live={actual_counts[split][class_name]}"
-                )
+            raise ValueError("integer snapshot file digest mismatch")
+        live_entries.append({"destination": destination, "sha256": actual_hash})
     return {
-        "path": str(manifest_path.resolve()),
-        "schema_version": schema_version,
+        "schema_version": manifest["manifest_schema_version"],
+        "domain_id": manifest["domain_id"],
+        "source_schema": manifest["source_schema"],
         "sha256": _sha256_text(_canonical_json(manifest)),
         "live_sha256": _sha256_text(_canonical_json(live_entries)),
     }
@@ -389,6 +285,7 @@ def _build_provenance(
     runtime = _runtime_identity(device)
     return {
         "config_sha256": _sha256_text(_canonical_json(config_for_hash)),
+        "domain_id": BCS_DOMAIN_ID,
         "data_dir": str(data_dir.resolve()),
         "output_dir": str(output_dir.resolve()),
         "dataset_manifest": _dataset_manifest_provenance(data_dir),
@@ -396,6 +293,7 @@ def _build_provenance(
         "cuda_device_count": runtime["cuda_device_count"],
         "runtime": runtime,
         "classes": list(CLASS_NAMES),
+        "class_values": list(BCS_CLASS_SCORES),
     }
 
 
@@ -571,6 +469,8 @@ def _build_run_info(context: RunInfoContext) -> dict[str, Any]:
         "finished_at_utc": _utc_now(),
         "config_file": str(context.config["_config_path"]),
         "dataset": str(context.data_dir),
+        "domain_id": BCS_DOMAIN_ID,
+        "class_values": list(BCS_CLASS_SCORES),
         "class_counts": {
             "train": context.train_dataset.class_counts,
             "val": context.val_dataset.class_counts,
@@ -1027,15 +927,17 @@ def train(
     epochs_without_improvement = 0
     checkpoint: dict[str, Any] | None = None
 
-    if resume is None:
-        if _existing_run_artifacts(output_dir) and not overwrite:
-            _prepare_output_dir(output_dir, overwrite=False)
-        output_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    if resume is None and _existing_run_artifacts(output_dir) and not overwrite:
+        _prepare_output_dir(output_dir, overwrite=False)
     provenance = _build_provenance(
         config, data_dir=data_dir, output_dir=output_dir, device=device
     )
+    if resume is None:
+        if _existing_run_artifacts(output_dir):
+            _prepare_output_dir(output_dir, overwrite=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
     if resume is not None:
         checkpoint = _load_resume_checkpoint(
             resume,

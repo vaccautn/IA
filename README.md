@@ -191,7 +191,7 @@ El núcleo ordinal y el trainer están versionados y cubiertos por pruebas con i
 
 - Python 3.11 o posterior.
 - Entorno `.venv` con las dependencias BCS instaladas (`.venv\Scripts\python -m pip install -e .[bcs]`).
-- Dataset generado en `data/bcs-cls/` y su `manifest.json` validado por el builder.
+- Snapshot entero generado en `data/bcs-integer-v1/` y su manifiesto v2 validado antes del entrenamiento.
 - La configuración operativa usa el backbone ImageNet por defecto en una ejecución fresca y puede requerir que esos pesos estén disponibles; las pruebas de esta transición usan `pretrained=False` y no descargan modelos.
 
 Para iniciar una ejecución operativa, usar:
@@ -200,7 +200,7 @@ Para iniciar una ejecución operativa, usar:
 .venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
 ```
 
-El directorio configurado (`outputs/bcs-ordinal/`) contiene `results.csv`, `run_info.json`, `weights/best.pt` y el checkpoint reanudable `weights/last.pt`. Una ejecución fresca rechaza artefactos existentes; `--overwrite` permite reemplazarlos después de las validaciones previas. `--resume outputs/bcs-ordinal/weights/last.pt` exige compatibilidad de configuración, manifiesto/dataset vivo e identidad del runtime, y no es un mecanismo para mezclar entornos.
+El directorio configurado (`outputs/bcs-ordinal-integer-v1/`) contiene `results.csv`, `run_info.json`, `weights/best.pt` y el checkpoint reanudable `weights/last.pt`. Una ejecución fresca rechaza artefactos existentes; `--overwrite` permite reemplazarlos después de las validaciones previas. `--resume outputs/bcs-ordinal-integer-v1/weights/last.pt` exige compatibilidad de configuración, manifiesto/dataset vivo e identidad del runtime, y no es un mecanismo para mezclar entornos.
 
 La evidencia comprometida de esta transición se limita a pruebas deterministas con imágenes Pillow temporales y tensores pequeños. No se ejecutó entrenamiento real, no se descargaron pesos y no se accedió ni se generaron datos o outputs reales para producir esta documentación.
 

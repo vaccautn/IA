@@ -213,7 +213,7 @@ def test_real_dataset_transforms_and_model_training_step(tmp_path: Path) -> None
 
 def _write_config(tmp_path: Path, name: str = "config.yaml", **overrides: object) -> Path:
     config = {
-        "data_dir": "data/bcs-cls",
+        "data_dir": "data/bcs-integer-v1",
         "output": str(tmp_path / "out"),
         "epochs": 2,
         "batch_size": 2,
@@ -937,32 +937,54 @@ def test_validate_computes_mae_with_canonical_integer_score_step() -> None:
 
 def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -> dict[str, object]:
     data_dir = tmp_path / "dataset"
-    selected_files = []
+    records = []
     for split in ("train", "val"):
-        for class_name in CLASS_NAMES:
+        for class_index, class_name in enumerate(CLASS_NAMES):
             class_dir = data_dir / split / class_name
             class_dir.mkdir(parents=True, exist_ok=True)
-            path = class_dir / "fixture.jpg"
+            evidence_id = (0 if split == "train" else NUM_CLASSES) + class_index + 1
+            path = class_dir / f"{evidence_id}.jpg"
             content = f"{split}/{class_name}".encode("utf-8")
             path.write_bytes(content)
-            selected_files.append(
+            records.append(
                 {
-                    "source": f"fixture/{split}/{class_name}.jpg",
-                    "sha256": hashlib.sha256(content).hexdigest(),
                     "split": split,
-                    "destination": f"{split}/{class_name}/fixture.jpg",
+                    "bcs_score": class_index + 1,
+                    "evidence_id": evidence_id,
+                    "relative_path": f"{split}/{class_name}/{evidence_id}.jpg",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "provenance": [
+                        {"evidence_id": evidence_id, "evaluation_id": evidence_id + 100}
+                    ],
                 }
             )
+    records.sort(key=lambda item: (item["bcs_score"], item["split"] == "val", item["evidence_id"]))
+    counts = {split: [1] * NUM_CLASSES for split in ("train", "val")}
     (data_dir / "manifest.json").write_text(
         json.dumps(
             {
-                "manifest_schema_version": 1,
-                "class_values": list(CLASS_NAMES),
+                "manifest_schema_version": "bcs-integer-snapshot-v2",
+                "domain_id": BCS_DOMAIN_ID,
+                "class_values": list(BCS_CLASS_SCORES),
                 "class_mapping": {name: index for index, name in enumerate(CLASS_NAMES)},
-                "selected_files": selected_files,
-                "counts": {
-                    split: {name: 1 for name in CLASS_NAMES} for split in ("train", "val")
+                "score_min": SCORE_MIN,
+                "score_max": SCORE_MAX,
+                "score_base": SCORE_BASE,
+                "score_step": SCORE_STEP,
+                "num_classes": NUM_CLASSES,
+                "num_thresholds": NUM_THRESHOLDS,
+                "source_schema": "bcs-source-v1",
+                "counts": counts,
+                "split_plan": {
+                    "identity_digest": "0" * 64,
+                    "seed": 7,
+                    "canonical_val_ratio": "0",
+                    "candidate_evidence_ids": list(range(1, 11)),
+                    "excluded_evidence_ids": [],
+                    "counts": counts,
                 },
+                "records": records,
+                "exclusions": [],
             },
             sort_keys=True,
         ),
@@ -1071,18 +1093,77 @@ def test_dataset_provenance_rejects_inconsistent_live_membership(
     if mutation == "added":
         (data_dir / "train" / CLASS_NAMES[0] / "added.jpg").write_bytes(b"added")
     elif mutation == "missing":
-        (data_dir / "train" / CLASS_NAMES[0] / "fixture.jpg").unlink()
+        (data_dir / "train" / CLASS_NAMES[0] / "1.jpg").unlink()
     else:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["selected_files"][0]["destination"] = "../escape.jpg"
+        manifest["records"][0]["relative_path"] = "../escape.jpg"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="membership|unsafe path"):
+    with pytest.raises(ValueError, match="manifest|membership|unsafe path"):
         _build_provenance(
             config,
             data_dir=data_dir,
             output_dir=Path(config["output"]),
             device=torch.device("cpu"),
         )
+
+
+def test_integer_v2_manifest_is_accepted_and_old_lineages_are_rejected(tmp_path: Path) -> None:
+    config = _tiny_training_config(tmp_path, tmp_path / "out")
+    manifest_path = Path(config["data_dir"]) / "manifest.json"
+    assert _build_provenance(
+        config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]), device=torch.device("cpu")
+    )["classes"] == list(CLASS_NAMES)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["manifest_schema_version"] = "bcs-integer-snapshot-v1"
+    manifest["records"][0]["storage_key"] = "private-storage-key"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="legacy|schema") as failure:
+        _build_provenance(
+            config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]), device=torch.device("cpu")
+        )
+    assert "private-storage-key" not in str(failure.value)
+    manifest["manifest_schema_version"] = "bcs-integer-snapshot-v2"
+    manifest["class_values"] = [3.25, 3.5, 3.75, 4.0, 4.25]
+    manifest["records"][0].pop("storage_key")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="legacy|schema"):
+        _build_provenance(
+            config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]), device=torch.device("cpu")
+        )
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda manifest: manifest["records"][0].update(relative_path="val/1/1.jpg"),
+    lambda manifest: manifest["records"][0].update(bcs_score=5),
+    lambda manifest: manifest.update(class_mapping={name: 0 for name in CLASS_NAMES}),
+])
+def test_integer_v2_manifest_rejects_record_and_class_tampering(tmp_path: Path, mutation) -> None:
+    config = _tiny_training_config(tmp_path, tmp_path / "out")
+    path = Path(config["data_dir"]) / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    mutation(manifest)
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError):
+        _build_provenance(config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]), device=torch.device("cpu"))
+
+
+def test_default_integer_training_roots_are_canonical(tmp_path: Path) -> None:
+    config = yaml.safe_load((REPO_ROOT / "configs" / "training_bcs_ordinal.yaml").read_text())
+    assert config["data_dir"] == "data/bcs-integer-v1"
+    assert config["output"] == "outputs/bcs-ordinal-integer-v1"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "unexpected"])
+def test_integer_snapshot_rejects_root_structure_tampering(tmp_path: Path, mutation: str) -> None:
+    config = _tiny_training_config(tmp_path, tmp_path / "out")
+    root = Path(config["data_dir"])
+    if mutation == "missing":
+        (root / "val" / CLASS_NAMES[-1] / "10.jpg").unlink()
+        (root / "val" / CLASS_NAMES[-1]).rmdir()
+    else:
+        (root / "unexpected").mkdir()
+    with pytest.raises(ValueError, match="structure|membership"):
+        _build_provenance(config, data_dir=root, output_dir=Path(config["output"]), device=torch.device("cpu"))
 
 
 def _seed_prior_training_artifacts(output: Path) -> dict[Path, bytes]:
@@ -1108,10 +1189,10 @@ def test_overwrite_invalid_manifest_preserves_prior_artifacts(tmp_path: Path) ->
     artifacts = _seed_prior_training_artifacts(output)
     manifest_path = Path(config["data_dir"]) / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["selected_files"] = []
+    manifest["records"] = []
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="membership"):
+    with pytest.raises(ValueError, match="manifest|membership"):
         trainer.train(config, overwrite=True)
     _assert_artifacts_unchanged(artifacts)
 
@@ -1190,9 +1271,9 @@ def test_public_resume_rejects_changed_dataset_manifest(tmp_path: Path, monkeypa
     with pytest.raises(ValueError, match="provenance mismatch"):
         trainer.train(config, resume=output / "weights" / "last.pt")
     config["lr"] = 0.01
-    live_file = Path(config["data_dir"]) / "train" / CLASS_NAMES[0] / "fixture.jpg"
+    live_file = Path(config["data_dir"]) / "train" / CLASS_NAMES[0] / "1.jpg"
     live_file.write_bytes(b"changed")
-    with pytest.raises(ValueError, match="hash mismatch"):
+    with pytest.raises(ValueError, match="digest|hash mismatch"):
         trainer.train(config, resume=output / "weights" / "last.pt")
 
 
@@ -1214,6 +1295,9 @@ def test_interrupted_and_resumed_workflow_matches_uninterrupted_run(
     assert "provenance" in torch.load(
         baseline_output / "weights" / "best.pt", map_location="cpu", weights_only=True
     )
+    run_info = json.loads((baseline_output / "run_info.json").read_text())
+    assert run_info["domain_id"] == BCS_DOMAIN_ID
+    assert run_info["class_values"] == list(BCS_CLASS_SCORES)
 
     resumed_calls.clear()
     _install_tiny_training_fakes(monkeypatch, resumed_calls)

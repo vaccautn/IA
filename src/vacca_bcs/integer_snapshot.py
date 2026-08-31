@@ -125,7 +125,7 @@ class IntegerSnapshotPublicationError(IntegerSnapshotError):
     pass
 
 
-class IntegerSnapshotManifestError(IntegerSnapshotError):
+class IntegerSnapshotManifestError(IntegerSnapshotError, ValueError):
     """Base class for sanitized snapshot manifest failures."""
 
 
