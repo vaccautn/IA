@@ -76,6 +76,7 @@ RESULTS_FIELDNAMES = [
     "val_exact_acc",
     "val_pm1_acc",
     "val_mae",
+    "val_recall",
 ]
 
 RESUMABLE_CHECKPOINT_FIELDS = {
@@ -102,6 +103,11 @@ RESUMABLE_CHECKPOINT_FIELDS = {
     "classes",
     "provenance",
     "rng_state",
+    "observed_classes",
+    "missing_classes",
+    "allow_partial_class_coverage",
+    "source_identity_scheme",
+    "source_mapping",
 }
 
 
@@ -119,9 +125,20 @@ def load_config(config_path: Path) -> dict[str, Any]:
         config = yaml.safe_load(handle)
     if not isinstance(config, dict):
         raise ValueError("Training config must be a YAML dictionary")
+    if "data_root" in config and "data_dir" in config and config["data_root"] != config["data_dir"]:
+        raise ValueError("data_root and data_dir must identify the same snapshot")
+    if "output_dir" in config and "output" in config and config["output_dir"] != config["output"]:
+        raise ValueError("output_dir and output must identify the same run output")
+    if "data_root" not in config and "data_dir" in config:
+        config["data_root"] = config["data_dir"]
+    if "output_dir" not in config and "output" in config:
+        config["output_dir"] = config["output"]
+    config["data_dir"] = config.get("data_root")
+    config["output"] = config.get("output_dir")
+    config.setdefault("allow_partial_class_coverage", False)
     required = {
-        "data_dir",
-        "output",
+        "data_root",
+        "output_dir",
         "epochs",
         "batch_size",
         "lr",
@@ -150,6 +167,13 @@ def load_config(config_path: Path) -> dict[str, Any]:
 
 def _validate_training_config(config: dict[str, Any]) -> None:
     """Reject invalid training values before any output directory is touched."""
+    if "data_dir" not in config and "data_root" in config:
+        config["data_dir"] = config["data_root"]
+    if "output" not in config and "output_dir" in config:
+        config["output"] = config["output_dir"]
+    config.setdefault("allow_partial_class_coverage", False)
+    if type(config.get("allow_partial_class_coverage")) is not bool:
+        raise ValueError("allow_partial_class_coverage must be a strict boolean")
     warmup_epochs = config.get("warmup_epochs", 2)
     integer_minimums = {
         "epochs": 1,
@@ -252,11 +276,49 @@ def _runtime_identity(device: torch.device) -> dict[str, Any]:
     return identity
 
 
-def _dataset_manifest_provenance(data_dir: Path) -> dict[str, Any]:
+def _coverage_from_manifest(manifest: dict[str, Any]) -> dict[str, list[int]]:
+    counts = manifest["counts"]
+    observed = [
+        score
+        for score in BCS_CLASS_SCORES
+        if counts["train"][score - SCORE_MIN] or counts["val"][score - SCORE_MIN]
+    ]
+    return {
+        "observed_classes": observed,
+        "missing_classes": [score for score in BCS_CLASS_SCORES if score not in observed],
+    }
+
+
+def _validate_class_coverage(
+    manifest: dict[str, Any], *, allow_partial_class_coverage: bool
+) -> dict[str, list[int]]:
+    if type(allow_partial_class_coverage) is not bool:
+        raise ValueError("allow_partial_class_coverage must be a strict boolean")
+    coverage = _coverage_from_manifest(manifest)
+    train = manifest["counts"]["train"]
+    val = manifest["counts"]["val"]
+    train_observed = [score for score in BCS_CLASS_SCORES if train[score - SCORE_MIN]]
+    if not any(train):
+        raise ValueError("snapshot training split is empty")
+    if not any(val):
+        raise ValueError("snapshot validation split is empty")
+    if len(train_observed) < 2:
+        raise ValueError("snapshot needs at least two training classes")
+    if coverage["missing_classes"] and not allow_partial_class_coverage:
+        raise ValueError("partial class coverage is disabled")
+    return coverage
+
+
+def _dataset_manifest_provenance(
+    data_dir: Path, *, allow_partial_class_coverage: bool = False
+) -> dict[str, Any]:
     manifest_path = data_dir / MANIFEST_FILENAME
     if not data_dir.is_dir() or not manifest_path.is_file():
         raise FileNotFoundError("integer snapshot dataset or manifest is missing")
     manifest = load_integer_snapshot_manifest(manifest_path)
+    coverage = _validate_class_coverage(
+        manifest, allow_partial_class_coverage=allow_partial_class_coverage
+    )
     data_root = data_dir.resolve()
     expected_dirs = set(SPLITS) | {
         f"{split}/{name}" for split in SPLITS for name in CLASS_NAMES
@@ -295,6 +357,10 @@ def _dataset_manifest_provenance(data_dir: Path) -> dict[str, Any]:
         "schema_version": manifest["manifest_schema_version"],
         "domain_id": manifest["domain_id"],
         "source_schema": manifest["source_schema"],
+        "identity_scheme": manifest.get("identity_scheme"),
+        "mapping": manifest.get("mapping"),
+        **coverage,
+        "allow_partial_class_coverage": allow_partial_class_coverage,
         "split_identity": manifest["split_plan"]["identity_digest"],
         "sha256": _sha256_text(_canonical_json(manifest)),
         "live_sha256": _sha256_text(_canonical_json(live_entries)),
@@ -308,6 +374,7 @@ def _build_provenance(
     config_for_hash = {
         key: value for key, value in config.items() if not key.startswith("_")
     }
+    config_for_hash.setdefault("allow_partial_class_coverage", False)
     config_for_hash["data_dir"] = str(data_dir.resolve())
     config_for_hash["output"] = str(output_dir.resolve())
     runtime = _runtime_identity(device)
@@ -317,7 +384,10 @@ def _build_provenance(
         "domain_id": BCS_DOMAIN_ID,
         "data_dir": str(data_dir.resolve()),
         "output_dir": str(output_dir.resolve()),
-        "dataset_manifest": _dataset_manifest_provenance(data_dir),
+        "dataset_manifest": _dataset_manifest_provenance(
+            data_dir,
+            allow_partial_class_coverage=config.get("allow_partial_class_coverage", False),
+        ),
         "device": str(device),
         "cuda_device_count": runtime["cuda_device_count"],
         "runtime": runtime,
@@ -328,6 +398,8 @@ def _build_provenance(
 
 def _checkpoint_lineage(provenance: dict[str, Any], run_id: str) -> dict[str, Any]:
     manifest = provenance.get("dataset_manifest", {})
+    coverage = manifest.get("observed_classes", [1, 2, 3, 4, 5])
+    missing = manifest.get("missing_classes", [])
     return {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "domain_id": BCS_DOMAIN_ID,
@@ -343,6 +415,11 @@ def _checkpoint_lineage(provenance: dict[str, Any], run_id: str) -> dict[str, An
         "snapshot_identity": manifest.get("split_identity", _DEFAULT_SNAPSHOT_ID),
         "dataset_manifest_digest": manifest.get("sha256", _DEFAULT_SNAPSHOT_ID),
         "run_id": run_id,
+        "observed_classes": coverage,
+        "missing_classes": missing,
+        "allow_partial_class_coverage": manifest.get("allow_partial_class_coverage", False),
+        "source_identity_scheme": manifest.get("identity_scheme"),
+        "source_mapping": manifest.get("mapping"),
     }
 
 
@@ -355,6 +432,11 @@ def _results_lineage(provenance: dict[str, Any], run_id: str) -> dict[str, Any]:
         "snapshot_schema": checkpoint["snapshot_schema"],
         "snapshot_identity": checkpoint["snapshot_identity"],
         "dataset_manifest_digest": checkpoint["dataset_manifest_digest"],
+        "observed_classes": checkpoint["observed_classes"],
+        "missing_classes": checkpoint["missing_classes"],
+        "allow_partial_class_coverage": checkpoint["allow_partial_class_coverage"],
+        "source_identity_scheme": checkpoint["source_identity_scheme"],
+        "source_mapping": checkpoint["source_mapping"],
     }
 
 
@@ -406,6 +488,26 @@ def _validate_checkpoint_lineage(
         or not _valid_hex(checkpoint.get("run_id"), 32)
     ):
         raise ValueError(f"Checkpoint {path} snapshot or run lineage is invalid")
+    observed = checkpoint.get("observed_classes")
+    missing = checkpoint.get("missing_classes")
+    if (
+        type(observed) is not list
+        or any(type(value) is not int for value in observed)
+        or observed != sorted(set(observed))
+        or any(value not in BCS_CLASS_SCORES for value in observed)
+        or type(missing) is not list
+        or any(type(value) is not int for value in missing)
+        or missing != sorted(set(missing))
+        or missing != [score for score in BCS_CLASS_SCORES if score not in observed]
+        or type(checkpoint.get("allow_partial_class_coverage")) is not bool
+        or (
+            bool(missing)
+            and not checkpoint["allow_partial_class_coverage"]
+        )
+        or type(checkpoint.get("source_identity_scheme")) not in (str, type(None))
+        or type(checkpoint.get("source_mapping")) not in (dict, type(None))
+    ):
+        raise ValueError(f"Checkpoint {path} coverage metadata is invalid")
     if expected is not None:
         expected_lineage = _checkpoint_lineage(expected, expected["run_id"])
         if any(checkpoint.get(field) != value for field, value in expected_lineage.items()):
@@ -622,6 +724,14 @@ def _build_run_info(context: RunInfoContext) -> dict[str, Any]:
         "device": str(context.device),
         "output_dir": str(context.output_dir),
         "provenance": context.provenance,
+        "coverage": {
+            key: context.provenance["dataset_manifest"][key]
+            for key in (
+                "observed_classes",
+                "missing_classes",
+                "allow_partial_class_coverage",
+            )
+        },
         "wall_time_seconds": time.perf_counter() - context.started_time,
     }
     if context.resume is not None:
@@ -704,7 +814,7 @@ def _validate_result_epoch(
 
 
 def _validate_results_row(row: list[str], *, line_number: int, expected_epoch: int) -> None:
-    if len(row) != len(RESULTS_FIELDNAMES):
+    if len(row) not in (len(RESULTS_FIELDNAMES) - 1, len(RESULTS_FIELDNAMES)):
         raise ValueError(
             f"results.csv line {line_number} is malformed: expected"
             f" {len(RESULTS_FIELDNAMES)} columns, got {len(row)}"
@@ -733,6 +843,26 @@ def _validate_results_row(row: list[str], *, line_number: int, expected_epoch: i
                 f"results.csv line {line_number} has an invalid {column} {value!r};"
                 f" expected a finite value {domain}"
             )
+    if len(row) == len(RESULTS_FIELDNAMES):
+        try:
+            recalls = json.loads(row[RESULTS_FIELDNAMES.index("val_recall")])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError(f"results.csv line {line_number} has invalid val_recall") from None
+        if (
+            type(recalls) is not dict
+            or set(recalls) != set(CLASS_NAMES)
+            or any(
+                value is not None
+                and (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or not 0 <= float(value) <= 1
+                )
+                for value in recalls.values()
+            )
+        ):
+            raise ValueError(f"results.csv line {line_number} has invalid val_recall")
 
 
 def _reconcile_results_csv(results_path: Path, *, checkpoint_epoch: int) -> int:
@@ -789,7 +919,7 @@ def _reconcile_results_csv(results_path: Path, *, checkpoint_epoch: int) -> int:
             f"results.csv line {checkpoint_epoch + 2} is malformed: expected"
             f" {len(RESULTS_FIELDNAMES)} columns, got {len(extra_row)}"
         )
-    if len(extra_row) == len(RESULTS_FIELDNAMES):
+    if len(extra_row) in (len(RESULTS_FIELDNAMES) - 1, len(RESULTS_FIELDNAMES)):
         try:
             extra_epoch = int(extra_row[0])
         except ValueError:
@@ -1045,7 +1175,7 @@ def _validate(
         class_name: (
             class_correct[index] / class_total[index]
             if class_total[index]
-            else 0.0
+            else None
         )
         for index, class_name in enumerate(CLASS_NAMES)
     }
@@ -1203,6 +1333,7 @@ def train(
                     "val_exact_acc": f"{metrics['exact_acc']:.8f}",
                     "val_pm1_acc": f"{metrics['pm1_acc']:.8f}",
                     "val_mae": f"{metrics['mae']:.8f}",
+                    "val_recall": _canonical_json(metrics["recall"]),
                 }
             )
             _flush_and_fsync(csv_file)
@@ -1216,7 +1347,7 @@ def train(
             print(
                 "  Recall: "
                 + ", ".join(
-                    f"{class_name}={recall:.3f}"
+                    f"{class_name}={recall if recall is None else format(recall, '.3f')}"
                     for class_name, recall in metrics["recall"].items()
                 )
             )

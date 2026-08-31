@@ -1,6 +1,7 @@
 # VACCA Phase 2 — ordinal Body Condition Score training
-data_dir: data/bcs-integer-v1
-output: outputs/bcs-ordinal-integer-v1
+data_root: data/bcs-local-integer-v1
+output_dir: outputs/bcs-ordinal-local-integer-v1
+allow_partial_class_coverage: true
 epochs: 30
 batch_size: 64
 lr: 0.0003

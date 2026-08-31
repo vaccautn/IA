@@ -25,6 +25,8 @@ from scripts.train_bcs_ordinal import (  # noqa: E402
     RESUMABLE_CHECKPOINT_FIELDS,
     _build_last_checkpoint,
     _build_provenance,
+    _coverage_from_manifest,
+    _validate_class_coverage,
     _runtime_identity,
     _capture_rng_state,
     _atomic_write_json,
@@ -229,6 +231,10 @@ def _write_config(tmp_path: Path, name: str = "config.yaml", **overrides: object
         "seed": 0,
     }
     config.update(overrides)
+    if "data_root" in overrides:
+        config.pop("data_dir", None)
+    if "output_dir" in overrides:
+        config.pop("output", None)
     path = tmp_path / name
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
     return path
@@ -270,6 +276,43 @@ def test_load_config_rejects_invalid_training_boundaries(
 def test_load_config_rejects_warmup_longer_than_training(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="warmup_epochs"):
         load_config(_write_config(tmp_path, epochs=2, warmup_epochs=3))
+
+
+def test_coverage_policy_is_strict_and_canonical_local_roots_are_supported(tmp_path: Path) -> None:
+    config = load_config(
+        _write_config(
+            tmp_path,
+            data_root="data/bcs-local-integer-v1",
+            output_dir="outputs/bcs-ordinal-local-integer-v1",
+            allow_partial_class_coverage=True,
+        )
+    )
+    assert config["data_dir"] == "data/bcs-local-integer-v1"
+    assert config["output"] == "outputs/bcs-ordinal-local-integer-v1"
+    assert config["allow_partial_class_coverage"] is True
+    with pytest.raises(ValueError, match="allow_partial_class_coverage"):
+        load_config(_write_config(tmp_path, allow_partial_class_coverage="true"))
+
+
+def test_partial_coverage_is_explicit_and_derived_from_manifest_counts() -> None:
+    manifest = {"counts": {"train": [0, 0, 2, 3, 0], "val": [0, 0, 1, 1, 0]}}
+    coverage = _coverage_from_manifest(manifest)
+    assert coverage == {
+        "observed_classes": [3, 4],
+        "missing_classes": [1, 2, 5],
+    }
+    _validate_class_coverage(manifest, allow_partial_class_coverage=True)
+    with pytest.raises(ValueError, match="partial class coverage"):
+        _validate_class_coverage(manifest, allow_partial_class_coverage=False)
+
+
+def test_partial_coverage_requires_non_empty_splits_and_two_training_classes() -> None:
+    for counts, message in (
+        ({"train": [0, 0, 2, 0, 0], "val": [0, 0, 1, 0, 0]}, "two training"),
+        ({"train": [0, 0, 2, 2, 0], "val": [0, 0, 0, 0, 0]}, "validation"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            _validate_class_coverage({"counts": counts}, allow_partial_class_coverage=True)
 
 
 def _seed_run_artifacts(output_dir: Path) -> None:
@@ -645,6 +688,7 @@ def _results_row(epoch: int) -> dict[str, str]:
         "val_exact_acc": "0.5",
         "val_pm1_acc": "0.9",
         "val_mae": "0.25",
+        "val_recall": json.dumps({name: 0.5 for name in CLASS_NAMES}, sort_keys=True),
     }
 
 
@@ -939,6 +983,29 @@ def test_validate_computes_mae_with_canonical_integer_score_step() -> None:
     assert metrics["mae"] == pytest.approx(4.0)
 
 
+def test_validate_reports_null_recall_for_unobserved_validation_classes() -> None:
+    class _FixedLogitsModel(torch.nn.Module):
+        def forward(self, images: torch.Tensor) -> torch.Tensor:
+            return torch.tensor([[-8.0, -8.0, -8.0, -8.0]])
+
+    metrics = trainer._validate(
+        _FixedLogitsModel(),
+        [(torch.zeros(1, 3, 8, 8), torch.tensor([0]))],
+        torch.device("cpu"),
+    )
+    assert metrics["recall"]["1"] == pytest.approx(1.0)
+    assert metrics["recall"]["2"] is None
+    assert metrics["recall"]["5"] is None
+
+
+def test_results_csv_validates_deterministic_partial_recall_json() -> None:
+    row = [
+        "1", "0.001", "1.0", "0.5", "0.9", "0.25",
+        json.dumps({"1": 1.0, "2": None, "3": 0.5, "4": None, "5": None}, sort_keys=True),
+    ]
+    trainer._validate_results_row(row, line_number=2, expected_epoch=1)
+
+
 def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -> dict[str, object]:
     data_dir = tmp_path / "dataset"
     records = []
@@ -1153,8 +1220,9 @@ def test_integer_v2_manifest_rejects_record_and_class_tampering(tmp_path: Path, 
 
 def test_default_integer_training_roots_are_canonical(tmp_path: Path) -> None:
     config = yaml.safe_load((REPO_ROOT / "configs" / "training_bcs_ordinal.yaml").read_text())
-    assert config["data_dir"] == "data/bcs-integer-v1"
-    assert config["output"] == "outputs/bcs-ordinal-integer-v1"
+    assert config["data_root"] == "data/bcs-local-integer-v1"
+    assert config["output_dir"] == "outputs/bcs-ordinal-local-integer-v1"
+    assert config["allow_partial_class_coverage"] is True
 
 
 @pytest.mark.parametrize("mutation", ["missing", "unexpected"])
