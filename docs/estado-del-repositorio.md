@@ -14,9 +14,9 @@ Este documento es la referencia rápida para saber qué puede operarse hoy en `I
 |---|---|---|
 | Rama actual | `feature/bcs-ordinal-phase-2` | `git branch --show-current` en el repositorio `IA`. |
 | Base de Fase 1 | Integrada en la rama hija | `feature/ia-initial-setup` es antecesora de `HEAD`. |
-| Fase 2 local | Seis commits locales para el builder transaccional | Los seis commits preceden a `HEAD` desde la base de Fase 1. |
+| Fase 2 local | Pipeline entero de export, snapshot y entrenamiento | El core, el snapshot v2, el trainer y las pruebas preceden a `HEAD` desde la base de Fase 1. |
 | Ramas de integración | Convención Git Flow documentada | `main` se describe como producción, `develop` como integración y `feature/*` como rama de trabajo; los refs locales observados mantienen `main` y `develop` en la base inicial. |
-| Trabajo ordinal BCS | Versionado y probado, sin ejecución real | Un clon de esta rama contiene el core, trainer, configuración y pruebas ordinales. Esto demuestra código y cobertura determinista, no una ejecución productiva ni un checkpoint entrenado. |
+| Trabajo ordinal BCS | Versionado y probado, sin ejecución real | Un clon de esta rama contiene el export client, snapshot v2, core, trainer, configuración y pruebas ordinales. Esto demuestra código y cobertura determinista, no una ejecución productiva ni un checkpoint entrenado. |
 
 La presencia de un archivo o commit demuestra su existencia en el repositorio, no disponibilidad productiva ni una aprobación de operación.
 
@@ -28,7 +28,7 @@ La presencia de un archivo o commit demuestra su existencia en el repositorio, n
 |---|---|---|---|
 | Detección de Fase 1 | `Operativo` (prototipo local) | FastAPI registra `/health`, `/detect` y `/ui`; el detector YOLO y los esquemas están en `src/vacca_api/`. | La API carga un peso bajo `outputs/`, no el peso versionado de `models/deploy/`; la evidencia de esta documentación no incluye un arranque del servidor. |
 | Modelo desplegado/versionado | `Verificado` como artefacto | `models/deploy/vacca-yolo26n-v1.pt` está versionado. El baseline también tiene manifiesto, digest y configuración CPU en `configs/baseline_manifest.json`. | `src/vacca_api/main.py` y `detection.py` apuntan a `outputs/training/combined-v2-finetune/weights/best.pt`; no existe en código una selección por variable de entorno ni un fallback al artefacto versionado. |
-| Builder transaccional BCS | `Verificado` | Los commits del builder abarcan `6b514aa` a `0a778c0` e implementan topología, plan, snapshot, recuperación, publicación y CLI. La ejecución focalizada registrada informó 38 tests aprobados sobre esos módulos y tests comprometidos. El builder usa exactamente `1`, `2`, `3`, `4` y `5` como etiquetas de clase del dataset. | Es un builder de dataset, no un servicio de inferencia BCS: esas etiquetas no establecen la arquitectura futura del modelo ni el contrato de score/API. Opera sobre `data/` y `outputs/`, que no se deben tocar durante esta tarea. |
+| Snapshot entero BCS | `Verificado` | `scripts/build_bcs_integer.py` consume el export autenticado, crea el split entero determinista y publica un manifiesto `bcs-integer-snapshot-v2` bajo `data/bcs-integer-v1/`. | Es una etapa de materialización, no un servicio de inferencia BCS. Opera sobre `data/` y `outputs/`, que permanecen ignorados por Git. |
 | Modelo ordinal BCS | `Verificado` con fixtures temporales | `src/vacca_bcs/model.py` implementa ResNet18 + cabeza CORAL; `dataset.py` conserva las cinco clases enteras `1..5`. | No es un servicio HTTP, no hay pesos entrenados comprometidos y no se afirma rendimiento real. El cálculo puede usar tensores flotantes, pero la clase semántica es entera. |
 | Trainer/resume | `Verificado` con pruebas deterministas | `scripts/train_bcs_ordinal.py`, `configs/training_bcs_ordinal.yaml` y `tests/test_vacca_bcs.py` cubren entrenamiento controlado, checkpoints, manifiesto vivo, configuración e identidad de runtime. | No se entrenó ni se reanudó una ejecución real; los outputs operativos son locales e ignorados. |
 | Endpoint de inferencia BCS | `Placeholder` | `POST /bcs` está registrado y devuelve un esquema `BCSResponse`. | No calcula un score: actualmente intenta detección, devuelve `status: not_implemented` y deja `bcs_score` en `null`. |
@@ -40,16 +40,14 @@ La presencia de un archivo o commit demuestra su existencia en el repositorio, n
 
 | Gate | Resultado | Alcance |
 |---|---|---|
-| Builder focalizado | Inventario: 38 tests; ejecución registrada: `38 passed` | Comando documentado: `.venv\Scripts\python -m pytest tests/test_bcs_dataset_topology.py tests/test_bcs_dataset_plan.py tests/test_bcs_dataset_snapshot.py tests/test_bcs_dataset_recovery.py tests/test_bcs_dataset_publish.py tests/test_bcs_cli.py`. Alcance: módulos y tests comprometidos del builder. |
-| BCS/API y builder focalizados | `163 passed`, 2 warnings | `.venv\Scripts\python -m pytest tests/test_vacca_bcs.py tests/test_vacca_api_contract.py tests/test_bcs_cli.py tests/test_bcs_dataset_plan.py tests/test_bcs_dataset_publish.py tests/test_bcs_dataset_recovery.py tests/test_bcs_dataset_snapshot.py tests/test_bcs_dataset_topology.py`. Incluye los caminos reales temporales y provenance/config/run-info. |
-| Suite completa | `298 passed`, 2 warnings y 65 subtests | `.venv\Scripts\python -m pytest -q` ejecutado sobre este worktree. No accedió a datos/outputs reales ni ejecutó entrenamiento real. |
+| Suite completa | `375 passed`, `1 skipped`, `2 warnings` y `65 subtests` | `.venv\Scripts\python -m pytest -q` ejecutado sobre este worktree. No accedió a datos/outputs reales ni ejecutó entrenamiento real. |
 | Servidor FastAPI | Ejecución local no registrada | La evidencia de esta documentación no incluye un arranque de servidor ni una llamada HTTP. |
 | Helper directo de detector/esquemas | Ejecución local no registrada | `scripts/smoke_test_api.py` no prueba HTTP: requiere datos y el peso local de `outputs/training/combined-finetune/weights/best.pt`. |
 | BCS ordinal real-path | `Verificado` con temporales | Las pruebas generan imágenes Pillow en carpetas de clase, ejecutan transforms/dataset, hacen forward/predict y un paso real de modelo/optimizer en CPU. |
 | Trainer ordinal real | No ejecutado | La cobertura usa tensores/imágenes controlados y no constituye un entrenamiento real ni una métrica de dataset real. |
 | Datos y outputs reales | No tocados | Esta documentación no creó, modificó ni publicó datasets, checkpoints o resultados. |
 
-El resultado `298 passed` corresponde a la suite actual de este worktree y es reproducible con el comando indicado. Las advertencias son deprecaciones de FastAPI (`on_event`), no bloquean esta transición. Ningún resultado de tests constituye evidencia de entrenamiento real o rendimiento productivo.
+El resultado `375 passed`, `1 skipped`, `2 warnings` y `65 subtests` corresponde a la suite final de este worktree y es reproducible con el comando indicado. Las advertencias son deprecaciones de FastAPI (`on_event`), no bloquean esta transición. Ningún resultado de tests constituye evidencia de entrenamiento real o rendimiento productivo.
 
 ## Riesgos y deuda actual
 
@@ -65,4 +63,4 @@ El resultado `298 passed` corresponde a la suite actual de este worktree y es re
 2. Resolver el empaquetado reproducible de la API y verificar un arranque limpio en un entorno nuevo.
 3. Mantener el core ordinal y el trainer como una unidad revisable; ejecutar un entrenamiento real sólo con datos, recursos y aprobación explícitos.
 4. Definir el contrato de inferencia BCS y una frontera explícita con el backend antes de implementar `/bcs`.
-5. Implementar por separado la materialización de imágenes y la migración de datasets; después ejecutar una verificación de integración con datos controlados.
+5. Ejecutar una verificación de integración con datos controlados antes de cualquier operación productiva.

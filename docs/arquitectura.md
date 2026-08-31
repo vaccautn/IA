@@ -9,11 +9,11 @@
 | `src/vacca_api/` | Adaptador FastAPI, carga del detector YOLO, esquemas HTTP y UI de prototipo. | `main.py`, `detection.py`, `schemas.py` |
 | `src/vacca_vision/` | Contratos de detección, validación de imágenes, reglas de aptitud y adaptador Ultralytics. | `contracts.py`, `image_validation.py`, `pipeline.py`, `ultralytics_adapter.py` |
 | `scripts/run_baseline.py` | Ejecuta el camino validado por manifiesto: snapshot, detector, pipeline y salida JSON. | `configs/baseline_manifest.json` |
-| `src/vacca_bcs/` comprometido | Dataset ordinal seguro y pipeline de modelo/transformaciones. | `constants.py`, `dataset.py`, `model.py` y módulos `dataset_*` |
+| `src/vacca_bcs/` comprometido | Integer snapshot, dataset ordinal y pipeline de modelo/transformaciones. | `constants.py`, `integer_snapshot.py`, `dataset.py`, `model.py` y source-plan modules |
 | Cliente de fuente BCS | Cliente HTTP autenticado y estricto para consumir el export versionado de la fuente. | `source_client.py` y `tests/test_bcs_source_client.py` |
 | Modelo ordinal BCS | Versionado y probado con fixtures temporales; no es serving HTTP. | `BCSOrdinalModel`, `CORALHead`, `coral_loss` y `predict` en `model.py` |
 | Entrenamiento y reanudación ordinales | Código, configuración y pruebas versionados; no hay una ejecución real comprometida. | `scripts/train_bcs_ordinal.py`, `configs/training_bcs_ordinal.yaml` y artefactos `weights/last.pt`/`run_info.json` sólo cuando una operación local los genera |
-| `tests/` | Gates de contratos, baseline, pipeline, builder y BCS ordinal. | Archivos `test_*.py` versionados en la rama, incluidos los caminos reales temporales |
+| `tests/` | Gates de contratos, baseline, Phase 1 pipeline y BCS ordinal. | Archivos `test_*.py` versionados en la rama, incluidos los caminos reales temporales |
 
 ## Flujo actual de detección HTTP
 
@@ -40,39 +40,37 @@ Detalles comprobables en el código:
 
 El endpoint HTTP no usa `AptitudePipeline`, `ImageValidationConfig` ni `ClassificationResult` de `vacca_vision`. Ese camino desacoplado se usa desde `scripts/run_baseline.py` y tiene sus propios contratos y pruebas.
 
-## Flujo del builder de dataset BCS
+## Integer BCS source-to-training flow
 
 ```text
-data/bcs-integer-v1/{1,2,3,4,5}
+authenticated bcs-source-v1 export
     ↓
-topología y seguridad de rutas
+normalize export → deterministic integer split plan
     ↓
-plan determinista (seed, selección, train/val, cambios)
+signed evidence materialization → bcs-integer-snapshot-v2 manifest
     ↓
-staging hermano de data/bcs-cls
+data/bcs-integer-v1/
     ↓
-copiar → validar bytes staged → SHA-256 → manifest.json
+validated integer snapshot → train_bcs_ordinal.py
     ↓
-recuperación/publicación del árbol completo
+outputs/bcs-ordinal-integer-v1/
     ↓
-data/bcs-cls/{train,val,...}
-    ↓
-Letterbox + normalización → ResNet18 + cabeza CORAL
-    ↓
-    continuous model estimate → canonical integer BCS score 1..5
+ResNet18 + CORAL → canonical integer BCS score 1..5
 ```
 
-- `dataset_topology.py` rechaza solapamientos entre fuente y destino y puntos de reanálisis inseguros.
-- `dataset_build_plan.py` valida todos los candidatos soportados antes de seleccionar, baraja con una semilla y calcula la partición.
-- `dataset_snapshot.py` copia a staging, vuelve a validar cada imagen, calcula los digests de los bytes staged y escribe un manifiesto cuyo campo `manifest_schema_version` versiona el esquema del registro; esto no implica seguimiento por Git.
-- `dataset_recovery.py` conserva la generación anterior en `data/bcs-cls.backup-recovery` cuando corresponde y bloquea reintentos con recuperación activa.
-- `dataset_transaction.py` publica el staging completo y trata de restaurar la generación anterior si la instalación falla. El intercambio de directorios no es una operación atómica única en Windows.
+- `source_client.py` authenticates to the versioned export and materializes signed evidence without retaining signed URLs.
+- `source_plan.py` normalizes immutable source records and preserves evidence/evaluation provenance.
+- `source_split_plan.py` creates a deterministic train/validation layout for classes `1..5`.
+- `integer_snapshot.py` validates image bytes, writes the v2 manifest, and rejects unsupported legacy manifest families.
+- `data/` and `outputs/` are Git-ignored operational roots; no local dataset or checkpoint is part of the tracked checkout.
 
-El manifiesto registra entradas de builder, escala y mapeo de clases, archivos seleccionados con fuente/destino/digest, y conteos por split y clase. `data/` está ignorado por Git: tanto el dataset generado como `data/bcs-cls/manifest.json` permanecen fuera del seguimiento Git aunque su esquema tenga versión.
-
-El builder comprometido usa exactamente `1`, `2`, `3`, `4` y `5` como etiquetas de clase del dataset. El modelo ordinal versionado consume esos cinco índices; ni el builder ni el modelo implementan todavía el contrato HTTP de `/bcs`.
-
-El dataset por carpetas conserva esas cinco clases ordenadas. `dataset.py` aplica letterbox cuadrado, aumentos sólo en entrenamiento y normalización ImageNet; `model.py` usa ResNet18 sin pesos descargados en las pruebas y una cabeza CORAL con umbrales ordenados. El modelo puede usar tensores flotantes durante el cálculo, pero su proyección semántica de clase es el score entero `1..5`. El trainer registra la configuración, el manifiesto vivo y la identidad real del runtime —Python, Torch, Torchvision, CUDA/cuDNN y GPU cuando corresponde— para rechazar resumes incompatibles.
+The folder dataset preserves the five ordered classes. `dataset.py` applies square
+letterboxing, training-only augmentation, and ImageNet normalization; `model.py`
+uses ResNet18 with an ordered CORAL head. The model may use floating-point tensors
+internally, but its semantic class projection is the integer score `1..5`. The
+trainer records configuration, the live manifest, and runtime identity to reject
+incompatible resumes. Old fractional or stale-lineage artifacts are unsupported
+and are not migrated.
 
 ## Frontera BCS futura
 
@@ -103,7 +101,7 @@ El PRD establece que el prototipo de IA es independiente del backend actual y qu
 
 `src/vacca_bcs/source_plan.py` provides the pure `normalize_source_export` function. It excludes empty or whitespace-only storage keys with explicit reasons, rejects surrounding whitespace in non-empty keys, collapses exact-key same-label records using the lowest evidence ID, and fails on conflicts using stable evidence/evaluation provenance without exposing key text. Each candidate carries immutable provenance records that preserve evidence/evaluation correspondence, sorted by IDs. Its immutable output is ordered by `(bcs_score, evidence_id)` with counts for classes `1..5`; it performs no download, filesystem write, image decode, split, hash, or label migration.
 
-`src/vacca_bcs/source_split_plan.py` creates the pure integer train/validation layout. It sorts each class canonically before using an independent seed, applies `floor(n * ratio)` clamped to `[1, n - 1]` for eligible classes, keeps singletons in training, and preserves source exclusions. Assignments expose only evidence-ID-based relative path stems; this module does not materialize, write files, decode images, split fractional datasets, or migrate domain labels.
+`src/vacca_bcs/source_split_plan.py` creates the pure integer train/validation layout. It sorts each class canonically before using an independent seed, applies `floor(n * ratio)` clamped to `[1, n - 1]` for eligible classes, keeps singletons in training, and preserves source exclusions. Assignments expose only evidence-ID-based relative path stems; this module does not materialize, write files, decode images, or migrate domain labels.
 
 ## Límites de artefactos y datos
 

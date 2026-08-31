@@ -10,14 +10,8 @@ SCORE_STEP = 1
 NUM_CLASSES = len(BCS_CLASS_SCORES)
 NUM_THRESHOLDS = NUM_CLASSES - 1
 
-# Image suffixes accepted by the dataset loader and the dataset builder.
+# Image suffixes accepted by the integer dataset loader.
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-CHUNK_SIZE = 1 << 20
-DEFAULT_MAX_PER_CLASS = 6000
-DEFAULT_SEED = 42
-DEFAULT_VAL_RATIO = 0.2
 SPLITS = ("train", "val")
-MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_FILENAME = "manifest.json"
-BACKUP_SUFFIX = ".backup-recovery"
