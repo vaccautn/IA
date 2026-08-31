@@ -14,8 +14,9 @@ from vacca_bcs.source_client import (
     BCSSourceExport,
     SCHEMA_VERSION,
 )
+from vacca_bcs.local_source import LOCAL_BCS_MAPPING
 
-from scripts.build_bcs_integer import build_parser, main, run
+from scripts.build_bcs_integer import DEFAULT_LOCAL_OUTPUT, ROOT, build_parser, main, run
 
 
 def _source_export() -> BCSSourceExport:
@@ -78,8 +79,19 @@ class _FakeMaterializer:
 
 def _args(tmp_path: Path, *extra: str):
     return build_parser().parse_args(
-        ["--base-url", "https://backend.test", "--output", str(tmp_path / "snapshot"), *extra]
+        ["--source", "backend", "--base-url", "https://backend.test", "--output", str(tmp_path / "snapshot"), *extra]
     )
+
+
+def _local_root(tmp_path: Path) -> Path:
+    root = tmp_path / "local-source"
+    for label, format_name in (("3.25", "JPEG"), ("4.0", "PNG")):
+        folder = root / label
+        folder.mkdir(parents=True)
+        stream = io.BytesIO()
+        Image.new("RGB", (2, 2), (20, 40, 60)).save(stream, format=format_name)
+        (folder / f"cow.{format_name.lower() if format_name == 'PNG' else 'jpg'}").write_bytes(stream.getvalue())
+    return root
 
 
 def test_run_orchestrates_validated_integer_snapshot_and_closes_dependencies(
@@ -116,7 +128,7 @@ def test_main_prints_only_safe_summary_and_reads_token_from_environment(
     output = io.StringIO()
 
     assert main(
-        ["--base-url", "https://backend.test", "--output", str(tmp_path / "snapshot")],
+        ["--source", "backend", "--base-url", "https://backend.test", "--output", str(tmp_path / "snapshot")],
         source_client_factory=_FakeClient,
         materializer_factory=_FakeMaterializer,
         stdout=output,
@@ -126,7 +138,7 @@ def test_main_prints_only_safe_summary_and_reads_token_from_environment(
     assert "private-" not in rendered
     assert "https://backend.test" not in rendered
     summary = json.loads(rendered)
-    assert set(summary) == {"snapshot_path", "included", "excluded", "counts", "plan_identity"}
+    assert {"snapshot_path", "included", "excluded", "counts", "plan_identity", "source_schema"} <= set(summary)
 
 
 def test_main_rejects_missing_token_and_bool_like_numeric_arguments(
@@ -136,12 +148,12 @@ def test_main_rejects_missing_token_and_bool_like_numeric_arguments(
     for option, value in (("--seed", "true"), ("--val-ratio", "true"), ("--timeout", "nan")):
         error = io.StringIO()
         assert main(
-            ["--base-url", "https://backend.test", "--output", str(tmp_path / value), option, value],
+            ["--source", "backend", "--base-url", "https://backend.test", "--output", str(tmp_path / value), option, value],
             stderr=error,
         ) == 1
         assert "super-secret" not in error.getvalue()
     error = io.StringIO()
-    assert main(["--base-url", "https://backend.test"], stderr=error) == 1
+    assert main(["--source", "backend", "--base-url", "https://backend.test"], stderr=error) == 1
     assert "token" in error.getvalue().lower()
     assert "https://backend.test" not in error.getvalue()
 
@@ -157,7 +169,7 @@ def test_main_sanitizes_client_materializer_snapshot_and_existing_root_failures(
 
     error = io.StringIO()
     assert main(
-        ["--base-url", "https://backend.test"],
+        ["--source", "backend", "--base-url", "https://backend.test"],
         source_client_factory=FailingClient,
         materializer_factory=_FakeMaterializer,
         stderr=error,
@@ -171,7 +183,7 @@ def test_main_sanitizes_client_materializer_snapshot_and_existing_root_failures(
 
     error = io.StringIO()
     assert main(
-        ["--base-url", "https://backend.test", "--output", str(tmp_path / "failed")],
+        ["--source", "backend", "--base-url", "https://backend.test", "--output", str(tmp_path / "failed")],
         source_client_factory=_FakeClient,
         materializer_factory=FailingMaterializer,
         stderr=error,
@@ -185,7 +197,7 @@ def test_main_sanitizes_client_materializer_snapshot_and_existing_root_failures(
 
     error = io.StringIO()
     assert main(
-        ["--base-url", "https://backend.test", "--output", str(tmp_path / "snapshot-fail")],
+        ["--source", "backend", "--base-url", "https://backend.test", "--output", str(tmp_path / "snapshot-fail")],
         source_client_factory=_FakeClient,
         materializer_factory=_FakeMaterializer,
         snapshot_builder=fail_snapshot,
@@ -199,7 +211,7 @@ def test_main_sanitizes_client_materializer_snapshot_and_existing_root_failures(
     existing.mkdir()
     error = io.StringIO()
     assert main(
-        ["--base-url", "https://backend.test", "--output", str(existing)],
+        ["--source", "backend", "--base-url", "https://backend.test", "--output", str(existing)],
         source_client_factory=_FakeClient,
         materializer_factory=_FakeMaterializer,
         stderr=error,
@@ -209,5 +221,71 @@ def test_main_sanitizes_client_materializer_snapshot_and_existing_root_failures(
 
 def test_parser_exposes_deterministic_operator_controls_without_token_argument() -> None:
     options = {action.dest for action in build_parser()._actions}
-    assert {"base_url", "output", "seed", "val_ratio", "timeout", "max_source_bytes", "max_image_bytes"} <= options
+    assert {"source", "local_root", "base_url", "output", "seed", "val_ratio", "timeout", "max_source_bytes", "max_image_bytes"} <= options
     assert "token" not in options
+
+
+def test_local_mode_uses_fixed_mapping_without_backend_environment_and_safe_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("VACCA_BACKEND_URL", raising=False)
+    monkeypatch.delenv("VACCA_BACKEND_TOKEN", raising=False)
+    root = _local_root(tmp_path)
+    output = tmp_path / "local-output"
+    rendered = io.StringIO()
+    assert main(
+        ["--local-root", str(root), "--output", str(output)], stdout=rendered
+    ) == 0
+    summary = json.loads(rendered.getvalue())
+    assert summary["source_schema"] == "bcs-local-folder-v1"
+    assert summary["mapping"] == dict(LOCAL_BCS_MAPPING.entries)
+    assert summary["observed_classes"] == [3, 4]
+    assert summary["missing_classes"] == [1, 2, 5]
+    assert str(root) not in rendered.getvalue()
+    assert output.exists()
+
+
+def test_source_defaults_outputs_and_incompatible_options_fail_closed(tmp_path: Path):
+    args = build_parser().parse_args([])
+    assert args.source == "local"
+    assert args.local_root == "data/bcs/dataset"
+    assert args.output is None
+    for argv in (
+        ["--base-url", "https://backend.test"],
+        ["--source", "backend", "--local-root", str(tmp_path)],
+    ):
+        error = io.StringIO()
+        assert main(argv, stderr=error) == 1
+        assert "backend.test" not in error.getvalue()
+
+
+def test_local_missing_root_fails_before_output_creation(tmp_path: Path):
+    output = tmp_path / "not-created"
+    error = io.StringIO()
+    assert main(
+        ["--local-root", str(tmp_path / "missing"), "--output", str(output)],
+        stderr=error,
+    ) == 1
+    assert not output.exists()
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert main(["--local-root", str(empty), "--output", str(output)], stderr=error) == 1
+    assert not output.exists()
+
+
+def test_local_omitted_output_uses_local_default_without_publishing(tmp_path: Path):
+    root = _local_root(tmp_path)
+    seen = {}
+
+    def capture(plan, output, materializer):
+        seen["output"] = output
+        seen["schema"] = plan.identity.source_schema
+        return output
+
+    result = run(
+        build_parser().parse_args(["--local-root", str(root)]),
+        snapshot_builder=capture,
+    )
+    assert result == ROOT / DEFAULT_LOCAL_OUTPUT
+    assert seen == {"output": ROOT / DEFAULT_LOCAL_OUTPUT, "schema": "bcs-local-folder-v1"}

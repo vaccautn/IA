@@ -175,19 +175,26 @@ change. This path remains separate from the integer BCS pipeline below.
 
 The supported Phase 2 workflow has exactly three stages:
 
-1. **Export:** fetch the authenticated `bcs-source-v1` export through `BCSSourceClient`.
-2. **Integer snapshot v2:** normalize the export, create the deterministic split, materialize signed evidence, and publish `data/bcs-integer-v1/` as a `bcs-integer-snapshot-v2` snapshot.
+1. **Source:** use the local `bcs-local-folder-v1` folders by default, or select the authenticated backend export explicitly.
+2. **Integer snapshot v2:** normalize the selected source, create the deterministic split, materialize records, and publish a transactional snapshot.
 3. **Trainer:** validate that snapshot and train the ordinal model with `scripts/train_bcs_ordinal.py` into `outputs/bcs-ordinal-integer-v1/`.
 
 ```powershell
+# Local source (default; no backend credentials or network)
+.venv\Scripts\python scripts/build_bcs_integer.py
+
+# Backend source (explicit; requires the authenticated export/R2 path)
 $env:VACCA_BACKEND_URL = "https://backend.example"
 $env:VACCA_BACKEND_TOKEN = "<token-from-your-secret-store>"
-.venv\Scripts\python scripts/build_bcs_integer.py
+.venv\Scripts\python scripts/build_bcs_integer.py --source backend
 .venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
 ```
 
-The builder requires the backend source-export and signed-evidence endpoints,
-refuses an existing output root, and reports safe snapshot counts and identity.
+The builder defaults to `--local-root data/bcs/dataset` and output
+`data/bcs-local-integer-v1`; its fixed mapping is `3.25/3.5 → 3` and
+`3.75/4.0/4.25 → 4`. Backend mode preserves `data/bcs-integer-v1` and requires
+the backend source-export and signed-evidence endpoints. Both modes refuse an
+existing output root and report safe source counts and plan identity.
 Use `--base-url` instead of `VACCA_BACKEND_URL` when appropriate, plus `--seed`,
 `--val-ratio`, `--timeout`, `--max-source-bytes`, and `--max-image-bytes` to make
 operational limits explicit. The token is read only from `VACCA_BACKEND_TOKEN`.

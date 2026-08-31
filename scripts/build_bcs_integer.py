@@ -12,6 +12,8 @@ from typing import Any, TextIO
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = "data/bcs-integer-v1"
+DEFAULT_LOCAL_ROOT = "data/bcs/dataset"
+DEFAULT_LOCAL_OUTPUT = "data/bcs-local-integer-v1"
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_SOURCE_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_IMAGE_BYTES = 16 * 1024 * 1024
@@ -19,11 +21,19 @@ DEFAULT_MAX_IMAGE_BYTES = 16 * 1024 * 1024
 sys.path.insert(0, str(ROOT / "src"))
 
 from vacca_bcs.integer_snapshot import build_integer_snapshot  # noqa: E402
+from vacca_bcs.local_source import (  # noqa: E402
+    LOCAL_BCS_MAPPING,
+    LocalSourceMaterializer,
+    scan_local_source,
+)
 from vacca_bcs.source_client import (  # noqa: E402
     BCSEvidenceMaterializer,
     BCSSourceClient,
 )
-from vacca_bcs.source_plan import normalize_source_export  # noqa: E402
+from vacca_bcs.source_plan import (  # noqa: E402
+    normalize_backend_source_export,
+    normalize_local_source_scan,
+)
 from vacca_bcs.source_split_plan import create_integer_split_plan  # noqa: E402
 
 
@@ -66,14 +76,25 @@ class _ArgumentParser(argparse.ArgumentParser):
         raise IntegerBuildCLIError("invalid command line")
 
 
+class _TrackedAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        explicit = set(getattr(namespace, "_explicit_options", ()))
+        explicit.add(self.dest)
+        setattr(namespace, "_explicit_options", explicit)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(description="Build a transactional integer BCS snapshot")
-    parser.add_argument("--base-url", default=None, help="Backend URL; defaults to VACCA_BACKEND_URL")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT)
+    parser.set_defaults(_explicit_options=set())
+    parser.add_argument("--source", choices=("local", "backend"), default="local")
+    parser.add_argument("--local-root", default=DEFAULT_LOCAL_ROOT, action=_TrackedAction)
+    parser.add_argument("--base-url", default=None, action=_TrackedAction, help="Backend URL; defaults to VACCA_BACKEND_URL")
+    parser.add_argument("--output", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-ratio", type=_finite_ratio, default=0.2)
-    parser.add_argument("--timeout", type=_positive_float, default=DEFAULT_TIMEOUT)
-    parser.add_argument("--max-source-bytes", type=_positive_int, default=DEFAULT_MAX_SOURCE_BYTES)
+    parser.add_argument("--timeout", type=_positive_float, default=DEFAULT_TIMEOUT, action=_TrackedAction)
+    parser.add_argument("--max-source-bytes", type=_positive_int, default=DEFAULT_MAX_SOURCE_BYTES, action=_TrackedAction)
     parser.add_argument("--max-image-bytes", type=_positive_int, default=DEFAULT_MAX_IMAGE_BYTES)
     return parser
 
@@ -88,6 +109,22 @@ def _backend_inputs(args: argparse.Namespace) -> tuple[str, str]:
     return base_url, token
 
 
+def _output_path(args: argparse.Namespace) -> Path:
+    default = DEFAULT_LOCAL_OUTPUT if args.source == "local" else DEFAULT_OUTPUT
+    output = Path(args.output or default)
+    return output if output.is_absolute() else (ROOT / output).resolve()
+
+
+def _validate_mode(args: argparse.Namespace) -> None:
+    explicit = getattr(args, "_explicit_options", set())
+    if args.source == "local":
+        incompatible = {"base_url", "timeout", "max_source_bytes"}.intersection(explicit)
+        if incompatible:
+            raise IntegerBuildCLIError("backend options are not valid for local source")
+    elif "local_root" in explicit:
+        raise IntegerBuildCLIError("--local-root is only valid for local source")
+
+
 def run(
     args: argparse.Namespace,
     *,
@@ -95,17 +132,29 @@ def run(
     materializer_factory: Callable[..., Any] = BCSEvidenceMaterializer,
     snapshot_builder: Callable[..., Any] = build_integer_snapshot,
 ) -> Any:
+    _validate_mode(args)
+    output = _output_path(args)
+    if args.source == "local":
+        scan = scan_local_source(args.local_root, LOCAL_BCS_MAPPING)
+        if not scan.records:
+            raise IntegerBuildCLIError("local source contains no image records")
+        source_plan = normalize_local_source_scan(scan)
+        split_plan = create_integer_split_plan(
+            source_plan, seed=args.seed, val_ratio=args.val_ratio
+        )
+        return snapshot_builder(
+            split_plan,
+            output,
+            LocalSourceMaterializer(scan, max_bytes=args.max_image_bytes),
+        )
     base_url, token = _backend_inputs(args)
-    output = Path(args.output)
-    if not output.is_absolute():
-        output = (ROOT / output).resolve()
     with source_client_factory(
         base_url=base_url,
         bearer_token=token,
         timeout=args.timeout,
         max_response_bytes=args.max_source_bytes,
     ) as client:
-        source_plan = normalize_source_export(client.fetch())
+        source_plan = normalize_backend_source_export(client.fetch())
         split_plan = create_integer_split_plan(
             source_plan, seed=args.seed, val_ratio=args.val_ratio
         )
@@ -120,11 +169,24 @@ def run(
 
 def _summary(snapshot: Any) -> dict[str, object]:
     manifest = json.loads(snapshot.manifest_json)
+    observed = manifest.get("observed_classes")
+    if observed is None:
+        counts = manifest["counts"]
+        observed = [
+            score
+            for score in range(1, 6)
+            if counts["train"][score - 1] or counts["val"][score - 1]
+        ]
+    mapping = manifest.get("mapping")
     return {
+        "source_schema": manifest["source_schema"],
         "snapshot_path": str(snapshot.output_root),
         "included": len(snapshot.records),
         "excluded": len(snapshot.exclusions),
         "counts": manifest["counts"],
+        "mapping": mapping,
+        "observed_classes": observed,
+        "missing_classes": [score for score in range(1, 6) if score not in observed],
         "plan_identity": manifest["split_plan"]["identity_digest"],
     }
 
