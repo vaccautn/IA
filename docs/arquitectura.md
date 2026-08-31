@@ -67,6 +67,20 @@ ResNet18 + CORAL → canonical integer BCS score 1..5
 - `integer_snapshot.py` validates image bytes, writes the v2 manifest, and rejects unsupported legacy manifest families.
 - `data/` and `outputs/` are Git-ignored operational roots; no local dataset or checkpoint is part of the tracked checkout.
 
+### Local folder source
+
+`local_source.py` defines the bounded `bcs-local-folder-v1` source contract for
+the later `data/bcs/dataset` operation without reading it here. It accepts only
+the exact folders `3.25`, `3.5`, `3.75`, `4.0` and `4.25`, mapping them to
+integer scores `3`, `3`, `4`, `4` and `4`; the five-class model domain remains
+`1..5`. JPEG/PNG files are records. An XML file is accepted only as a paired,
+unused sidecar and never supplies labels or content. Discovery rejects links,
+nested or unexpected paths, normalized path collisions and duplicate content.
+Record identity is `sha256("bcs-local-folder-v1\\0" + normalized_relative_path)`.
+Materialization rechecks the root/path, reads one bounded file, and returns
+source-neutral bytes plus SHA-256; image decoding remains the snapshot builder's
+responsibility. Snapshot and training integration are intentionally separate.
+
 The folder dataset preserves the five ordered classes. `dataset.py` applies square
 letterboxing, training-only augmentation, and ImageNet normalization; `model.py`
 uses ResNet18 with an ordered CORAL head. The model may use floating-point tensors
