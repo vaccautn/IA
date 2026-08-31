@@ -196,8 +196,8 @@ conversión ni fallback desde artefactos fraccionales o antiguos.
 - Usá `file` como nombre exacto del campo multipart.
 - Ejecutá la suite con `.venv\Scripts\python -m pytest -q`.
 
-La suite verificada en `ff7ac78` terminó con `430 passed, 2 skipped, 2 warnings`
-y `65 subtests`; las advertencias son deprecaciones conocidas de FastAPI
-`on_event`. El chequeo Ruff del código tocado está limpio, pero el repositorio
-completo conserva siete diagnósticos no relacionados de Fase 1; no se afirma
-Ruff globalmente verde.
+La suite verificada para este estado de la rama terminó con `430 passed, 2
+skipped, 2 warnings` y `65 subtests`; las advertencias son deprecaciones
+conocidas de FastAPI `on_event`. El chequeo Ruff del código tocado está limpio,
+pero el repositorio completo conserva siete diagnósticos no relacionados de Fase
+1; no se afirma Ruff globalmente verde.

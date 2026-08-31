@@ -240,10 +240,10 @@ artifacts; `--overwrite` allows replacement after validation. `--resume
 outputs/bcs-ordinal-integer-v1/weights/last.pt` requires compatible configuration,
 live manifest/dataset, snapshot identity, domain, and `run_id`.
 
-Final repository verification at `ff7ac78`: `.venv\Scripts\python -m pytest -q`
-reports `430 passed, 2 skipped, 2 warnings, 65 subtests passed`. The warnings are
-the known FastAPI `on_event` deprecations. This verification did not access real
-BCS data, outputs, model weights, or run training.
+Verification for this branch state: `.venv\Scripts\python -m pytest -q` reports
+`430 passed, 2 skipped, 2 warnings, 65 subtests passed`. The warnings are the
+known FastAPI `on_event` deprecations. This verification did not access real BCS
+data, outputs, model weights, or run training.
 
 ## Resultados de entrenamiento
 

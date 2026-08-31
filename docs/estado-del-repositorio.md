@@ -1,9 +1,9 @@
 # Estado del repositorio
 
 Esta es la referencia rápida para saber qué está implementado y probado en
-`IA`, y qué sigue pendiente como operación real. El estado corresponde a
-`feature/bcs-ordinal-phase-2` en `ff7ac78`; no implica un despliegue de usuario
-final ni la existencia de pesos BCS reales.
+`IA`, y qué sigue pendiente como operación real. El estado corresponde a la rama
+`feature/bcs-ordinal-phase-2`; no implica un despliegue de usuario final ni la
+existencia de pesos BCS reales.
 
 ## Ruta rápida
 
@@ -49,7 +49,7 @@ conversión ni un fallback ejecutable desde artefactos antiguos.
 
 | Gate | Resultado | Alcance |
 |---|---|---|
-| Suite completa | `430 passed`, `2 skipped`, `2 warnings`, `65 subtests` | `.venv\Scripts\python -m pytest -q` en el worktree de `ff7ac78`; sin datos BCS reales ni entrenamiento. |
+| Suite completa | `430 passed`, `2 skipped`, `2 warnings`, `65 subtests` | `.venv\Scripts\python -m pytest -q` en el estado documentado de esta rama; sin datos BCS reales ni entrenamiento. |
 | Contrato API/serving | Cubierto por pruebas | Upload compartido, `/bcs`, readiness, OpenAPI, redondeo, sanitización y aislamiento de `/health`/`/detect`. |
 | Pipeline BCS | Cubierto con temporales | Imágenes controladas, snapshot, transforms, forward/predict, optimizer, checkpoint y lineage en CPU. |
 | Ruff | No globalmente verde | Código reemplazado/tocado limpio; quedan siete diagnósticos no relacionados en archivos de Fase 1. |
