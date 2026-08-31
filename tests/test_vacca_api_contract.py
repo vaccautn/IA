@@ -289,3 +289,8 @@ def test_bcs_readiness_openapi_and_health_remain_bcs_independent(monkeypatch) ->
     response = main.health()
     assert response.model_loaded is True
     assert runtime.get_calls == 0
+
+
+def test_prototype_ui_uses_active_detection_model_label() -> None:
+    html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert "Modelo: combined-v2-finetune (Navid + BCS)" in html
