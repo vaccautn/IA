@@ -19,6 +19,11 @@ if TYPE_CHECKING:
         encode_levels,
         predict,
     )
+    from .serving import (
+        BCSLineageMetadata,
+        LoadedBCSModel,
+        load_bcs_model,
+    )
 
 
 __all__ = [
@@ -30,6 +35,9 @@ __all__ = [
     "coral_loss",
     "encode_levels",
     "predict",
+    "BCSLineageMetadata",
+    "LoadedBCSModel",
+    "load_bcs_model",
 ]
 
 _LAZY_EXPORTS = {
@@ -40,6 +48,9 @@ _LAZY_EXPORTS = {
     "coral_loss": (".model", "coral_loss"),
     "encode_levels": (".model", "encode_levels"),
     "predict": (".model", "predict"),
+    "BCSLineageMetadata": (".serving", "BCSLineageMetadata"),
+    "LoadedBCSModel": (".serving", "LoadedBCSModel"),
+    "load_bcs_model": (".serving", "load_bcs_model"),
 }
 
 
