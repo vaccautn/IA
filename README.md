@@ -289,7 +289,7 @@ IA/
 ├── outputs/
 │   ├── bcs-ordinal-integer-v1/ ← Canonical integer trainer root
 │   └── training/             ← Phase 1 training outputs
-├── models/checkpoints/      ← yolo26n.pt base
+├── models/deploy/           ← Versioned Phase 1 deployment model
 └── PRD.md                   ← Product Requirements Doc
 ```
 
