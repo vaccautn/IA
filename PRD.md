@@ -9,6 +9,11 @@
 
 ---
 
+> **Nota de estado:** Este PRD conserva los requisitos y la historia de alcance
+> de la Fase 1. Para la implementación vigente de la rama, incluido el pipeline
+> ordinal BCS entero, su serving y las tareas operativas pendientes (export real,
+> entrenamiento, pesos y despliegue), consultar `docs/estado-del-repositorio.md`.
+
 ## 1. Resumen ejecutivo
 
 VACCA es un sistema orientado al monitoreo de la condición corporal del ganado bovino mediante imágenes y, en etapas posteriores, video. La primera fase del componente de inteligencia artificial consiste en desarrollar un prototipo independiente capaz de analizar una imagen estática y determinar si contiene exactamente un bovino apto para continuar con el procesamiento.
