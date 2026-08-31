@@ -1,15 +1,14 @@
-"""Quick smoke test for VACCA API endpoints (runs without starting a server)."""
-import json
+"""Quick direct detector/schema check (does not start FastAPI or make HTTP calls)."""
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from vacca_api.detection import get_detector
-from vacca_api.schemas import BCSResponse, DetectResponse, HealthResponse
+from vacca_api.detection import get_detector  # noqa: E402
+from vacca_api.schemas import DetectResponse, HealthResponse  # noqa: E402
 
-MODEL_PATH = ROOT / "outputs" / "training" / "combined-finetune" / "weights" / "best.pt"
+MODEL_PATH = ROOT / "outputs" / "training" / "combined-v2-finetune" / "weights" / "best.pt"
 
 # Test image
 test_img = ROOT / "data" / "cow-detection-navids" / "valid" / "images"
@@ -21,7 +20,7 @@ if not images:
 test_file = images[0]
 print(f"Test image: {test_file.name}")
 
-# 1. Health check
+# 1. Direct health schema construction
 detector = get_detector(model_path=MODEL_PATH)
 health = HealthResponse(
     model_loaded=True,
@@ -44,8 +43,4 @@ resp = DetectResponse(
 )
 print(f"\n[DETECT] {resp.model_dump_json(indent=2)}")
 
-# 3. BCS placeholder
-bcs_resp = BCSResponse(cow_detected=resp.cow_detected)
-print(f"\n[BCS] {bcs_resp.model_dump_json(indent=2)}")
-
-print("\n[OK] All endpoints respond correctly")
+print("\n[OK] Direct detector/schema check completed")

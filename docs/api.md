@@ -1,152 +1,202 @@
-# API de detección
+# API de detección y BCS
 
-**BCS hoy:** `POST /bcs` sigue siendo un placeholder y siempre devuelve `bcs_score: null`; no ejecuta inferencia BCS.
-
-Esta es la guía operativa del servicio FastAPI que existe hoy. La detección de Fase 1 está implementada; `vacca_bcs.source_client` ya consume el export versionado del backend. La inferencia BCS futura aceptará scores finitos en el rango inclusivo `1..5` y usará un score entero con redondeo decimal half-down (los empates exactos `.5` bajan, por ejemplo `3.5 → 3`), sin clamp ni cambio de la precisión flotante del modelo. Esa inferencia todavía no está implementada.
+Esta es la guía operativa del servicio FastAPI actual. La detección de Fase 1 y
+el endpoint BCS están implementados, pero son capacidades independientes:
+`/detect` usa el detector YOLO local; `/bcs` usa, bajo demanda, un checkpoint
+ordinal BCS configurado por entorno. No se ha producido todavía un checkpoint BCS
+real, por lo que una instalación sin configuración BCS responde `503`.
 
 ## Camino rápido
 
-Los siguientes pasos están documentados en `README.md` y en `scripts/run_api.py`. Son comandos verificados contra el repositorio; este documento no registra una ejecución local de ellos.
+Los siguientes comandos preparan y arrancan el prototipo local. No descargan
+datos BCS ni crean un checkpoint BCS.
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install -e .[yolo]
-.venv\Scripts\pip install fastapi uvicorn python-multipart
+.venv\Scripts\python -m pip install -e ".[api,bcs,dev,yolo]"
 dir outputs\training\combined-v2-finetune\weights\best.pt
 .venv\Scripts\python scripts/run_api.py
 ```
 
-El launcher acepta opciones documentadas por el propio script:
+El detector de Fase 1 necesita el output local
+`outputs/training/combined-v2-finetune/weights/best.pt`. Ese archivo no está en
+este checkout; `models/deploy/vacca-yolo26n-v1.pt` es un artefacto versionado,
+pero la API no lo usa como fallback ni lo selecciona por configuración.
+
+El launcher acepta:
 
 ```powershell
 .venv\Scripts\python scripts/run_api.py --port 3000
+.venv\Scripts\python scripts/run_api.py --host 0.0.0.0
 .venv\Scripts\python scripts/run_api.py --reload
 ```
 
-Estas variantes también están documentadas y este documento no registra una ejecución local de ellas. El puerto predeterminado es `8000`, el host predeterminado es `127.0.0.1` y no existe una variable de entorno para reemplazarlos.
+El puerto predeterminado es `8000` y el host predeterminado es `127.0.0.1`.
+`--reload` es sólo para desarrollo. La aplicación no implementa autenticación y
+mantiene CORS abierto para el prototipo; revisar ambos límites antes de exponerla.
 
-## Prerrequisitos y carga de configuración
+## Configuración BCS
 
-| Requisito | Evidencia | Estado |
-|---|---|---|
-| Python `>=3.11` | `pyproject.toml` y README | Declarado; README indica desarrollo/prueba con 3.13. |
-| Pillow | Dependencia base de `pyproject.toml` | Declarado. |
-| Ultralytics `8.4.115` | Extra `yolo` y `requirements-cpu.txt` | Declarado en el extra; la API importa YOLO de forma diferida. |
-| FastAPI, Uvicorn y `python-multipart` | Comando separado del README | Necesarios por los imports y `UploadFile = File(...)`, pero no declarados en `pyproject.toml` ni en `requirements-cpu.txt`. |
-| Peso de detección | `src/vacca_api/main.py:MODEL_PATH` | Debe existir en `outputs/training/combined-v2-finetune/weights/best.pt`. |
+El runtime BCS es opcional, aislado y lazy. Sólo se configura cuando existe la
+ruta `VACCA_BCS_CHECKPOINT`; no carga el modelo durante la importación ni al
+consultar `/ready/bcs`. `VACCA_BCS_DEVICE` es opcional y por defecto vale `cpu`.
 
-La ruta del peso está hardcodeada en `main.py` y repetida como valor por defecto en `detection.py`. Es relativa a la raíz calculada desde el paquete, no configurable por CLI, variable de entorno o archivo de configuración. Esto impide que el servicio sea portable a un checkout limpio si ese output local no está disponible.
+```powershell
+$env:VACCA_BCS_CHECKPOINT = "C:\secure\models\bcs-ordinal-integer-checkpoint-v1.pt"
+$env:VACCA_BCS_DEVICE = "cpu"
+.venv\Scripts\python scripts/run_api.py
+```
 
-El archivo versionado `models/deploy/vacca-yolo26n-v1.pt` **no es el peso que carga esta API**. La API tampoco consume el peso base declarado en `configs/baseline_manifest.json`.
+El checkpoint debe tener schema `bcs-ordinal-integer-checkpoint-v1`, dominio
+`bcs-integer-1-5`, escala/clases `1..5` y lineage compatible con
+`bcs-integer-snapshot-v2`, incluyendo identidad del snapshot, digest del
+manifiesto y `run_id`. Los checkpoints viejos o de otra escala se rechazan.
+Nunca pongas tokens en el archivo `.env`, el código ni los comandos compartidos.
 
 ## Rutas registradas
 
-### Rutas de la aplicación
-
-| Método | Ruta | Entrada | Respuesta actual |
+| Método | Ruta | Entrada | Respuesta |
 |---|---|---|---|
-| `GET` | `/health` | Ninguna | `HealthResponse`, HTTP 200 si el detector singleton puede cargarse. |
-| `POST` | `/detect` | Multipart con campo `file` | `DetectResponse`, o HTTP 400/500 según la validación/error descrito abajo. |
-| `POST` | `/bcs` | Multipart con campo `file` | `BCSResponse` placeholder; actualmente HTTP 200 incluso cuando la detección interna falla. |
-| `GET` | `/ui` | Ninguna | HTML de `src/vacca_api/static/index.html`; HTTP 404 si el archivo no existe. Es UI de prototipo. |
+| `GET` | `/health` | Ninguna | `HealthResponse`, HTTP 200 si el detector YOLO puede cargarse. |
+| `POST` | `/detect` | Multipart con campo `file` | `DetectResponse`, o HTTP 400/500. |
+| `POST` | `/bcs` | Multipart con campo `file` | `BCSResponse` en HTTP 200, o error HTTP sanitizado. |
+| `GET` | `/ready/bcs` | Ninguna | `BCSReadinessResponse`: 200 sólo en estado `ready`, 503 en otro estado. |
+| `GET` | `/ui` | Ninguna | UI HTML de prototipo; 404 si falta el archivo. |
 
-FastAPI agrega además las rutas automáticas `/docs`, `/redoc` y `/openapi.json` porque `FastAPI()` se crea con la documentación habilitada por defecto. No son un contrato de integración productivo.
+FastAPI agrega `/docs`, `/redoc` y `/openapi.json`. El OpenAPI declara el body
+exitoso de cada ruta y el body de readiness `503`; los errores de operación
+`/bcs` usan el body estándar de FastAPI `{"detail":"..."}`.
 
-La aplicación configura CORS con `allow_origins=["*"]`, `allow_methods=["*"]` y `allow_headers=["*"]`, y no implementa autenticación. Es una configuración de prototipo y debe revisarse antes de exponer el servicio fuera de un entorno controlado.
+`/health` y `/detect` no consultan el runtime BCS. `/bcs` no ejecuta YOLO ni
+recorta la imagen: recibe la imagen completa y usa el servicio ordinal.
 
-### `GET /health`
+## `GET /health`
 
-Campos exactos de `HealthResponse`:
+Forma exacta de `HealthResponse`:
 
 ```json
 {
   "status": "ok",
   "model_loaded": true,
-  "model_path": "<ruta calculada al peso>",
+  "model_path": "<ruta calculada al peso YOLO>",
   "gpu_available": false
 }
 ```
 
-`model_path` refleja la ruta del singleton y `gpu_available` consulta `torch.cuda.is_available()`. El ejemplo no afirma un valor de entorno: sólo muestra la forma del esquema.
+`model_path` refleja el singleton del detector y `gpu_available` consulta
+`torch.cuda.is_available()`. El ejemplo no afirma un valor de entorno.
 
-### `POST /detect`
+## `POST /detect`
 
-Solicitud multipart compatible con el código:
+Solicitud multipart:
 
 ```powershell
 Invoke-RestMethod -Uri http://127.0.0.1:8000/detect `
   -Method Post `
-  -Form @{file=Get-Item "data\cow-detection-navids\valid\images\alguna.jpg"}
+  -Form @{file=Get-Item "ruta\a\imagen.jpg"}
 ```
 
-El ejemplo proviene del README y está documentado; este documento no registra una ejecución local. El nombre del campo debe ser `file`.
+La validación compartida exige `content_type` que comience con `image/*` y un
+archivo no vacío. Los errores son:
 
-Respuesta exitosa: `DetectResponse` contiene `cow_detected`, `detection_count`, `detections`, `image_width`, `image_height` e `inference_time_ms`. Cada elemento de `detections` contiene `class_name`, `confidence`, `bbox` y `x1`, `y1`, `x2`, `y2`. `bbox` usa `x_center`, `y_center`, `width` y `height` normalizados entre `0` y `1`; las cuatro coordenadas `x1..y2` son píxeles.
+- `400` para MIME no soportado, lectura fallida o archivo vacío.
+- `500` con `{"detail":"Detection failed — check server logs"}` si falla el
+  detector o Pillow durante la detección.
+- Un request sin `file` conserva la validación estándar de FastAPI.
 
-Ejemplo de forma, tomada del esquema/README:
+Una respuesta exitosa contiene `cow_detected`, `detection_count`, `detections`,
+`image_width`, `image_height` e `inference_time_ms`. Cada detección contiene
+`class_name`, `confidence`, `bbox` y coordenadas de píxel `x1`, `y1`, `x2`, `y2`.
+
+## `POST /bcs`
+
+La ruta estima el score desde la imagen completa. `BCSResponse` tiene esta forma:
 
 ```json
 {
-  "cow_detected": true,
-  "detection_count": 1,
-  "detections": [{
-    "class_name": "cow",
-    "confidence": 0.9259,
-    "bbox": {"x_center": 0.5258, "y_center": 0.4361, "width": 0.8436, "height": 0.712},
-    "x1": 66, "y1": 51, "x2": 606, "y2": 506
-  }],
-  "image_width": 640,
-  "image_height": 640,
-  "inference_time_ms": 15.42
+  "status": "ok",
+  "message": "BCS score computed successfully.",
+  "cow_detected": null,
+  "bcs_score": 3
 }
 ```
 
-Comportamiento de errores comprobado en `main.py`:
+`bcs_score` es `null` únicamente en el esquema de respuesta que admite
+compatibilidad; una respuesta HTTP 200 exitosa contiene un entero estricto de
+`1` a `5`. `cow_detected` es siempre `null` en el éxito BCS porque esta ruta no
+ejecuta detección. No se expone confianza.
 
-- `400` si `content_type` no comienza con `image/`.
-- `400` si falla la lectura del upload.
-- `400` si el archivo leído está vacío.
-- `500` con `Detection failed — check server logs` para excepciones del detector, incluido un bytes que Pillow no puede decodificar.
-- Una solicitud sin el campo requerido `file` queda bajo la validación estándar de FastAPI; la aplicación no define un payload de error propio para ese caso.
+El modelo calcula internamente una expectativa CORAL continua y la adapta al
+contrato entero sólo en el límite HTTP mediante redondeo decimal half-down: un
+empate exacto `.5` baja (`3.5 → 3`). Valores no finitos o fuera de `1..5` no se
+publican.
 
-### `POST /bcs`: placeholder, no inferencia BCS
+Errores de operación, todos con body estándar `{"detail": "..."}`:
 
-La ruta está registrada para reservar la superficie de Fase 2, pero no funciona como serving ordinal:
+| HTTP | `detail` | Causa |
+|---:|---|---|
+| 400 | `File must be an image (JPEG, PNG, etc.)` / `Empty file` / `Failed to read uploaded file` | Validación común del upload. |
+| 400 | `BCS image input is invalid` | La carga no es un JPEG/PNG decodificable o viola límites de imagen. |
+| 500 | `BCS inference failed` | El modelo no pudo producir inferencia. |
+| 500 | `BCS score could not be produced` | El score no pasó la validación de frontera. |
+| 503 | `BCS capability is unavailable` | Falta el checkpoint, no se pudo cargar o el dispositivo no está disponible. |
 
-- Lee el archivo y vuelve a ejecutar sólo el detector de bovinos.
-- Si esa detección funciona, `cow_detected` es booleano; si falla cualquier excepción, queda `null`.
-- Siempre construye `BCSResponse` con `status: "not_implemented"`, el mensaje fijo de no implementación y `bcs_score: null`.
-- No valida `content_type` ni archivo vacío de la misma manera que `/detect`.
+Ejemplo de capacidad no configurada: `POST /bcs` devuelve HTTP `503` y
+`{"detail":"BCS capability is unavailable"}`; no devuelve un `BCSResponse`
+exitoso ni un score nulo como sustituto.
 
-No debe usarse `/bcs` para obtener un score ni presentarse como integración con el backend.
+## `GET /ready/bcs`
 
-## `scripts/smoke_test_api.py`: helper directo, no prueba HTTP
+Esta ruta inspecciona el estado sin disparar la carga lazy. El body exacto es
+`BCSReadinessResponse`:
 
-Este script no inicia FastAPI ni realiza solicitudes HTTP. Importa directamente `get_detector` y los esquemas Pydantic, construye respuestas en memoria y ejecuta el detector sobre un archivo local.
+```json
+{"status":"unconfigured","message":"BCS capability is not configured."}
+```
 
-- Carga `outputs/training/combined-finetune/weights/best.pt`.
-- La aplicación FastAPI carga `outputs/training/combined-v2-finetune/weights/best.pt` desde `src/vacca_api/main.py`.
-- Por esa diferencia, y porque no usa Uvicorn ni un cliente HTTP, el helper no puede demostrar cuál es el modelo activo de la API, el arranque, las rutas, el multipart ni el comportamiento de errores HTTP.
-- Es un smoke helper directo de detector/esquemas; no es suficiente como verificación de la API y no debe recomendarse como tal.
+Estados y status HTTP:
 
-## Troubleshooting y checklist
+| Estado | HTTP | Mensaje |
+|---|---:|---|
+| `unconfigured` | 503 | `BCS capability is not configured.` |
+| `not_loaded` | 503 | `BCS capability is configured but not loaded.` |
+| `ready` | 200 | `BCS capability is ready.` |
+| `unavailable` | 503 | `BCS capability is unavailable.` |
 
-- [ ] El entorno virtual existe y las dependencias de API se instalaron con el comando documentado.
-- [ ] `outputs\training\combined-v2-finetune\weights\best.pt` existe; si no, el startup no tiene una ruta alternativa implementada.
-- [ ] Se está usando `scripts/run_api.py`, que añade `src/` al import path.
-- [ ] El puerto elegido no está ocupado. Si `8000` está ocupado, usar la opción `--port` del launcher; esta variante está documentada, pero no tiene una ejecución local registrada en este documento.
-- [ ] Si el puerto está ocupado, revisar el error de Uvicorn: el launcher no hace una comprobación previa ni implementa recuperación automática.
-- [ ] La solicitud de `/detect` usa multipart y el campo exacto `file`.
-- [ ] El archivo tiene MIME `image/*` y no está vacío.
-- [ ] Para BCS, interpretar la respuesta como placeholder, nunca como score.
-- [ ] No confundir `models/deploy/` versionado con la ruta `outputs/` que la API realmente carga.
+## Arquitectura y límites
 
-## Readiness
+El backend es dueño de autenticación, persistencia de evaluaciones y R2. IA
+consume `GET /api/bcs-source-v1` con Bearer y, por cada evidencia, solicita un
+signed URL al backend. El token sólo viaja al backend: la descarga posterior a
+R2 usa el signed URL sin enviar el token. IA materializa bytes y SHA-256, sin
+retener el signed URL.
 
-| Capacidad | Lectura operativa | Estado |
-|---|---|---|
-| Detección local por HTTP | Hay launcher, rutas y esquema; requiere dependencias manuales y un output local. | `Operativo` como prototipo local; no verificado mediante un arranque registrado en este documento. |
-| Modelo portable/versionado para esta API | Hay un artefacto versionado, pero no está conectado a `MODEL_PATH`. | `Bloqueado` hasta resolver selección/configuración de peso. |
-| BCS ordinal por HTTP | Sólo hay respuesta placeholder. | `Placeholder`. |
-| Integración backend autenticada | `vacca_bcs.source_client` consume `GET /api/bcs-source-v1` con Bearer; no descarga imágenes ni migra datasets. | `En desarrollo`. |
-| Helper directo de detector/esquemas | Existe `scripts/smoke_test_api.py`; usa datos y `outputs/training/combined-finetune/weights/best.pt`. | No es una prueba HTTP/FastAPI y no basta para verificar el modelo activo, startup, rutas, multipart ni errores de la API; no tiene una ejecución local registrada en este documento. |
+El flujo de build es:
+
+```text
+bcs-source-v1 + signed evidence URL
+  → scripts/build_bcs_integer.py
+  → data/bcs-integer-v1/ (bcs-integer-snapshot-v2)
+  → scripts/train_bcs_ordinal.py
+  → outputs/bcs-ordinal-integer-v1/
+  → VACCA_BCS_CHECKPOINT (serving)
+```
+
+`data/` y `outputs/` son raíces operativas ignoradas por Git. El snapshot es
+determinista y el loader/trainer validan dominio, escala y lineage. No hay
+conversión ni fallback desde artefactos fraccionales o antiguos.
+
+## Troubleshooting y verificación
+
+- Confirmá que el output YOLO de Fase 1 existe antes de arrancar la API.
+- Consultá `/ready/bcs` para distinguir `unconfigured`, `not_loaded`, `ready` y
+  `unavailable` sin forzar la carga.
+- Si `/bcs` devuelve `503`, no lo interpretes como score: falta una capacidad
+  BCS operable.
+- Usá `file` como nombre exacto del campo multipart.
+- Ejecutá la suite con `.venv\Scripts\python -m pytest -q`.
+
+La suite verificada en `ff7ac78` terminó con `430 passed, 2 skipped, 2 warnings`
+y `65 subtests`; las advertencias son deprecaciones conocidas de FastAPI
+`on_event`. El chequeo Ruff del código tocado está limpio, pero el repositorio
+completo conserva diez diagnósticos no relacionados de Fase 1.

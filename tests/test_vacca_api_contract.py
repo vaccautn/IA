@@ -181,7 +181,7 @@ def test_detect_uses_uploaded_bytes_once_and_preserves_success(monkeypatch) -> N
     assert upload.read_count == 1
 
 
-def test_bcs_valid_upload_keeps_placeholder_compatibility(monkeypatch) -> None:
+def test_bcs_valid_upload_returns_integer_score(monkeypatch) -> None:
     service = _FakeService()
     runtime = _FakeRuntime(service)
     upload = _Upload("image/png")
