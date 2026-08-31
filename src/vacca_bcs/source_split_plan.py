@@ -16,7 +16,15 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from numbers import Real
 
-from .source_plan import SourceCandidate, SourceExclusion, SourcePlan, SourceProvenance
+from .source_plan import (
+    BackendSourceProvenance,
+    LocalSourceProvenance,
+    SourceCandidate,
+    SourceExclusion,
+    SourcePlan,
+    SourceRecord,
+    SourceProvenance,
+)
 
 
 class IntegerSplitPlanError(Exception):
@@ -62,10 +70,11 @@ class IntegerSplitCounts:
 class IntegerSplitAssignment:
     split: str
     bcs_score: int
-    evidence_id: int
-    provenance: tuple[SourceProvenance, ...]
-    storage_key: str
+    evidence_id: int | None
+    provenance: tuple[SourceProvenance | BackendSourceProvenance | LocalSourceProvenance, ...]
+    storage_key: str | None
     relative_path_stem: str
+    record_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "provenance", tuple(self.provenance))
@@ -87,6 +96,11 @@ class IntegerSplitPlanIdentity:
     candidate_evidence_ids: tuple[int, ...]
     excluded_evidence_ids: tuple[int, ...]
     digest: str
+    candidate_record_ids: tuple[str, ...] = ()
+    source_schema: str = "bcs-source-v1"
+    identity_scheme: str = "backend-evidence-v1"
+    mapping_lineage: tuple[tuple[str, int], ...] = ()
+    observed_classes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -95,6 +109,9 @@ class IntegerSplitPlanIdentity:
         object.__setattr__(
             self, "excluded_evidence_ids", tuple(self.excluded_evidence_ids)
         )
+        object.__setattr__(self, "candidate_record_ids", tuple(self.candidate_record_ids))
+        object.__setattr__(self, "mapping_lineage", tuple(self.mapping_lineage))
+        object.__setattr__(self, "observed_classes", tuple(self.observed_classes))
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +121,7 @@ class IntegerSplitPlan:
     counts: IntegerSplitCounts
     config: IntegerSplitConfig
     identity: IntegerSplitPlanIdentity
-    source_candidates: tuple[SourceCandidate, ...]
+    source_candidates: tuple[SourceCandidate | SourceRecord, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "assignments", tuple(self.assignments))
@@ -135,14 +152,45 @@ def _validate_ratio(val_ratio: Real) -> tuple[float, str]:
     return ratio, format(decimal_ratio.normalize(), "f")
 
 
-def _validate_input(source_plan: BCSIntegerSourcePlan) -> tuple[SourceCandidate, ...]:
+def _candidate_id(candidate: SourceCandidate | SourceRecord) -> str:
+    if isinstance(candidate, SourceRecord):
+        return candidate.record_id
+    return f"backend/evidence/{candidate.evidence_id}"
+
+
+def _candidate_score(candidate: SourceCandidate | SourceRecord) -> int:
+    return candidate.bcs_score
+
+
+def _candidate_sort_key(candidate: SourceCandidate | SourceRecord) -> tuple[int, object]:
+    return (
+        candidate.bcs_score,
+        candidate.evidence_id
+        if isinstance(candidate, SourceCandidate)
+        else candidate.record_id,
+    )
+
+
+def _candidate_provenance(candidate: SourceCandidate | SourceRecord) -> tuple[object, ...]:
+    return tuple(candidate.provenance)
+
+
+def _validate_input(
+    source_plan: BCSIntegerSourcePlan,
+) -> tuple[SourceCandidate | SourceRecord, ...]:
     if not isinstance(source_plan, SourcePlan):
         raise IntegerSplitInputError("input must be a normalized SourcePlan")
     candidates = tuple(source_plan.candidates)
-    evidence_ids = [candidate.evidence_id for candidate in candidates]
-    if len(set(evidence_ids)) != len(evidence_ids):
+    if source_plan.source_schema not in {"bcs-source-v1", "bcs-local-folder-v1"}:
+        raise IntegerSplitInputError("source plan schema is not supported")
+    record_ids = [_candidate_id(candidate) for candidate in candidates]
+    if any(not isinstance(record_id, str) or not record_id for record_id in record_ids):
+        raise IntegerSplitInputError("source records must have stable record IDs")
+    if len(set(record_ids)) != len(record_ids):
         raise IntegerSplitInputError(
             "normalized source plan has duplicate evidence IDs"
+            if all(isinstance(candidate, SourceCandidate) for candidate in candidates)
+            else "normalized source plan has duplicate record IDs"
         )
     exclusion_ids = [item.evidence_id for item in source_plan.exclusions]
     duplicate_exclusions = tuple(
@@ -152,7 +200,12 @@ def _validate_input(source_plan: BCSIntegerSourcePlan) -> tuple[SourceCandidate,
         raise IntegerSplitInputError(
             f"duplicate exclusion evidence IDs: {duplicate_exclusions}"
         )
-    overlap = tuple(sorted(set(evidence_ids).intersection(exclusion_ids)))
+    candidate_evidence_ids = {
+        candidate.evidence_id
+        for candidate in candidates
+        if isinstance(candidate, SourceCandidate)
+    }
+    overlap = tuple(sorted(candidate_evidence_ids.intersection(exclusion_ids)))
     if overlap:
         raise IntegerSplitInputError(
             f"evidence IDs appear in both candidates and exclusions: {overlap}"
@@ -162,8 +215,14 @@ def _validate_input(source_plan: BCSIntegerSourcePlan) -> tuple[SourceCandidate,
             raise IntegerSplitInputError(
                 "source plan labels must be integer scores in 1..5"
             )
-        if type(candidate.evidence_id) is not int:
+        if isinstance(candidate, SourceRecord) and candidate.source_schema != source_plan.source_schema:
+            raise IntegerSplitInputError("source record schema does not match source plan")
+        if isinstance(candidate, SourceCandidate) and type(candidate.evidence_id) is not int:
             raise IntegerSplitInputError("source plan evidence IDs must be integers")
+    if source_plan.source_schema == "bcs-local-folder-v1" and any(
+        not isinstance(candidate, SourceRecord) for candidate in candidates
+    ):
+        raise IntegerSplitInputError("local source plan contains backend records")
     return candidates
 
 
@@ -176,33 +235,57 @@ def _validation_count(size: int, canonical_ratio: str) -> int:
 
 
 def _assignment(
-    candidate: SourceCandidate,
+    candidate: SourceCandidate | SourceRecord,
     split: str,
 ) -> IntegerSplitAssignment:
+    record_id = _candidate_id(candidate)
+    backend = isinstance(candidate, SourceCandidate)
+    evidence_id = candidate.evidence_id if backend else None
+    storage_key = candidate.storage_key if backend else None
     return IntegerSplitAssignment(
         split=split,
-        bcs_score=candidate.bcs_score,
-        evidence_id=candidate.evidence_id,
-        provenance=candidate.provenance,
-        storage_key=candidate.storage_key,
-        relative_path_stem=f"{split}/{candidate.bcs_score}/{candidate.evidence_id}",
+        bcs_score=_candidate_score(candidate),
+        evidence_id=evidence_id,
+        provenance=_candidate_provenance(candidate),
+        storage_key=storage_key,
+        relative_path_stem=f"{split}/{candidate.bcs_score}/{candidate.evidence_id}"
+        if backend
+        else f"{split}/{candidate.bcs_score}/{record_id}",
+        record_id=record_id,
     )
 
 
 def _identity_digest(
     config: IntegerSplitConfig,
-    candidates: tuple[SourceCandidate, ...],
+    candidates: tuple[SourceCandidate | SourceRecord, ...],
     exclusions: tuple[SourceExclusion, ...],
     assignments: tuple[IntegerSplitAssignment, ...],
     counts: IntegerSplitCounts,
+    source_plan: SourcePlan,
 ) -> str:
+    def provenance_value(item: object) -> tuple[object, ...]:
+        if isinstance(item, SourceProvenance):
+            return (item.evidence_id, item.evaluation_id)
+        if isinstance(item, BackendSourceProvenance):
+            return (item.evidence_id, item.evaluation_id, item.session_id, item.animal_id)
+        if isinstance(item, LocalSourceProvenance):
+            return (item.relative_path, item.source_label)
+        raise IntegerSplitInputError("source provenance type is unsupported")
+
     payload = {
+        "source": (
+            source_plan.source_schema,
+            source_plan.identity_scheme,
+            source_plan.mapping_lineage,
+            source_plan.observed_classes,
+        ),
         "assignments": [
             (
                 item.split,
                 item.bcs_score,
+                item.record_id,
                 item.evidence_id,
-                tuple((p.evidence_id, p.evaluation_id) for p in item.provenance),
+                tuple(provenance_value(p) for p in item.provenance),
                 item.storage_key,
                 item.relative_path_stem,
             )
@@ -210,24 +293,24 @@ def _identity_digest(
         ],
         "candidates": [
             (
-                item.evaluation_id,
-                item.session_id,
-                item.animal_id,
-                item.evidence_id,
-                item.storage_key,
+                _candidate_id(item),
+                getattr(item, "evaluation_id", None),
+                getattr(item, "session_id", None),
+                getattr(item, "animal_id", None),
+                getattr(item, "materializer_key", None),
                 item.bcs_score,
-                tuple((p.evidence_id, p.evaluation_id) for p in item.provenance),
+                tuple(provenance_value(p) for p in item.provenance),
             )
             for item in sorted(
-                candidates, key=lambda item: (item.bcs_score, item.evidence_id)
+                candidates, key=_candidate_sort_key
             )
         ],
         "config": (config.seed, config.canonical_val_ratio),
         "counts": {"train": counts.train, "val": counts.val},
         "exclusions": sorted(
             (
-                item.evidence_id,
-                item.evaluation_id,
+                getattr(item, "evidence_id", None),
+                getattr(item, "evaluation_id", None),
                 item.bcs_score,
                 item.reason,
             )
@@ -250,9 +333,7 @@ def create_integer_split_plan(
     config = IntegerSplitConfig(seed=seed, val_ratio=val_ratio)
     candidates = _validate_input(source_plan)
     by_score = {score: [] for score in range(1, 6)}
-    for candidate in sorted(
-        candidates, key=lambda item: (item.bcs_score, item.evidence_id)
-    ):
+    for candidate in sorted(candidates, key=_candidate_sort_key):
         by_score[candidate.bcs_score].append(candidate)
 
     assignments: list[IntegerSplitAssignment] = []
@@ -274,7 +355,7 @@ def create_integer_split_plan(
             key=lambda item: (
                 item.bcs_score,
                 0 if item.split == "train" else 1,
-                item.evidence_id,
+                item.evidence_id if item.evidence_id is not None else item.record_id,
             ),
         )
     )
@@ -286,9 +367,8 @@ def create_integer_split_plan(
         canonical_val_ratio=config.canonical_val_ratio,
         candidate_evidence_ids=tuple(
             item.evidence_id
-            for item in sorted(
-                candidates, key=lambda item: (item.bcs_score, item.evidence_id)
-            )
+            for item in sorted(candidates, key=_candidate_sort_key)
+            if isinstance(item, SourceCandidate)
         ),
         excluded_evidence_ids=excluded_ids,
         digest=_identity_digest(
@@ -297,7 +377,15 @@ def create_integer_split_plan(
             source_plan.exclusions,
             ordered_assignments,
             counts,
+            source_plan,
         ),
+        candidate_record_ids=tuple(
+            _candidate_id(item) for item in sorted(candidates, key=_candidate_sort_key)
+        ),
+        source_schema=source_plan.source_schema,
+        identity_scheme=source_plan.identity_scheme,
+        mapping_lineage=source_plan.mapping_lineage,
+        observed_classes=source_plan.observed_classes,
     )
     return IntegerSplitPlan(
         assignments=ordered_assignments,
@@ -306,7 +394,7 @@ def create_integer_split_plan(
         config=config,
         identity=identity,
         source_candidates=tuple(
-            sorted(candidates, key=lambda item: (item.bcs_score, item.evidence_id))
+            sorted(candidates, key=lambda item: (item.bcs_score, _candidate_id(item)))
         ),
     )
 
@@ -318,7 +406,15 @@ def validate_integer_split_plan(plan: IntegerSplitPlan) -> None:
     """Recompute and validate every contract-relevant part of a split plan."""
     if not isinstance(plan, IntegerSplitPlan):
         raise IntegerSplitInputError("input must be an integer split plan")
-    source = SourcePlan(plan.source_candidates, plan.exclusions, (0,) * 5)
+    source = SourcePlan(
+        plan.source_candidates,
+        plan.exclusions,
+        (0,) * 5,
+        source_schema=plan.identity.source_schema,
+        identity_scheme=plan.identity.identity_scheme,
+        mapping_lineage=plan.identity.mapping_lineage,
+        observed_classes=plan.identity.observed_classes,
+    )
     expected = create_integer_split_plan(
         source, seed=plan.config.seed, val_ratio=plan.config.val_ratio
     )
