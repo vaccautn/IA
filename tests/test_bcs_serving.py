@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import copy
+from io import BytesIO
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 import torch
+from PIL import Image, ImageOps
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -163,3 +165,128 @@ def test_rejects_symlink_when_supported(checkpoint, tmp_path: Path) -> None:
         pytest.skip("symlinks are unavailable")
     with pytest.raises(serving.BCSCheckpointLoadError):
         serving.load_bcs_model(link)
+
+
+class _InferenceModel(torch.nn.Module):
+    def __init__(self, logits: torch.Tensor, failure: bool = False) -> None:
+        super().__init__()
+        self.logits = logits
+        self.failure = failure
+        self.seen: torch.Tensor | None = None
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        if self.failure:
+            raise RuntimeError("private model failure")
+        assert not self.training
+        assert torch.is_inference_mode_enabled()
+        self.seen = image.detach().clone()
+        return self.logits.to(image.device)
+
+
+def _loaded_model(model: torch.nn.Module, imgsz: int = 8) -> serving.LoadedBCSModel:
+    lineage = serving.BCSLineageMetadata(
+        serving.CHECKPOINT_SCHEMA_VERSION,
+        BCS_DOMAIN_ID,
+        serving.SNAPSHOT_SCHEMA_VERSION,
+        "a" * 64,
+        "b" * 64,
+        "c" * 32,
+    )
+    return serving.LoadedBCSModel(model, imgsz, torch.device("cpu"), lineage)
+
+
+def _image_bytes(image_format: str = "JPEG", size: tuple[int, int] = (2, 1), exif=None) -> bytes:
+    image = Image.new("RGB", size, (20, 80, 140))
+    output = BytesIO()
+    options = {"format": image_format}
+    if exif is not None:
+        options["exif"] = exif
+    image.save(output, **options)
+    return output.getvalue()
+
+
+def test_infers_continuous_ordinal_score_without_rounding() -> None:
+    model = _InferenceModel(torch.tensor([[20.0, 0.0, 0.0, 0.0]]))
+    result = serving.BCSInferenceService(_loaded_model(model)).infer(_image_bytes())
+
+    assert result.continuous_score == pytest.approx(3.5)
+    assert result.score == result.continuous_score
+    assert result.continuous_score != 3
+    assert model.seen is not None and model.seen.shape == (1, 3, 8, 8)
+
+
+def test_preprocessing_is_validation_path_exif_transposed_and_rgb(monkeypatch) -> None:
+    calls: list[tuple[int, bool]] = []
+    original_build = serving.build_transforms
+
+    def build(imgsz: int, *, train: bool):
+        calls.append((imgsz, train))
+        return original_build(imgsz, train=train)
+
+    monkeypatch.setattr(serving, "build_transforms", build)
+    exif = Image.Exif()
+    exif[274] = 6
+    payload = _image_bytes(exif=exif)
+    model = _InferenceModel(torch.zeros(1, 4))
+    service = serving.BCSInferenceService(_loaded_model(model))
+    service.infer(payload)
+
+    with Image.open(BytesIO(payload)) as decoded:
+        expected = original_build(8, train=False)(
+            ImageOps.exif_transpose(decoded).convert("RGB")
+        ).unsqueeze(0)
+    assert calls == [(8, False)]
+    assert model.seen is not None and torch.equal(model.seen, expected)
+
+
+@pytest.mark.parametrize(
+    "logits",
+    [torch.zeros(1, 3), torch.full((1, 4), float("nan"))],
+)
+def test_rejects_invalid_logits(logits: torch.Tensor) -> None:
+    model = _InferenceModel(logits)
+    with pytest.raises(serving.BCSInferenceExecutionError):
+        serving.infer_bcs(_loaded_model(model), _image_bytes())
+
+
+def test_model_failure_is_typed_and_sanitized() -> None:
+    model = _InferenceModel(torch.zeros(1, 4), failure=True)
+    with pytest.raises(serving.BCSInferenceExecutionError) as failure:
+        serving.infer_bcs(_loaded_model(model), _image_bytes())
+    assert "private model failure" not in str(failure.value)
+
+
+@pytest.mark.parametrize("payload", [b"", b"not an image", _image_bytes("GIF")])
+def test_rejects_empty_corrupt_and_unsupported_images(payload: bytes) -> None:
+    service = serving.BCSInferenceService(_loaded_model(_InferenceModel(torch.zeros(1, 4))))
+    with pytest.raises(serving.BCSInferenceInputError):
+        service.infer(payload)
+
+
+def test_rejects_bomb_and_unsafe_dimensions(monkeypatch) -> None:
+    service = serving.BCSInferenceService(_loaded_model(_InferenceModel(torch.zeros(1, 4))))
+
+    def bomb(*args, **kwargs):
+        raise Image.DecompressionBombError("private image details")
+
+    monkeypatch.setattr(serving.Image, "open", bomb)
+    with pytest.raises(serving.BCSInferenceInputError) as failure:
+        service.infer(_image_bytes())
+    assert "private image details" not in str(failure.value)
+
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        serving, "_IMAGE_CONFIG", serving.ImageValidationConfig(max_width=1)
+    )
+    with pytest.raises(serving.BCSInferenceInputError):
+        service.infer(_image_bytes(size=(2, 1)))
+
+
+def test_repeated_inference_is_deterministic_and_device_bound() -> None:
+    model = _InferenceModel(torch.tensor([[0.5, -0.5, 1.0, -1.0]]))
+    service = serving.BCSInferenceService(_loaded_model(model, imgsz=16))
+    first = service.infer(_image_bytes())
+    second = service.infer(_image_bytes())
+
+    assert first == second
+    assert model.seen is not None and model.seen.device == torch.device("cpu")

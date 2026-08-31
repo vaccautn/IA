@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import math
 import os
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import torch
+from PIL import Image, ImageOps
+
+from vacca_vision.image_validation import ImageValidationConfig, _validate_dimensions
 
 from .constants import (
     BCS_DOMAIN_ID,
@@ -20,6 +26,7 @@ from .constants import (
     SCORE_MIN,
     SCORE_STEP,
 )
+from .dataset import build_transforms
 from .model import BCSOrdinalModel
 
 CHECKPOINT_SCHEMA_VERSION = "bcs-ordinal-integer-checkpoint-v1"
@@ -45,6 +52,7 @@ _REQUIRED_FIELDS = frozenset(
     }
 )
 _OPTIONAL_TRAINING_FIELDS = frozenset({"epoch", "val_mae", "provenance"})
+_IMAGE_CONFIG = ImageValidationConfig()
 
 
 class BCSCheckpointError(Exception):
@@ -62,6 +70,18 @@ class BCSCheckpointLoadError(BCSCheckpointError):
 BCSServingError = BCSCheckpointError
 BCSServingUnavailableError = BCSCheckpointUnavailableError
 BCSServingLoadError = BCSCheckpointLoadError
+
+
+class BCSInferenceError(Exception):
+    """Base class for sanitized BCS inference failures."""
+
+
+class BCSInferenceInputError(BCSInferenceError):
+    """Raised when uploaded image bytes are not a safe supported image."""
+
+
+class BCSInferenceExecutionError(BCSInferenceError):
+    """Raised when model inference cannot produce a valid ordinal result."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +104,99 @@ class LoadedBCSModel:
     imgsz: int
     device: torch.device
     lineage: BCSLineageMetadata
+
+
+@dataclass(frozen=True, slots=True)
+class BCSInferenceResult:
+    """Immutable continuous BCS output and safe model lineage."""
+
+    continuous_score: float
+    lineage: BCSLineageMetadata
+
+    @property
+    def score(self) -> float:
+        return self.continuous_score
+
+
+class BCSInferenceService:
+    """Run deterministic full-image inference for one loaded BCS model.
+
+    The service owns no global state. Validation transforms are deterministic and
+    each request allocates its own tensor, so concurrent calls only read the model.
+    """
+
+    def __init__(self, loaded: LoadedBCSModel) -> None:
+        if not isinstance(loaded, LoadedBCSModel):
+            raise BCSInferenceInputError("loaded BCS model is invalid")
+        self._loaded = loaded
+        try:
+            self._transform = build_transforms(loaded.imgsz, train=False)
+        except Exception:
+            raise BCSInferenceInputError("BCS image preprocessing is unavailable") from None
+
+    def infer(self, image_bytes: bytes | bytearray | memoryview) -> BCSInferenceResult:
+        tensor = self._prepare(image_bytes)
+        try:
+            self._loaded.model.eval()
+            with torch.inference_mode():
+                logits = self._loaded.model(tensor.to(self._loaded.device))
+        except Exception:
+            raise BCSInferenceExecutionError("BCS inference failed") from None
+        if (
+            not isinstance(logits, torch.Tensor)
+            or tuple(logits.shape) != (1, NUM_THRESHOLDS)
+            or not bool(torch.isfinite(logits).all())
+        ):
+            raise BCSInferenceExecutionError("BCS model returned invalid logits")
+        try:
+            score = float(SCORE_BASE + torch.sigmoid(logits).sum().item())
+        except Exception:
+            raise BCSInferenceExecutionError("BCS model returned an invalid score") from None
+        if not math.isfinite(score) or not SCORE_BASE <= score <= SCORE_MAX:
+            raise BCSInferenceExecutionError("BCS model returned an out-of-range score")
+        return BCSInferenceResult(score, self._loaded.lineage)
+
+    def _prepare(self, image_bytes: bytes | bytearray | memoryview) -> torch.Tensor:
+        if not isinstance(image_bytes, (bytes, bytearray, memoryview)):
+            raise BCSInferenceInputError("BCS image input must be bytes")
+        try:
+            if not image_bytes or len(image_bytes) > _IMAGE_CONFIG.max_size_bytes:
+                raise BCSInferenceInputError("BCS image input is empty or too large")
+            payload = bytes(image_bytes)
+        except BCSInferenceInputError:
+            raise
+        except (TypeError, ValueError):
+            raise BCSInferenceInputError("BCS image input is invalid") from None
+        if not payload or len(payload) > _IMAGE_CONFIG.max_size_bytes:
+            raise BCSInferenceInputError("BCS image input is empty or too large")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(BytesIO(payload)) as probe:
+                    if probe.format not in {"JPEG", "PNG"}:
+                        raise BCSInferenceInputError("BCS image format is unsupported")
+                    _validate_dimensions(*probe.size, _IMAGE_CONFIG)
+                    probe.verify()
+                with Image.open(BytesIO(payload)) as decoded:
+                    decoded.load()
+                    transposed = ImageOps.exif_transpose(decoded)
+                    try:
+                        with transposed.convert("RGB") as rgb:
+                            return self._transform(rgb).unsqueeze(0)
+                    finally:
+                        if transposed is not decoded:
+                            transposed.close()
+        except BCSInferenceInputError:
+            raise
+        except Exception:
+            raise BCSInferenceInputError("BCS image cannot be decoded safely") from None
+
+
+def infer_bcs(
+    loaded: LoadedBCSModel, image_bytes: bytes | bytearray | memoryview
+) -> BCSInferenceResult:
+    """Infer one continuous integer-domain BCS score from a full image."""
+    return BCSInferenceService(loaded).infer(image_bytes)
 
 
 def _valid_digest(value: object, length: int) -> bool:

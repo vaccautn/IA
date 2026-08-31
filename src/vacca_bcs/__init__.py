@@ -20,8 +20,14 @@ if TYPE_CHECKING:
         predict,
     )
     from .serving import (
+        BCSInferenceError,
+        BCSInferenceExecutionError,
+        BCSInferenceInputError,
+        BCSInferenceResult,
+        BCSInferenceService,
         BCSLineageMetadata,
         LoadedBCSModel,
+        infer_bcs,
         load_bcs_model,
     )
 
@@ -36,7 +42,13 @@ __all__ = [
     "encode_levels",
     "predict",
     "BCSLineageMetadata",
+    "BCSInferenceError",
+    "BCSInferenceExecutionError",
+    "BCSInferenceInputError",
+    "BCSInferenceResult",
+    "BCSInferenceService",
     "LoadedBCSModel",
+    "infer_bcs",
     "load_bcs_model",
 ]
 
@@ -49,7 +61,13 @@ _LAZY_EXPORTS = {
     "encode_levels": (".model", "encode_levels"),
     "predict": (".model", "predict"),
     "BCSLineageMetadata": (".serving", "BCSLineageMetadata"),
+    "BCSInferenceError": (".serving", "BCSInferenceError"),
+    "BCSInferenceExecutionError": (".serving", "BCSInferenceExecutionError"),
+    "BCSInferenceInputError": (".serving", "BCSInferenceInputError"),
+    "BCSInferenceResult": (".serving", "BCSInferenceResult"),
+    "BCSInferenceService": (".serving", "BCSInferenceService"),
     "LoadedBCSModel": (".serving", "LoadedBCSModel"),
+    "infer_bcs": (".serving", "infer_bcs"),
     "load_bcs_model": (".serving", "load_bcs_model"),
 }
 
