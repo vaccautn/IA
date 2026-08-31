@@ -239,16 +239,25 @@ def _assignment(
     split: str,
 ) -> IntegerSplitAssignment:
     record_id = _candidate_id(candidate)
-    backend = isinstance(candidate, SourceCandidate)
-    evidence_id = candidate.evidence_id if backend else None
-    storage_key = candidate.storage_key if backend else None
+    backend = isinstance(candidate, SourceCandidate) or (
+        isinstance(candidate, SourceRecord)
+        and candidate.source_schema == "bcs-source-v1"
+    )
+    evidence_id = (
+        candidate.evidence_id
+        if isinstance(candidate, SourceCandidate)
+        else candidate.materializer_key
+        if backend
+        else None
+    )
+    storage_key = candidate.storage_key if isinstance(candidate, SourceCandidate) else None
     return IntegerSplitAssignment(
         split=split,
         bcs_score=_candidate_score(candidate),
         evidence_id=evidence_id,
         provenance=_candidate_provenance(candidate),
         storage_key=storage_key,
-        relative_path_stem=f"{split}/{candidate.bcs_score}/{candidate.evidence_id}"
+        relative_path_stem=f"{split}/{candidate.bcs_score}/{evidence_id}"
         if backend
         else f"{split}/{candidate.bcs_score}/{record_id}",
         record_id=record_id,

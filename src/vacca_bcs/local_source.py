@@ -228,3 +228,19 @@ def materialize_local_record(scan: LocalSourceScan, record: LocalSourceRecord, *
     if digest != record.sha256:
         raise LocalSourceMaterializationError("local source file does not match scan")
     return LocalSourceMaterialized(record.record_id, record.relative_path, payload, digest, len(payload))
+
+
+class LocalSourceMaterializer:
+    """Resolve one scanned local record by its stable identity."""
+
+    def __init__(self, scan: LocalSourceScan, *, max_bytes: int = DEFAULT_MAX_IMAGE_BYTES) -> None:
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise LocalSourceMaterializationError("maximum local source bytes must be positive")
+        self._scan = scan
+        self._max_bytes = max_bytes
+
+    def materialize(self, record_id: str) -> LocalSourceMaterialized:
+        record = next((item for item in self._scan.records if item.record_id == record_id), None)
+        if record is None:
+            raise LocalSourceMaterializationError("local source record is not in scan")
+        return materialize_local_record(self._scan, record, max_bytes=self._max_bytes)

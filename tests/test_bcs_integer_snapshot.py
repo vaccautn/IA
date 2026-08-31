@@ -11,12 +11,20 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from vacca_bcs.source_client import BCSEvidencePayload
+from vacca_bcs.source_client import (
+    BCSEvidencePayload,
+    BCSSourceEvidence,
+    BCSSourceEvaluationRow,
+    BCSSourceExport,
+)
+from vacca_bcs.local_source import LocalSourceMaterializer, scan_local_source
 from vacca_bcs.source_plan import (
     SourceCandidate,
     SourceExclusion,
     SourcePlan,
     SourceProvenance,
+    normalize_backend_source_export,
+    normalize_local_source_scan,
 )
 from vacca_bcs.source_split_plan import (
     IntegerSplitInputError,
@@ -71,6 +79,98 @@ def materializer(payloads: dict[int, bytes]):
         )
 
     return resolve
+
+
+def local_split_plan(tmp_path: Path):
+    write = tmp_path / "source"
+    (write / "3.25").mkdir(parents=True)
+    (write / "4.0").mkdir()
+    (write / "3.25" / "cow.jpg").write_bytes(image_bytes("JPEG"))
+    (write / "4.0" / "cow.png").write_bytes(image_bytes("PNG"))
+    scan = scan_local_source(write)
+    return create_integer_split_plan(
+        normalize_local_source_scan(scan), seed=9, val_ratio=0
+    ), scan
+
+
+def test_builds_and_loads_local_lineage_without_backend_fields(tmp_path: Path):
+    plan, scan = local_split_plan(tmp_path)
+    snapshot = build_integer_snapshot(
+        plan, tmp_path / "snapshot", LocalSourceMaterializer(scan)
+    )
+    manifest = json.loads(snapshot.manifest_json)
+    assert manifest["source_schema"] == "bcs-local-folder-v1"
+    assert manifest["identity_scheme"] == "local-path-sha256-v1"
+    assert manifest["mapping"] == {
+        "3.25": 3, "3.5": 3, "3.75": 4, "4.0": 4, "4.25": 4
+    }
+    assert manifest["observed_classes"] == [3, 4]
+    assert str(tmp_path) not in snapshot.manifest_json
+    assert all("evidence_id" not in item for item in manifest["records"])
+    assert all("evaluation_id" not in item for item in manifest["records"])
+    assert [item["relative_path"] for item in manifest["records"]] == [
+        f"train/{item.bcs_score}/{item.record_id}{Path(item.relative_path).suffix}"
+        for item in snapshot.records
+    ]
+    assert load_integer_snapshot_manifest(snapshot.output_root / "manifest.json") == manifest
+
+
+def test_builds_canonical_backend_lineage_with_legacy_manifest_shape(tmp_path: Path):
+    plan = create_integer_split_plan(
+        normalize_backend_source_export(
+            BCSSourceExport(
+                "bcs-source-v1",
+                (BCSSourceEvaluationRow(2, 7, 8, 3, (BCSSourceEvidence(11, "safe"),)),),
+            )
+        ),
+        seed=9,
+        val_ratio=0,
+    )
+    snapshot = build_integer_snapshot(
+        plan, tmp_path / "backend", materializer({11: image_bytes("JPEG")})
+    )
+    manifest = json.loads(snapshot.manifest_json)
+    assert manifest["source_schema"] == "bcs-source-v1"
+    assert manifest["records"][0]["evidence_id"] == 11
+    assert "record_id" not in manifest["records"][0]
+    assert load_integer_snapshot_manifest(snapshot.output_root / "manifest.json") == manifest
+
+
+def test_local_manifest_is_deterministic_and_rejects_variant_tampering(tmp_path: Path):
+    plan, scan = local_split_plan(tmp_path)
+    first = build_integer_snapshot(
+        plan, tmp_path / "one", LocalSourceMaterializer(scan)
+    )
+    second = build_integer_snapshot(
+        plan, tmp_path / "two", LocalSourceMaterializer(scan)
+    )
+    assert first.manifest_json == second.manifest_json
+    manifest = json.loads(first.manifest_json)
+    for tamper in (
+        lambda value: value.update(mapping={"3.25": 3}),
+        lambda value: value.update(observed_classes=[3]),
+        lambda value: value.update(source_schema="bcs-source-v1"),
+        lambda value: value.pop("identity_scheme"),
+        lambda value: value["records"][0].update(evidence_id=1),
+        lambda value: value["records"][0]["provenance"][0].update(source_label="5"),
+        lambda value: value["records"][0].update(relative_path="../escape.jpg"),
+        lambda value: value["split_plan"].update(candidate_record_ids=[]),
+        lambda value: value.update(unexpected=None),
+    ):
+        changed = json.loads(json.dumps(manifest))
+        tamper(changed)
+        with pytest.raises(IntegerSnapshotManifestValidationError):
+            load_integer_snapshot_manifest(changed)
+
+
+def test_local_materializer_failure_cleans_transaction_and_leaks_no_root(tmp_path: Path):
+    plan, scan = local_split_plan(tmp_path)
+    (scan.root / "3.25" / "cow.jpg").write_bytes(b"replacement")
+    with pytest.raises(IntegerSnapshotMaterializationError) as failure:
+        build_integer_snapshot(plan, tmp_path / "local-failure", LocalSourceMaterializer(scan))
+    assert str(scan.root) not in str(failure.value)
+    assert not (tmp_path / "local-failure").exists()
+    assert not list(tmp_path.glob(".local-failure.staging-*"))
 
 
 def test_builds_jpeg_png_layout_manifest_counts_and_safe_provenance(tmp_path: Path):

@@ -8,23 +8,31 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable
+import unicodedata
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Protocol
 
 from PIL import Image
 
 from vacca_vision.image_validation import (
+    SUPPORTED_EXTENSIONS,
     SUPPORTED_FORMATS,
     ImageValidationConfig,
     _validate_dimensions,
 )
 
 from .source_client import BCSEvidencePayload
-from .source_plan import SourceExclusion, SourceProvenance
+from .local_source import LOCAL_BCS_MAPPING, LocalSourceMaterialized
+from .source_plan import (
+    BackendSourceProvenance,
+    LocalSourceProvenance,
+    SourceExclusion,
+    SourceProvenance,
+)
 from .source_split_plan import (
     IntegerSplitAssignment,
     IntegerSplitCounts,
@@ -79,6 +87,23 @@ _SPLIT_KEYS = frozenset(
 _COUNT_KEYS = frozenset(SPLITS)
 _RECORD_KEYS = frozenset(
     {"split", "bcs_score", "evidence_id", "relative_path", "sha256", "provenance"}
+)
+_LOCAL_MANIFEST_KEYS = _MANIFEST_KEYS | frozenset(
+    {"identity_scheme", "mapping", "observed_classes"}
+)
+_LOCAL_RECORD_KEYS = frozenset(
+    {"split", "bcs_score", "record_id", "relative_path", "sha256", "provenance"}
+)
+_LOCAL_PROVENANCE_KEYS = frozenset({"relative_path", "source_label"})
+_LOCAL_SPLIT_KEYS = frozenset(
+    {
+        "identity_digest",
+        "seed",
+        "canonical_val_ratio",
+        "candidate_record_ids",
+        "excluded_record_ids",
+        "counts",
+    }
 )
 _PROVENANCE_KEYS = frozenset({"evidence_id", "evaluation_id"})
 _EXCLUSION_KEYS = frozenset({"evaluation_id", "evidence_id", "bcs_score", "reason"})
@@ -142,17 +167,19 @@ class IntegerSnapshotManifestValidationError(IntegerSnapshotManifestError):
 
 
 class IntegerEvidenceMaterializer(Protocol):
-    def materialize(self, evidence_id: int) -> BCSEvidencePayload: ...
+    def materialize(self, identity: int | str) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
 class IntegerSnapshotRecord:
     split: str
     bcs_score: int
-    evidence_id: int
+    evidence_id: int | None
     relative_path: str
     sha256: str
-    provenance: tuple[SourceProvenance, ...]
+    provenance: tuple[SourceProvenance | BackendSourceProvenance | LocalSourceProvenance, ...]
+    record_id: str = ""
+    source_schema: str = SOURCE_SCHEMA_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,14 +215,14 @@ def _validate_image(payload: bytes) -> str:
 
 
 def _materialize(
-    materializer: Callable[[int], BCSEvidencePayload] | IntegerEvidenceMaterializer,
-    evidence_id: int,
-) -> BCSEvidencePayload:
+    materializer: object, assignment: IntegerSplitAssignment
+) -> tuple[bytes, str]:
+    identity = assignment.evidence_id if assignment.evidence_id is not None else assignment.record_id
     try:
         payload = (
-            materializer(evidence_id)
+            materializer(identity)
             if callable(materializer)
-            else materializer.materialize(evidence_id)
+            else materializer.materialize(identity)
         )
     except IntegerSnapshotError:
         raise
@@ -203,15 +230,17 @@ def _materialize(
         raise IntegerSnapshotMaterializationError(
             "failed to materialize evidence"
         ) from None
-    if type(payload) is not BCSEvidencePayload or payload.evidence_id != evidence_id:
-        raise IntegerSnapshotMaterializationError(
-            "materialized evidence identity mismatch"
-        )
-    if hashlib.sha256(payload.payload).hexdigest() != payload.sha256:
-        raise IntegerSnapshotMaterializationError(
-            "materialized evidence digest mismatch"
-        )
-    return payload
+    if assignment.evidence_id is not None:
+        if type(payload) is not BCSEvidencePayload or payload.evidence_id != identity:
+            raise IntegerSnapshotMaterializationError("materialized evidence identity mismatch")
+        content, digest = payload.payload, payload.sha256
+    else:
+        if type(payload) is not LocalSourceMaterialized or payload.record_id != identity:
+            raise IntegerSnapshotMaterializationError("materialized source identity mismatch")
+        content, digest = payload.payload, payload.sha256
+    if hashlib.sha256(content).hexdigest() != digest:
+        raise IntegerSnapshotMaterializationError("materialized source digest mismatch")
+    return content, digest
 
 
 def _write_file(path: Path, content: bytes) -> None:
@@ -302,7 +331,12 @@ def _manifest(
     plan: IntegerSplitPlan, records: tuple[IntegerSnapshotRecord, ...]
 ) -> str:
     counts = {"train": list(plan.counts.train), "val": list(plan.counts.val)}
-    record_ids = sorted(record.evidence_id for record in records)
+    local = plan.identity.source_schema == "bcs-local-folder-v1"
+    record_ids = (
+        sorted(record.record_id for record in records)
+        if local
+        else sorted(record.evidence_id for record in records)
+    )
     excluded_ids = sorted(item.evidence_id for item in plan.exclusions)
     payload = {
         "class_mapping": {
@@ -321,7 +355,24 @@ def _manifest(
         "manifest_schema_version": SNAPSHOT_SCHEMA_VERSION,
         "num_classes": NUM_CLASSES,
         "num_thresholds": NUM_THRESHOLDS,
-        "records": [asdict(item) for item in records],
+            "records": (
+                []
+                if local
+                else [
+                    {
+                        "split": item.split,
+                        "bcs_score": item.bcs_score,
+                        "evidence_id": item.evidence_id,
+                        "relative_path": item.relative_path,
+                        "sha256": item.sha256,
+                        "provenance": [
+                            {"evidence_id": value.evidence_id, "evaluation_id": value.evaluation_id}
+                            for value in item.provenance
+                        ],
+                    }
+                    for item in records
+                ]
+            ),
         "score_base": SCORE_BASE,
         "score_max": SCORE_MAX,
         "score_min": SCORE_MIN,
@@ -336,6 +387,31 @@ def _manifest(
             "canonical_val_ratio": plan.identity.canonical_val_ratio,
         },
     }
+    if plan.identity.source_schema == "bcs-local-folder-v1":
+        payload["source_schema"] = plan.identity.source_schema
+        payload["identity_scheme"] = plan.identity.identity_scheme
+        payload["mapping"] = dict(LOCAL_BCS_MAPPING.entries)
+        payload["observed_classes"] = list(plan.identity.observed_classes)
+        payload["records"] = [
+            {
+                "split": item.split,
+                "bcs_score": item.bcs_score,
+                "record_id": item.record_id,
+                "relative_path": item.relative_path,
+                "sha256": item.sha256,
+                "provenance": [asdict(value) for value in item.provenance],
+            }
+            for item in records
+        ]
+        payload["split_plan"] = {
+            "candidate_record_ids": sorted(item.record_id for item in records),
+            "excluded_record_ids": [],
+            "identity_digest": plan.identity.digest,
+            "seed": plan.config.seed,
+            "canonical_val_ratio": plan.identity.canonical_val_ratio,
+            "counts": counts,
+        }
+        payload["exclusions"] = []
     return json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
 
 
@@ -371,6 +447,103 @@ def _valid_canonical_ratio(value: object) -> bool:
     return value == canonical
 
 
+def _validate_local_manifest(payload: dict[str, object]) -> dict[str, object]:
+    manifest = _require_keys(payload, _LOCAL_MANIFEST_KEYS)
+    expected_mapping = dict(LOCAL_BCS_MAPPING.entries)
+    expected_classes = {str(score): index for index, score in enumerate(BCS_CLASS_SCORES)}
+    if (
+        manifest["manifest_schema_version"] != SNAPSHOT_SCHEMA_VERSION
+        or manifest["domain_id"] != BCS_DOMAIN_ID
+        or manifest["source_schema"] != "bcs-local-folder-v1"
+        or manifest["identity_scheme"] != "local-path-sha256-v1"
+        or manifest["mapping"] != expected_mapping
+        or manifest["observed_classes"] != [3, 4]
+        or manifest["class_values"] != list(BCS_CLASS_SCORES)
+        or manifest["class_mapping"] != expected_classes
+    ):
+        raise _manifest_failure("local snapshot lineage is invalid")
+    if (
+        type(manifest["observed_classes"]) is not list
+        or any(type(item) is not int for item in manifest["observed_classes"])
+        or type(manifest["mapping"]) is not dict
+        or any(type(key) is not str or type(value) is not int for key, value in manifest["mapping"].items())
+        or type(manifest["class_mapping"]) is not dict
+        or any(type(key) is not str or type(value) is not int for key, value in manifest["class_mapping"].items())
+    ):
+        raise _manifest_failure("local snapshot lineage is invalid")
+    for field, expected in (
+        ("score_min", SCORE_MIN), ("score_max", SCORE_MAX),
+        ("score_base", SCORE_BASE), ("score_step", SCORE_STEP),
+        ("num_classes", NUM_CLASSES), ("num_thresholds", NUM_THRESHOLDS),
+    ):
+        if type(manifest[field]) is not int or manifest[field] != expected:
+            raise _manifest_failure("snapshot manifest scale does not match the domain")
+    counts = _validate_counts(manifest["counts"])
+    split_plan = _require_keys(manifest["split_plan"], _LOCAL_SPLIT_KEYS)
+    if (
+        not _valid_digest(split_plan["identity_digest"])
+        or type(split_plan["seed"]) is not int
+        or not _valid_canonical_ratio(split_plan["canonical_val_ratio"])
+        or split_plan["counts"] != counts
+    ):
+        raise _manifest_failure("local snapshot split identity is invalid")
+    split_counts = _validate_counts(split_plan["counts"])
+    if split_counts != counts:
+        raise _manifest_failure("local snapshot split counts are inconsistent")
+    records = manifest["records"]
+    if type(records) is not list or manifest["exclusions"] != []:
+        raise _manifest_failure("local snapshot lineage lists are invalid")
+    record_ids: list[str] = []
+    paths: set[str] = set()
+    actual_counts = {split: [0] * NUM_CLASSES for split in SPLITS}
+    sort_keys: list[tuple[int, int, str]] = []
+    for record in records:
+        item = _require_keys(record, _LOCAL_RECORD_KEYS)
+        split, score, identifier = item["split"], item["bcs_score"], item["record_id"]
+        if (
+            type(split) is not str or split not in SPLITS
+            or type(score) is not int or score not in BCS_CLASS_SCORES
+            or not _valid_digest(identifier) or not _valid_digest(item["sha256"])
+            or type(item["relative_path"]) is not str
+            or re.fullmatch(rf"(?:train|val)/{score}/{identifier}\.(?:jpg|png)", item["relative_path"]) is None
+        ):
+            raise _manifest_failure("local snapshot record is invalid")
+        path_key = item["relative_path"].casefold()
+        if identifier in record_ids or path_key in paths:
+            raise _manifest_failure("local snapshot records are not unique")
+        raw_provenance = item["provenance"]
+        if type(raw_provenance) is not list or len(raw_provenance) != 1:
+            raise _manifest_failure("local snapshot provenance is invalid")
+        provenance = _require_keys(raw_provenance[0], _LOCAL_PROVENANCE_KEYS)
+        source_path, source_label = provenance["relative_path"], provenance["source_label"]
+        source_parts = PurePosixPath(source_path).parts if type(source_path) is str else ()
+        if (
+            type(source_path) is not str or type(source_label) is not str
+            or "\\" in source_path or PurePosixPath(source_path).is_absolute()
+            or any(part in {"", ".", ".."} for part in source_parts)
+            or source_path != unicodedata.normalize("NFC", source_path)
+            or source_parts[:1] != (source_label,)
+            or len(source_parts) != 2
+            or Path(source_path).suffix.casefold() not in SUPPORTED_EXTENSIONS
+            or source_label not in dict(LOCAL_BCS_MAPPING.entries)
+            or identifier != hashlib.sha256(f"bcs-local-folder-v1\0{source_path}".encode()).hexdigest()
+        ):
+            raise _manifest_failure("local snapshot provenance is invalid")
+        record_ids.append(identifier)
+        paths.add(path_key)
+        actual_counts[split][score - SCORE_MIN] += 1
+        sort_keys.append((score, 0 if split == "train" else 1, identifier))
+    if sort_keys != sorted(sort_keys) or actual_counts != counts:
+        raise _manifest_failure("local snapshot records are not deterministic")
+    candidates, excluded = split_plan["candidate_record_ids"], split_plan["excluded_record_ids"]
+    if (
+        type(candidates) is not list or candidates != sorted(record_ids)
+        or type(excluded) is not list or excluded != []
+    ):
+        raise _manifest_failure("local snapshot split identity is inconsistent")
+    return payload
+
+
 def _validate_counts(value: object) -> dict[str, list[int]]:
     counts = _require_keys(value, _COUNT_KEYS)
     normalized: dict[str, list[int]] = {}
@@ -398,6 +571,8 @@ def validate_integer_snapshot_manifest(payload: object) -> dict[str, object]:
     if type(payload) is not dict:
         raise _manifest_failure("snapshot manifest must be an object", schema=True)
     version = payload.get("manifest_schema_version")
+    if payload.get("source_schema") == "bcs-local-folder-v1":
+        return _validate_local_manifest(payload)
     class_values = payload.get("class_values")
     if version == "bcs-integer-snapshot-v1" or (
         type(class_values) is list
@@ -550,12 +725,13 @@ def load_integer_snapshot_manifest(path: Path | str | object) -> dict[str, objec
 
 
 def _check_assignment(assignment: IntegerSplitAssignment) -> None:
-    expected = f"{assignment.split}/{assignment.bcs_score}/{assignment.evidence_id}"
+    identity = assignment.evidence_id if assignment.evidence_id is not None else assignment.record_id
+    expected = f"{assignment.split}/{assignment.bcs_score}/{identity}"
     if (
         assignment.split not in {"train", "val"}
         or not 1 <= assignment.bcs_score <= 5
-        or type(assignment.evidence_id) is not int
-        or assignment.evidence_id <= 0
+        or (assignment.evidence_id is None and not _valid_digest(assignment.record_id))
+        or (assignment.evidence_id is not None and (type(assignment.evidence_id) is not int or assignment.evidence_id <= 0))
         or assignment.relative_path_stem != expected
     ):
         raise IntegerSnapshotInputError("split plan contains an invalid assignment")
@@ -564,13 +740,19 @@ def _check_assignment(assignment: IntegerSplitAssignment) -> None:
 def build_integer_snapshot(
     plan: IntegerSplitPlan,
     output_root: Path,
-    materializer: Callable[[int], BCSEvidencePayload] | IntegerEvidenceMaterializer,
+    materializer: object,
 ) -> IntegerDatasetSnapshot:
     """Materialize and atomically publish one immutable integer snapshot."""
     if not isinstance(plan, IntegerSplitPlan):
         raise IntegerSnapshotInputError("input must be an integer split plan")
     validate_integer_split_plan(plan)
     validate_integer_split_plan(plan)
+    if plan.identity.source_schema == "bcs-local-folder-v1" and (
+        plan.identity.identity_scheme != "local-path-sha256-v1"
+        or plan.identity.mapping_lineage != LOCAL_BCS_MAPPING.entries
+        or plan.identity.observed_classes != (3, 4)
+    ):
+        raise IntegerSnapshotInputError("local split plan source lineage is invalid")
     output_root = Path(output_root)
     if os.path.lexists(output_root):
         raise IntegerSnapshotOutputError("output root already exists")
@@ -578,7 +760,7 @@ def build_integer_snapshot(
     lock = _acquire_lock(output_root)
     staging: Path | None = None
     records: list[IntegerSnapshotRecord] = []
-    seen: set[int] = set()
+    seen: set[str | int] = set()
     try:
         if os.path.lexists(output_root):
             raise IntegerSnapshotOutputError("output root already exists")
@@ -592,24 +774,27 @@ def build_integer_snapshot(
                 (staging / split / str(score)).mkdir(parents=True, exist_ok=True)
         for assignment in plan.assignments:
             _check_assignment(assignment)
-            if assignment.evidence_id in seen:
+            identity = assignment.evidence_id if assignment.evidence_id is not None else assignment.record_id
+            if identity in seen:
                 raise IntegerSnapshotInputError(
-                    "split plan contains duplicate evidence IDs"
+                    "split plan contains duplicate source record IDs"
                 )
-            seen.add(assignment.evidence_id)
-            payload = _materialize(materializer, assignment.evidence_id)
-            extension = _validate_image(payload.payload)
+            seen.add(identity)
+            payload, digest = _materialize(materializer, assignment)
+            extension = _validate_image(payload)
             relative_path = f"{assignment.relative_path_stem}{extension}"
             destination = staging / Path(relative_path)
-            _write_file(destination, payload.payload)
+            _write_file(destination, payload)
             records.append(
                 IntegerSnapshotRecord(
                     assignment.split,
                     assignment.bcs_score,
                     assignment.evidence_id,
                     relative_path,
-                    payload.sha256,
+                    digest,
                     assignment.provenance,
+                    assignment.record_id,
+                    plan.identity.source_schema,
                 )
             )
         records_tuple = tuple(records)
