@@ -14,8 +14,11 @@ from typing import TextIO
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-SNAPSHOT_RELATIVE = Path("data/bcs-integer-v1")
-OUTPUT_RELATIVE = Path("outputs/bcs-ordinal-integer-v1")
+LOCAL_ROOT_RELATIVE = Path("data/bcs/dataset")
+LOCAL_SNAPSHOT_RELATIVE = Path("data/bcs-local-integer-v1")
+LOCAL_OUTPUT_RELATIVE = Path("outputs/bcs-ordinal-local-integer-v1")
+BACKEND_SNAPSHOT_RELATIVE = Path("data/bcs-integer-v1")
+BACKEND_OUTPUT_RELATIVE = Path("outputs/bcs-ordinal-integer-v1")
 CONFIG_RELATIVE = Path("configs/training_bcs_ordinal.yaml")
 MANIFEST_NAME = "manifest.json"
 LAST_CHECKPOINT = Path("weights/last.pt")
@@ -31,6 +34,8 @@ class OvernightError(RuntimeError):
 class Plan:
     root: Path
     config: Path
+    source: str
+    local_root: Path | None
     snapshot: Path
     output: Path
     checkpoint: Path
@@ -43,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Preflight and run the integer BCS snapshot/training workflow"
     )
+    parser.add_argument("--source", choices=("local", "backend"), default="local")
+    parser.add_argument("--local-root", default=str(LOCAL_ROOT_RELATIVE))
     parser.add_argument("--config", default=str(CONFIG_RELATIVE))
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -89,12 +96,23 @@ def preflight(
     _require_path(root / "scripts" / "build_bcs_integer.py", "snapshot builder")
     _require_path(root / "scripts" / "train_bcs_ordinal.py", "ordinal trainer")
     values = _load_config(config)
-    snapshot = (root / SNAPSHOT_RELATIVE).resolve()
-    output = (root / OUTPUT_RELATIVE).resolve()
-    for key, expected in (("data_dir", snapshot), ("output", output)):
+    local_snapshot = (root / LOCAL_SNAPSHOT_RELATIVE).resolve()
+    local_output = (root / LOCAL_OUTPUT_RELATIVE).resolve()
+    for key, expected in (("data_root", local_snapshot), ("output_dir", local_output)):
         raw = values.get(key)
         if not isinstance(raw, str) or _path(raw, root) != expected:
             raise OvernightError(f"training config {key} disagrees with the canonical root")
+    if args.source == "backend" and _path(args.local_root, root) != root / LOCAL_ROOT_RELATIVE:
+        raise OvernightError("--local-root is only valid for local source")
+    if args.source == "local":
+        local_root = _path(args.local_root, root)
+        if not local_root.is_dir():
+            raise OvernightError("local source root is missing")
+        snapshot, output = local_snapshot, local_output
+    else:
+        local_root = None
+        snapshot = (root / BACKEND_SNAPSHOT_RELATIVE).resolve()
+        output = (root / BACKEND_OUTPUT_RELATIVE).resolve()
 
     if args.resume and not args.skip_build:
         raise OvernightError("--resume requires --skip-build")
@@ -112,7 +130,7 @@ def preflight(
             raise OvernightError("--resume requires results_lineage.json")
     elif output.exists():
         raise OvernightError("canonical training output already exists; fresh runs refuse stale artifacts")
-    if not args.skip_build:
+    if not args.skip_build and args.source == "backend":
         env = _environment(environment)
         if not env.get("VACCA_BACKEND_URL", "").strip():
             raise OvernightError("VACCA_BACKEND_URL is required for the snapshot build")
@@ -121,6 +139,8 @@ def preflight(
     return Plan(
         root=root,
         config=config,
+        source=args.source,
+        local_root=local_root,
         snapshot=snapshot,
         output=output,
         checkpoint=output / LAST_CHECKPOINT,
@@ -208,9 +228,18 @@ def run(
     build_log = run_dir / "build.log"
     train_log = run_dir / "train.log"
     if not plan.skip_build:
+        command = [
+            sys.executable,
+            str(plan.root / "scripts" / "build_bcs_integer.py"),
+            "--source",
+            plan.source,
+        ]
+        if plan.source == "local":
+            command.extend(("--local-root", str(plan.local_root)))
+        command.extend(("--output", str(plan.snapshot)))
         _step(
             "snapshot build",
-            [sys.executable, str(plan.root / "scripts" / "build_bcs_integer.py"), "--output", str(plan.snapshot)],
+            command,
             plan=plan,
             environment=env,
             runner=runner,
@@ -222,6 +251,8 @@ def run(
         "--config",
         str(plan.config),
     ]
+    if plan.source == "backend":
+        command.extend(("--data-dir", str(plan.snapshot), "--output", str(plan.output)))
     if plan.resume:
         command.extend(("--resume", str(plan.checkpoint)))
     _step("ordinal training", command, plan=plan, environment=env, runner=runner, log_path=train_log)
