@@ -91,7 +91,21 @@ El servidor levanta en `http://127.0.0.1:8000` con estos endpoints:
 
 ### Opción 1: UI web (recomendado para validar)
 
-Abrí `http://127.0.0.1:8000/ui` en el navegador, arrastrá una imagen y ves las detecciones con bounding boxes dibujados en tiempo real.
+Arrancá la API y abrí `http://127.0.0.1:8000/ui` en el navegador:
+
+```powershell
+# BCS es opcional; sin esta variable la pestaña BCS muestra "unconfigured".
+# Sólo configurala cuando exista un checkpoint real compatible.
+$env:VACCA_BCS_CHECKPOINT = "C:\secure\models\bcs-ordinal-integer-checkpoint-v1.pt"
+.venv\Scripts\python scripts/run_api.py
+```
+
+Después arrastrá una imagen o seleccioná un archivo. La pestaña `Detect` conserva
+el envío automático y dibuja bounding boxes; la pestaña `BCS` consulta
+`/ready/bcs` al abrirse y sólo envía la imagen a `/bcs` al pulsar `Calculate BCS`.
+El checkpoint BCS real todavía no existe en este checkout: sin configuración la
+UI muestra honestamente `unconfigured` y mantiene el cálculo deshabilitado. Las
+pruebas de API usan un runtime falso controlado; no sustituyen un checkpoint real.
 
 > ⚠ La UI es un prototipo para validación. Para producción, borrá `src/vacca_api/static/index.html` y la ruta `/ui` de `main.py`.
 

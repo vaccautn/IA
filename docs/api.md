@@ -67,6 +67,30 @@ FastAPI agrega `/docs`, `/redoc` y `/openapi.json`. El OpenAPI declara el body
 exitoso de cada ruta y el body de readiness `503`; los errores de operación
 `/bcs` usan el body estándar de FastAPI `{"detail":"..."}`.
 
+## UI de prototipo (`GET /ui`)
+
+La UI conserva la detección automática en la pestaña `Detect` y comparte la imagen
+seleccionada con la pestaña `BCS`. BCS no se ejecuta al seleccionar una imagen:
+requiere pulsar `Calculate BCS`. Al seleccionar la pestaña se consulta
+`/ready/bcs`; `ready` y `not_loaded` habilitan el cálculo, mientras que
+`unconfigured` y `unavailable` lo mantienen deshabilitado. Los errores de las
+rutas se muestran con mensajes sanitizados y el score exitoso se presenta como un
+entero `1..5`, sin confianza; `cow_detected: null` se muestra como `Not reported`.
+
+El checkpoint BCS real todavía no está presente. Por eso una ejecución sin
+`VACCA_BCS_CHECKPOINT` debe mostrar `unconfigured` y no debe interpretarse como un
+score. Para probar la UI con una capacidad real, configurá únicamente un
+checkpoint compatible y arrancá la API:
+
+```powershell
+$env:VACCA_BCS_CHECKPOINT = "C:\secure\models\bcs-ordinal-integer-checkpoint-v1.pt"
+$env:VACCA_BCS_DEVICE = "cpu" # opcional
+.venv\Scripts\python scripts/run_api.py
+```
+
+Abrí luego `http://127.0.0.1:8000/ui`. El runtime falso se usa sólo en las pruebas
+deterministas; no se incluye ni se afirma un modelo BCS real.
+
 `/health` y `/detect` no consultan el runtime BCS. `/bcs` no ejecuta YOLO ni
 recorta la imagen: recibe la imagen completa y usa el servicio ordinal.
 
