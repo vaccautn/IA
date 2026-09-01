@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sys
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
@@ -20,25 +21,55 @@ DEFAULT_MAX_IMAGE_BYTES = 16 * 1024 * 1024
 
 sys.path.insert(0, str(ROOT / "src"))
 
-from vacca_bcs.integer_snapshot import build_integer_snapshot  # noqa: E402
+from vacca_bcs.integer_snapshot import (  # noqa: E402
+    IntegerSnapshotError,
+    build_integer_snapshot,
+)
 from vacca_bcs.local_source import (  # noqa: E402
     LOCAL_BCS_MAPPING,
+    LocalSourceError,
     LocalSourceMaterializer,
     scan_local_source,
 )
 from vacca_bcs.source_client import (  # noqa: E402
     BCSEvidenceMaterializer,
     BCSSourceClient,
+    BCSSourceClientError,
 )
 from vacca_bcs.source_plan import (  # noqa: E402
+    SourcePlanError,
     normalize_backend_source_export,
     normalize_local_source_scan,
 )
-from vacca_bcs.source_split_plan import create_integer_split_plan  # noqa: E402
-
-
+from vacca_bcs.source_split_plan import (  # noqa: E402
+    IntegerSplitPlanError,
+    create_integer_split_plan,
+)
 class IntegerBuildCLIError(ValueError):
     """Raised for safe, operator-facing CLI failures."""
+
+
+_TYPED_ERROR_CATEGORIES = (
+    (LocalSourceError, "local-source"),
+    (BCSSourceClientError, "source-client"),
+    (SourcePlanError, "source-plan"),
+    (IntegerSplitPlanError, "split-plan"),
+    (IntegerSnapshotError, "snapshot"),
+)
+
+
+def _report_failure(error: Exception, stream: TextIO) -> None:
+    for error_type, category in _TYPED_ERROR_CATEGORIES:
+        if isinstance(error, error_type):
+            print(f"ERROR [{category}]: {error}", file=stream)
+            return
+    correlation_id = uuid.uuid4().hex[:12]
+    print(
+        "ERROR [unexpected]: "
+        f"{type(error).__name__}; correlation_id={correlation_id}; "
+        "inspect the local operator log for details",
+        file=stream,
+    )
 
 
 def _finite_ratio(value: str) -> float:
@@ -210,8 +241,8 @@ def main(
     except IntegerBuildCLIError as error:
         print(f"ERROR: {error}", file=stderr or sys.stderr)
         return 1
-    except Exception:
-        print("ERROR: integer snapshot build failed", file=stderr or sys.stderr)
+    except Exception as error:
+        _report_failure(error, stderr or sys.stderr)
         return 1
     print(json.dumps(_summary(snapshot), indent=2, sort_keys=True), file=stdout or sys.stdout)
     return 0

@@ -68,7 +68,7 @@ def test_unexpected_layout_is_rejected(tmp_path, kind):
         scan_local_source(tmp_path)
 
 
-def test_casefold_nfc_and_digest_collisions_are_rejected(tmp_path):
+def test_casefold_nfc_and_cross_class_digest_collisions_are_rejected(tmp_path):
     make_file(tmp_path, "3.25", "Cow.jpg", b"one")
     make_file(tmp_path, "3.25", "cow.JPG", b"two")
     if (tmp_path / "3.25" / "Cow.jpg").read_bytes() == b"one":
@@ -85,8 +85,14 @@ def test_casefold_nfc_and_digest_collisions_are_rejected(tmp_path):
     digest_root = tmp_path / "digest"
     make_file(digest_root, "3.25", "a.jpg")
     make_file(digest_root, "3.25", "b.jpg")
-    with pytest.raises(LocalSourceCollisionError):
-        scan_local_source(digest_root, digest_fn=lambda path: "0" * 64)
+    same_class = scan_local_source(digest_root, digest_fn=lambda path: "0" * 64)
+    assert len(same_class.records) == 2
+
+    cross_class = tmp_path / "cross-class-digest"
+    make_file(cross_class, "3.25", "a.jpg")
+    make_file(cross_class, "4.0", "b.jpg")
+    with pytest.raises(LocalSourceCollisionError, match="across BCS classes"):
+        scan_local_source(cross_class, digest_fn=lambda path: "0" * 64)
 
     id_root = tmp_path / "record-id"
     make_file(id_root, "3.25", "a.jpg")

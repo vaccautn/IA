@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from vacca_bcs.source_client import (
@@ -14,7 +15,12 @@ from vacca_bcs.source_client import (
     BCSSourceExport,
     SCHEMA_VERSION,
 )
+from vacca_bcs.integer_snapshot import IntegerSnapshotMaterializationError
 from vacca_bcs.local_source import LOCAL_BCS_MAPPING
+from vacca_bcs.local_source import LocalSourceScanError
+from vacca_bcs.source_plan import SourcePlanIntegrityError
+from vacca_bcs.source_split_plan import IntegerSplitInputError
+from scripts import build_bcs_integer
 
 from scripts.build_bcs_integer import DEFAULT_LOCAL_OUTPUT, ROOT, build_parser, main, run
 
@@ -217,6 +223,41 @@ def test_main_sanitizes_client_materializer_snapshot_and_existing_root_failures(
         stderr=error,
     ) == 1
     assert "private-token" not in error.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    (
+        (LocalSourceScanError("safe scan detail"), "local-source"),
+        (SourcePlanIntegrityError("safe plan detail"), "source-plan"),
+        (IntegerSplitInputError("safe split detail"), "split-plan"),
+        (IntegerSnapshotMaterializationError("safe snapshot detail"), "snapshot"),
+    ),
+)
+def test_main_reports_typed_failures_with_safe_categories(failure, category, monkeypatch):
+    monkeypatch.setattr(build_bcs_integer, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(failure))
+    error = io.StringIO()
+
+    assert main([], stderr=error) == 1
+    assert f"ERROR [{category}]:" in error.getvalue()
+    assert str(failure) in error.getvalue()
+
+
+def test_main_reports_unexpected_failure_with_class_and_correlation_guidance(monkeypatch):
+    monkeypatch.setattr(
+        build_bcs_integer,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("storage-key-and-token")
+        ),
+    )
+    error = io.StringIO()
+
+    assert main([], stderr=error) == 1
+    rendered = error.getvalue()
+    assert "ERROR [unexpected]: RuntimeError" in rendered
+    assert "correlation_id=" in rendered
+    assert "storage-key-and-token" not in rendered
 
 
 def test_parser_exposes_deterministic_operator_controls_without_token_argument() -> None:

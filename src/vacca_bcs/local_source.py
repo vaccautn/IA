@@ -165,9 +165,12 @@ def scan_local_source(root: str | Path, mapping: LocalSourceMapping | Mapping[st
             raise LocalSourceScanError("local source digest failed") from None
         if type(digest) is not str or not _DIGEST_RE.fullmatch(digest):
             raise LocalSourceScanError("local source digest is invalid")
-        if digest in digests:
-            raise LocalSourceCollisionError(f"duplicate local source content: {relative}")
-        digests[digest] = relative
+        previous = digests.get(digest)
+        if previous is not None and previous[1] != labels[label]:
+            raise LocalSourceCollisionError(
+                f"duplicate local source content across BCS classes: {relative}"
+            )
+        digests[digest] = (relative, labels[label])
         identifier = record_id_fn(relative)
         if type(identifier) is not str or not _DIGEST_RE.fullmatch(identifier):
             raise LocalSourceScanError("local source record ID is invalid")
