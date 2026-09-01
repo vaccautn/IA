@@ -1,4 +1,5 @@
-# VACCA Phase 2 — ordinal Body Condition Score training
+# VACCA Phase 2 — local ordinal BCS training; 3.25/3.5→3 and 3.75/4.0/4.25→4.
+# The model remains five-class (1..5); missing 1, 2, and 5 are not validated.
 data_root: data/bcs-local-integer-v1
 output_dir: outputs/bcs-ordinal-local-integer-v1
 allow_partial_class_coverage: true

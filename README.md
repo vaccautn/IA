@@ -177,34 +177,41 @@ The supported Phase 2 workflow has exactly three stages:
 
 1. **Source:** use the local `bcs-local-folder-v1` folders by default, or select the authenticated backend export explicitly.
 2. **Integer snapshot v2:** normalize the selected source, create the deterministic split, materialize records, and publish a transactional snapshot.
-3. **Trainer:** validate that snapshot and train the ordinal model with `scripts/train_bcs_ordinal.py` into `outputs/bcs-ordinal-integer-v1/`.
+3. **Trainer:** validate that snapshot and train the ordinal model with `scripts/train_bcs_ordinal.py` into the source-specific output root.
 
 ```powershell
-# Local source (default; no backend credentials or network)
-.venv\Scripts\python scripts/build_bcs_integer.py
+# Local source (default; no backend credentials, R2, or network)
+.venv\Scripts\python scripts/build_bcs_integer.py --source local --local-root data/bcs/dataset --output data/bcs-local-integer-v1
+.venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
 
-# Backend source (explicit; requires the authenticated export/R2 path)
+# Backend source (explicit future path; requires the authenticated export/R2 path)
 $env:VACCA_BACKEND_URL = "https://backend.example"
 $env:VACCA_BACKEND_TOKEN = "<token-from-your-secret-store>"
-.venv\Scripts\python scripts/build_bcs_integer.py --source backend
-.venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
+.venv\Scripts\python scripts/build_bcs_integer.py --source backend --output data/bcs-integer-v1
+.venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml --data-dir data/bcs-integer-v1 --output outputs/bcs-ordinal-integer-v1
 ```
 
-The builder defaults to `--local-root data/bcs/dataset` and output
+The local builder defaults to `--local-root data/bcs/dataset` and snapshot
 `data/bcs-local-integer-v1`; its fixed mapping is `3.25/3.5 → 3` and
-`3.75/4.0/4.25 → 4`. Backend mode preserves `data/bcs-integer-v1` and requires
-the backend source-export and signed-evidence endpoints. Both modes refuse an
-existing output root and report safe source counts and plan identity.
+`3.75/4.0/4.25 → 4`. The current folder source observes only classes `3` and `4`
+(`1`, `2`, and `5` have no source folder), so
+`[3, 4]` is documented coverage, not a five-class validation result. The model
+domain remains `1..5`; an initial checkpoint is valid only for this observed
+`3/4` coverage until classes `1`, `2`, and `5` are supplied. Backend mode keeps
+the distinct `data/bcs-integer-v1` and `outputs/bcs-ordinal-integer-v1` roots and
+is an optional future path requiring backend source-export and signed-evidence
+endpoints. Both modes refuse an existing output root and report safe counts.
 Use `--base-url` instead of `VACCA_BACKEND_URL` when appropriate, plus `--seed`,
 `--val-ratio`, `--timeout`, `--max-source-bytes`, and `--max-image-bytes` to make
 operational limits explicit. The token is read only from `VACCA_BACKEND_TOKEN`.
 The active domain is `bcs-integer-1-5` with classes `1..5`.
 
-The backend owns authentication and R2. IA sends the Bearer token only to the
+The local path needs no backend, R2, or token. The optional backend path has the
+backend owning authentication and R2; IA sends the Bearer token only to the
 backend, receives source metadata and signed evidence URLs, and downloads the
 evidence from those URLs without forwarding the token. Signed URLs are not
-retained. This workflow requires real backend access and is not run by the
-repository verification below.
+retained. Only the optional backend workflow requires real backend access; neither
+path is run by the repository verification below.
 
 Artifacts with an unsupported schema or stale lineage are rejected by the active
 loader and trainer. There is no conversion, fallback, or legacy workflow.
@@ -237,7 +244,7 @@ loaded, `/bcs` returns `503`; no end-user deployment is claimed.
 
 - Python 3.11 or later.
 - A `.venv` with the BCS dependencies installed (`.venv\Scripts\python -m pip install -e ".[bcs]"`).
-- A generated snapshot at `data/bcs-integer-v1/` with its v2 manifest validated before training.
+- A generated local snapshot at `data/bcs-local-integer-v1/` with its v2 manifest validated before training.
 - A fresh operational run may require ImageNet backbone weights; transition tests use `pretrained=False` and do not download models.
 
 Start an operational run with:
@@ -246,11 +253,13 @@ Start an operational run with:
 .venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
 ```
 
-The configured directory contains `results.csv`, `run_info.json`, `weights/best.pt`,
-and the resumable checkpoint `weights/last.pt`. A fresh run rejects existing
-artifacts; `--overwrite` allows replacement after validation. `--resume
-outputs/bcs-ordinal-integer-v1/weights/last.pt` requires compatible configuration,
-live manifest/dataset, snapshot identity, domain, and `run_id`.
+The local configured directory contains `results.csv`, `run_info.json`,
+`weights/best.pt`, and the resumable checkpoint `weights/last.pt`. A fresh run
+rejects existing artifacts; `--overwrite` allows replacement after validation.
+`--resume outputs/bcs-ordinal-local-integer-v1/weights/last.pt` requires
+compatible configuration, live manifest/dataset, snapshot identity, domain, and
+`run_id`. Serving validation preserves the five-class `1..5` model contract but
+the initial local checkpoint must be treated as validated only on classes `3,4`.
 
 ### Orquestación overnight (preparada, no ejecutada)
 
@@ -258,25 +267,25 @@ Valida rutas, entorno y artefactos antes de iniciar cualquier CLI; no inicia la 
 y conserva logs en el directorio ignorado `logs/bcs-overnight/`.
 
 ```powershell
-# Preflight (sin build, entrenamiento, red ni datos)
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --preflight-only
+# Preflight local (sin build, entrenamiento, red ni datos)
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --preflight-only
 # Noche nueva
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset
 # Reanudar (conserva el snapshot y usa weights/last.pt)
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --skip-build --resume
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --skip-build --resume
 ```
 Por la mañana, revisar el log y el `weights/best.pt` compatible; configurar el
 checkpoint, iniciar la API manualmente y verificar las dos rutas:
 
 ```powershell
-$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-integer-v1\weights\best.pt").Path
+$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-local-integer-v1\weights\best.pt").Path
 .venv\Scripts\python.exe scripts/run_api.py
 Invoke-RestMethod http://127.0.0.1:8000/ready/bcs
 Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs -Method Post -Form @{file=Get-Item "vaca.jpg"}
 ```
 
 Verification for this branch state: `.venv\Scripts\python.exe -m pytest -q`
-reports `435 passed, 2 skipped, 2 warnings, 65 subtests passed`. The warnings are the
+reports `479 passed, 3 skipped, 2 warnings, 65 subtests passed`. The warnings are the
 known FastAPI `on_event` deprecations. This verification did not access real BCS
 data, outputs, model weights, or run training.
 
@@ -313,15 +322,19 @@ IA/
 │   ├── build_combined_v2.py ← Separate Phase 1 combined dataset
 │   ├── build_bcs_integer.py ← Source export to integer snapshot v2
 │   ├── train_bcs_ordinal.py ← Integer ordinal trainer
+│   ├── run_bcs_overnight.py ← Local/backend overnight operator
 │   ├── run_baseline.py       ← Reproducible Phase 1 baseline
 │   ├── run_api.py           ← API server launcher
 │   └── smoke_test_api.py    ← Comprobación directa de detector/esquemas
 ├── configs/                 ← YAMLs de entrenamiento
 ├── data/                    ← (gitignored)
+│   ├── bcs/dataset/         ← Local fractional source folders
+│   ├── bcs-local-integer-v1/ ← Local integer snapshot root
 │   ├── bcs-integer-v1/      ← Canonical integer snapshot root
 │   ├── combined/            ← Phase 1 dataset v1
 │   └── combined-v2/         ← Phase 1 dataset v2
 ├── outputs/
+│   ├── bcs-ordinal-local-integer-v1/ ← Local trainer root
 │   ├── bcs-ordinal-integer-v1/ ← Canonical integer trainer root
 │   └── training/             ← Phase 1 training outputs
 ├── models/deploy/           ← Versioned Phase 1 deployment model

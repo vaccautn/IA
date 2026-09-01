@@ -43,26 +43,27 @@ Detalles comprobables en el código:
 
 El endpoint HTTP no usa `AptitudePipeline`, `ImageValidationConfig` ni `ClassificationResult` de `vacca_vision`. Ese camino desacoplado se usa desde `scripts/run_baseline.py` y tiene sus propios contratos y pruebas.
 
-## Integer BCS source-to-training flow
+## Integer BCS source-to-training flows
 
 ```text
-authenticated bcs-source-v1 export
+data/bcs/dataset
+    ↓ local folder mapping
+data/bcs-local-integer-v1/ → train_bcs_ordinal.py
     ↓
-normalize export → deterministic integer split plan
-    ↓
-signed evidence materialization → bcs-integer-snapshot-v2 manifest
-    ↓
-data/bcs-integer-v1/
-    ↓
-validated integer snapshot → train_bcs_ordinal.py
-    ↓
-outputs/bcs-ordinal-integer-v1/
+outputs/bcs-ordinal-local-integer-v1/
     ↓
 ResNet18 + CORAL → canonical integer BCS score 1..5
+
+optional backend export/R2
+    ↓ authenticated backend builder
+data/bcs-integer-v1/ → train_bcs_ordinal.py
+    ↓
+outputs/bcs-ordinal-integer-v1/
 ```
 
-- `source_client.py` authenticates to the versioned export and materializes signed evidence without retaining signed URLs.
-- `source_plan.py` normalizes immutable source records and preserves evidence/evaluation provenance.
+- The local path needs no backend, R2, token, network, or signed URL.
+- `source_client.py` and the backend path remain an optional future integration.
+- `source_plan.py` normalizes immutable source records and preserves provenance.
 - `source_split_plan.py` creates a deterministic train/validation layout for classes `1..5`.
 - `integer_snapshot.py` validates image bytes, writes the v2 manifest, and rejects unsupported legacy manifest families.
 - `data/` and `outputs/` are Git-ignored operational roots; no local dataset or checkpoint is part of the tracked checkout.
@@ -70,12 +71,13 @@ ResNet18 + CORAL → canonical integer BCS score 1..5
 ### Local folder source
 
 `local_source.py` defines the bounded `bcs-local-folder-v1` source contract for
-the later `data/bcs/dataset` operation without reading it here. It accepts only
-the exact folders `3.25`, `3.5`, `3.75`, `4.0` and `4.25`, mapping them to
-integer scores `3`, `3`, `4`, `4` and `4`; the five-class model domain remains
-`1..5`. JPEG/PNG files are records. An XML file is accepted only as a paired,
-unused sidecar and never supplies labels or content. Discovery rejects links,
-nested or unexpected paths, normalized path collisions and duplicate content.
+`data/bcs/dataset` without scanning it in repository verification. It accepts only
+the exact folders `3.25`, `3.5`, `3.75`, `4.0` and `4.25`, mapping them to integer
+scores `3`, `3`, `4`, `4` and `4`; the five-class model domain remains `1..5`.
+The current observed coverage is `[3,4]`; `[1,2,5]` is missing and not validated.
+JPEG/PNG files are records. An XML file is only a paired unused sidecar and never
+supplies labels or content. Discovery rejects links, nested/unexpected paths,
+normalized collisions and duplicate content.
 Record identity is `sha256("bcs-local-folder-v1\\0" + normalized_relative_path)`.
 Materialization rechecks the root/path, reads one bounded file, and returns
 source-neutral bytes plus SHA-256; image decoding remains the snapshot builder's

@@ -165,26 +165,42 @@ Estados y status HTTP:
 
 ## Arquitectura y límites
 
-El backend es dueño de autenticación, persistencia de evaluaciones y R2. IA
-consume `GET /api/bcs-source-v1` con Bearer y, por cada evidencia, solicita un
-signed URL al backend. El token sólo viaja al backend: la descarga posterior a
-R2 usa el signed URL sin enviar el token. IA materializa bytes y SHA-256, sin
-retener el signed URL.
+La ejecución overnight soportada por defecto es local: lee `data/bcs/dataset`, no
+requiere backend, R2, token ni red. El backend sigue siendo dueño de autenticación,
+persistencia y R2 para la ruta futura opcional; IA consume `GET /api/bcs-source-v1`
+con Bearer sólo en ese modo.
 
 El flujo de build es:
 
 ```text
-bcs-source-v1 + signed evidence URL
-  → scripts/build_bcs_integer.py
-  → data/bcs-integer-v1/ (bcs-integer-snapshot-v2)
+  data/bcs/dataset (3.25/3.5→3; 3.75/4.0/4.25→4)
+  → scripts/run_bcs_overnight.py (local default)
+  → data/bcs-local-integer-v1/ (bcs-integer-snapshot-v2)
   → scripts/train_bcs_ordinal.py
-  → outputs/bcs-ordinal-integer-v1/
+  → outputs/bcs-ordinal-local-integer-v1/
   → VACCA_BCS_CHECKPOINT (serving)
 ```
 
-`data/` y `outputs/` son raíces operativas ignoradas por Git. El snapshot es
-determinista y el loader/trainer validan dominio, escala y lineage. No hay
-conversión ni fallback desde artefactos fraccionales o antiguos.
+Las carpetas fraccionales se mapean a las clases enteras `3` y `4`; la cobertura
+observada es `[3,4]` y `[1,2,5]` está explícitamente ausente, por lo que no se
+validan esos scores. El modelo y su dominio siguen siendo cinco clases `1..5`.
+`data/bcs-local-integer-v1/` y `outputs/bcs-ordinal-local-integer-v1/` son las
+raíces locales; la ruta backend futura conserva las raíces distintas
+`data/bcs-integer-v1/` y `outputs/bcs-ordinal-integer-v1/`. Los snapshots son
+deterministas y loader/trainer validan dominio, escala y lineage.
+
+### Runbook local
+
+```powershell
+# No lee contenidos de imágenes ni inicia subprocess
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --preflight-only
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset
+# Sólo después de una interrupción, reutiliza snapshot y last.pt
+.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --skip-build --resume
+```
+
+Estas instrucciones preparan una ejecución; no documentan una ejecución realizada
+ni validan operativamente `/ready/bcs` o `/bcs`.
 
 ## Troubleshooting y verificación
 
@@ -196,7 +212,7 @@ conversión ni fallback desde artefactos fraccionales o antiguos.
 - Usá `file` como nombre exacto del campo multipart.
 - Ejecutá la suite con `.venv\Scripts\python.exe -m pytest -q`.
 
-La suite verificada para este estado de la rama terminó con `435 passed, 2
+La suite verificada para este estado de la rama terminó con `479 passed, 3
 skipped, 2 warnings` y `65 subtests`; las advertencias son deprecaciones
 conocidas de FastAPI `on_event`. Ruff global `0.15.20` terminó con `0 diagnostics`;
 este `.venv` no contiene Ruff, por lo que se usó el ejecutable global configurado.
