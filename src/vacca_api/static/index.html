@@ -189,6 +189,179 @@
 </footer>
 
 <script>
+(function (root) {
+  const readinessMessages = Object.freeze({
+    ready: 'BCS listo para calcular.',
+    not_loaded: 'BCS configurado, pero todavía no está cargado.',
+    unconfigured: 'BCS no está configurado en este servidor.',
+    unavailable: 'BCS no está disponible en este momento.',
+  });
+  const validReadiness = new Set(Object.keys(readinessMessages));
+  const errorMessages = Object.freeze({
+    'File must be an image (JPEG, PNG, etc.)': 'Seleccioná una imagen válida.',
+    'Empty file': 'El archivo está vacío.',
+    'Failed to read uploaded file': 'No se pudo leer la imagen.',
+    'BCS image input is invalid': 'La imagen no es válida para BCS.',
+    'BCS capability is unavailable': 'BCS no está disponible en este momento.',
+    'BCS inference failed': 'No se pudo calcular el BCS.',
+    'BCS score could not be produced': 'No se pudo producir un score BCS.',
+  });
+
+  function createUiController({
+    fetchImpl,
+    formDataFactory = () => new FormData(),
+    abortControllerFactory = () => new AbortController(),
+    urlApi = URL,
+    isImageFile = file => Boolean(file && file.type && file.type.startsWith('image/')),
+    onState = () => {},
+    onEvent = () => {},
+  }) {
+    const state = {
+      generation: 0, selectedFile: null, objectUrl: null, bcsStatus: null,
+      bcsMessage: '', readinessLoading: false, detectLoading: false, bcsLoading: false,
+    };
+    let detectRequest = null, bcsRequest = null, readinessRequest = null, readinessId = 0;
+    const snapshot = () => ({ ...state, canCalculate: Boolean(
+      state.selectedFile && !state.bcsLoading && !state.readinessLoading &&
+      (state.bcsStatus === 'ready' || state.bcsStatus === 'not_loaded')
+    ) });
+    const emit = event => { onState(snapshot(), event); if (event) onEvent(event, snapshot()); };
+    const abort = request => { if (request) request.abort(); };
+    const detail = payload => payload && typeof payload.detail === 'string' ? payload.detail : '';
+    const errorMessage = (status, payload, fallback) => errorMessages[detail(payload)] ||
+      (status === 400 ? 'La solicitud de imagen no es válida.' : fallback);
+    const current = generation => generation === state.generation;
+    const payload = async response => { try { return await response.json(); } catch (_) { return null; } };
+
+    function invalidateSelection(reason) {
+      state.generation += 1;
+      readinessId += 1;
+      abort(detectRequest); abort(bcsRequest); abort(readinessRequest);
+      detectRequest = bcsRequest = readinessRequest = null;
+      if (state.objectUrl) { try { urlApi.revokeObjectURL(state.objectUrl); } catch (_) {} }
+      Object.assign(state, {
+        selectedFile: null, objectUrl: null, bcsStatus: null, bcsMessage: '',
+        readinessLoading: false, detectLoading: false, bcsLoading: false,
+      });
+      emit({ type: 'selection-reset', reason });
+    }
+
+    async function detect(file, generation) {
+      if (!current(generation)) return;
+      state.detectLoading = true;
+      emit({ type: 'detection-loading' });
+      detectRequest = abortControllerFactory();
+      const formData = formDataFactory();
+      formData.append('file', file);
+      try {
+        const response = await fetchImpl('/detect', {
+          method: 'POST', body: formData, signal: detectRequest.signal,
+        });
+        const body = await payload(response);
+        if (!current(generation)) return;
+        if (!response.ok) {
+          emit({ type: 'error', target: 'detect', status: response.status,
+            message: errorMessage(response.status, body, 'La detección no pudo completarse.') });
+          return;
+        }
+        emit({ type: 'detection-result', data: body, generation });
+      } catch (error) {
+        if (error.name !== 'AbortError' && current(generation)) {
+          emit({ type: 'error', target: 'detect', status: '—', message: 'Error de conexión con el servicio.' });
+        }
+      } finally {
+        if (current(generation)) { state.detectLoading = false; detectRequest = null; emit(); }
+      }
+    }
+
+    function selectFile(file) {
+      if (!isImageFile(file)) {
+        invalidateSelection('invalid-file');
+        emit({ type: 'error', target: 'detect', status: 400, message: 'Seleccioná sólo imágenes (JPEG, PNG).' });
+        return false;
+      }
+      invalidateSelection('new-selection');
+      state.selectedFile = file;
+      try { state.objectUrl = urlApi.createObjectURL(file); } catch (_) {
+        invalidateSelection('preview-failure');
+        emit({ type: 'error', target: 'detect', status: 400, message: 'No se pudo mostrar la imagen.' });
+        return false;
+      }
+      const generation = state.generation;
+      emit({ type: 'selected', file, generation, objectUrl: state.objectUrl });
+      detect(file, generation);
+      return true;
+    }
+
+    async function refreshReadiness() {
+      const requestId = ++readinessId;
+      abort(readinessRequest);
+      readinessRequest = abortControllerFactory();
+      state.readinessLoading = true; state.bcsStatus = null; state.bcsMessage = '';
+      emit({ type: 'readiness-loading' });
+      try {
+        const response = await fetchImpl('/ready/bcs', { signal: readinessRequest.signal });
+        const body = await payload(response);
+        if (requestId !== readinessId) return;
+        const status = body && validReadiness.has(body.status) ? body.status : 'unavailable';
+        state.bcsStatus = status; state.bcsMessage = readinessMessages[status];
+        emit({ type: 'readiness', status, message: state.bcsMessage });
+      } catch (error) {
+        if (error.name === 'AbortError' || requestId !== readinessId) return;
+        state.bcsStatus = 'unavailable'; state.bcsMessage = readinessMessages.unavailable;
+        emit({ type: 'readiness', status: 'unavailable', message: state.bcsMessage });
+      } finally {
+        if (requestId === readinessId) { state.readinessLoading = false; readinessRequest = null; emit(); }
+      }
+    }
+
+    async function calculateBcs() {
+      const generation = state.generation;
+      if (!snapshot().canCalculate) return false;
+      state.bcsLoading = true; emit({ type: 'bcs-loading' });
+      bcsRequest = abortControllerFactory();
+      const formData = formDataFactory();
+      formData.append('file', state.selectedFile);
+      try {
+        const response = await fetchImpl('/bcs', {
+          method: 'POST', body: formData, signal: bcsRequest.signal,
+        });
+        const body = await payload(response);
+        if (!current(generation)) return false;
+        if (!response.ok) {
+          state.bcsLoading = false;
+          if (response.status === 503) {
+            state.bcsStatus = detail(body) === 'BCS capability is unavailable' ? 'unavailable' : 'unavailable';
+            state.bcsMessage = readinessMessages.unavailable;
+          }
+          emit({ type: 'error', target: 'bcs', status: response.status,
+            message: errorMessage(response.status, body, 'No se pudo calcular el BCS.') });
+          if (response.status === 503) refreshReadiness();
+          return false;
+        }
+        state.bcsLoading = false;
+        emit({ type: 'bcs-result', data: body });
+        refreshReadiness();
+        return true;
+      } catch (error) {
+        if (!current(generation) || error.name === 'AbortError') return false;
+        state.bcsLoading = false;
+        emit({ type: 'error', target: 'bcs', status: '—', message: 'Error de conexión con el servicio BCS.' });
+        return false;
+      } finally {
+        if (current(generation)) { bcsRequest = null; emit(); }
+      }
+    }
+
+    function destroy() { invalidateSelection('destroy'); }
+    return { selectFile, refreshReadiness, calculateBcs, invalidateSelection, destroy, getState: snapshot };
+  }
+
+  root.VaccaUiController = { createUiController };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { createUiController };
+})(typeof window === 'undefined' ? globalThis : window);
+</script>
+<script>
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('fileInput');
 const preview = document.getElementById('preview');
@@ -201,95 +374,30 @@ const tabs = [document.getElementById('detectTab'), document.getElementById('bcs
 const tabPanels = { detectTab: document.getElementById('detectPanel'), bcsTab: document.getElementById('bcsPanel') };
 
 const COLORS = ['#58a6ff','#3fb950','#d2991d','#f85149','#bc8cff','#ff7b72'];
-function selectTab(tab) { tabs.forEach(candidate => { const selected = candidate === tab; candidate.setAttribute('aria-selected', String(selected)); candidate.tabIndex = selected ? 0 : -1; tabPanels[candidate.id].hidden = !selected; }); if (tab.id === 'bcsTab') fetchReadiness(); }
-tabs.forEach((tab, index) => { tab.addEventListener('click', () => selectTab(tab)); tab.addEventListener('keydown', event => { if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0; const targetIndex = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + offset + tabs.length) % tabs.length; tabs[targetIndex].focus(); selectTab(tabs[targetIndex]); }); });
 const bcsReadiness = document.getElementById('bcsReadiness'), refreshReadiness = document.getElementById('refreshReadiness'), calculateBcs = document.getElementById('calculateBcs'), bcsProgress = document.getElementById('bcsProgress'), bcsResults = document.getElementById('bcsResults');
-const READINESS_MESSAGES = Object.freeze({ ready: 'BCS listo para calcular.', not_loaded: 'BCS configurado, pero todavía no está cargado.', unconfigured: 'BCS no está configurado en este servidor.', unavailable: 'BCS no está disponible en este momento.' });
-const READINESS_STATUSES = new Set(Object.keys(READINESS_MESSAGES));
-const BCS_ERROR_MESSAGES = Object.freeze({ 'File must be an image (JPEG, PNG, etc.)': 'Seleccioná una imagen válida.', 'Empty file': 'El archivo está vacío.', 'Failed to read uploaded file': 'No se pudo leer la imagen.', 'BCS image input is invalid': 'La imagen no es válida para BCS.', 'BCS capability is unavailable': 'BCS no está disponible en este momento.', 'BCS inference failed': 'No se pudo calcular el BCS.', 'BCS score could not be produced': 'No se pudo producir un score BCS.' });
-let selectedFile = null, selectionVersion = 0, currentObjectUrl = null;
-let detectController = null, bcsController = null, readinessController = null;
-let readinessRequestId = 0, bcsStatus = null, latestDetection = null, latestDetectionVersion = 0, bcsLoading = false;
-fileInput.addEventListener('change', () => { if (fileInput.files.length > 0) handleFile(fileInput.files[0]); fileInput.value = ''; });
+let latestDetection = null, latestDetectionVersion = 0;
+
+function selectTab(tab) { tabs.forEach(candidate => { const selected = candidate === tab; candidate.setAttribute('aria-selected', String(selected)); candidate.tabIndex = selected ? 0 : -1; tabPanels[candidate.id].hidden = !selected; }); if (tab.id === 'bcsTab') controller.refreshReadiness(); }
+tabs.forEach((tab, index) => { tab.addEventListener('click', () => selectTab(tab)); tab.addEventListener('keydown', event => { if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0; const targetIndex = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + offset + tabs.length) % tabs.length; tabs[targetIndex].focus(); selectTab(tabs[targetIndex]); }); });
+function syncUi(state) { calculateBcs.disabled = !state.canCalculate; bcsProgress.hidden = !state.bcsLoading; bcsProgress.textContent = state.bcsLoading ? 'Calculando BCS…' : ''; spinner.classList.toggle('active', state.detectLoading); bcsReadiness.dataset.status = state.readinessLoading ? 'loading' : (state.bcsStatus || 'unknown'); bcsReadiness.textContent = state.readinessLoading ? 'BCS: comprobando disponibilidad…' : state.bcsStatus ? `${state.bcsStatus}: ${state.bcsMessage}` : 'BCS: estado no consultado.'; }
+function resetVisualState() { preview.removeAttribute('src'); preview.style.display = 'none'; uploadHint.style.display = 'block'; dropzone.classList.remove('has-image'); results.replaceChildren(); summary.replaceChildren(); summary.style.display = 'none'; canvas.style.display = 'none'; bcsResults.replaceChildren(); }
+function handleControllerEvent(event) {
+  if (event.type === 'selection-reset') resetVisualState();
+  if (event.type === 'selected') { preview.src = event.objectUrl; preview.style.display = 'block'; uploadHint.style.display = 'none'; dropzone.classList.add('has-image'); }
+  if (event.type === 'detection-loading') { results.replaceChildren(); summary.style.display = 'none'; canvas.style.display = 'none'; }
+  if (event.type === 'detection-result') { latestDetection = event.data; latestDetectionVersion = event.generation; renderResults(event.data); drawBoxes(event.data, event.generation); }
+  if (event.type === 'error') showError(event.target === 'bcs' ? bcsResults : results, event.status, event.message);
+  if (event.type === 'bcs-result') renderBcsResult(event.data);
+}
+const controller = window.VaccaUiController.createUiController({ fetchImpl: (...args) => fetch(...args), onState: syncUi, onEvent: handleControllerEvent });
+fileInput.addEventListener('change', () => { if (fileInput.files.length > 0) controller.selectFile(fileInput.files[0]); fileInput.value = ''; });
 dropzone.addEventListener('dragover', event => { event.preventDefault(); dropzone.classList.add('dragover'); });
 dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
-dropzone.addEventListener('drop', event => { event.preventDefault(); dropzone.classList.remove('dragover'); if (event.dataTransfer.files.length > 0) handleFile(event.dataTransfer.files[0]); });
-function isCurrent(version) { return version === selectionVersion; }
+dropzone.addEventListener('drop', event => { event.preventDefault(); dropzone.classList.remove('dragover'); if (event.dataTransfer.files.length > 0) controller.selectFile(event.dataTransfer.files[0]); });
+function isCurrent(version) { return version === controller.getState().generation; }
 function createTextElement(tag, className, text) { const element = document.createElement(tag); if (className) element.className = className; element.textContent = text; return element; }
 function appendSummaryRow(container, label, value, className = '') { const row = createTextElement('div', 'summary-row', ''); row.append(createTextElement('span', '', label), createTextElement('span', className, value)); container.append(row); }
 function showError(container, status, message) { container.replaceChildren(createTextElement('div', 'results-empty error-message', `Error: ${status} — ${message}`)); }
-function safePayloadDetail(payload) { return payload && typeof payload.detail === 'string' ? payload.detail : ''; }
-function mappedErrorMessage(status, payload, fallback) { return BCS_ERROR_MESSAGES[safePayloadDetail(payload)] || (status === 400 ? 'La solicitud de imagen no es válida.' : fallback); }
-async function responsePayload(response) { try { return await response.json(); } catch (_) { return null; } }
-function handleFile(file) {
-  if (!file || !file.type.startsWith('image/')) {
-    showError(results, 400, 'Seleccioná sólo imágenes (JPEG, PNG).');
-    return;
-  }
-  selectionVersion += 1;
-  const version = selectionVersion;
-  selectedFile = file;
-  latestDetection = null;
-  latestDetectionVersion = version;
-  detectController?.abort();
-  bcsController?.abort();
-  detectController = null;
-  bcsController = null;
-  bcsLoading = false;
-  spinner.classList.remove('active');
-  bcsProgress.hidden = true;
-  results.replaceChildren();
-  summary.replaceChildren();
-  summary.style.display = 'none';
-  canvas.style.display = 'none';
-  bcsResults.replaceChildren();
-  if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
-  currentObjectUrl = URL.createObjectURL(file);
-  preview.onload = () => {
-    if (isCurrent(version)) detectAndDraw(file, version);
-  };
-  preview.onerror = () => {
-    if (isCurrent(version)) showError(results, 400, 'No se pudo mostrar la imagen.');
-  };
-  preview.src = currentObjectUrl;
-  preview.style.display = 'block';
-  uploadHint.style.display = 'none';
-  dropzone.classList.add('has-image');
-  updateBcsControls();
-}
-async function detectAndDraw(file, version) {
-  if (!isCurrent(version)) return;
-  spinner.classList.add('active');
-  results.replaceChildren();
-  summary.style.display = 'none';
-  canvas.style.display = 'none';
-  detectController = new AbortController();
-  const formData = new FormData();
-  formData.append('file', file);
-  try {
-    const response = await fetch('/detect', {
-      method: 'POST', body: formData, signal: detectController.signal,
-    });
-    const payload = await responsePayload(response);
-    if (!isCurrent(version)) return;
-    if (!response.ok) {
-      showError(results, response.status, mappedErrorMessage(response.status, payload, 'La detección no pudo completarse.'));
-      return;
-    }
-    latestDetection = payload;
-    latestDetectionVersion = version;
-    renderResults(payload);
-    drawBoxes(payload, version);
-  } catch (error) {
-    if (!isCurrent(version) || error.name === 'AbortError') return;
-    showError(results, '—', 'Error de conexión con el servicio.');
-  } finally {
-    if (isCurrent(version)) {
-      spinner.classList.remove('active');
-      detectController = null;
-    }
-  }
-}
 function renderResults(data) {
   results.replaceChildren();
   const detections = Array.isArray(data.detections) ? data.detections : [];
@@ -359,37 +467,6 @@ function drawBoxes(data, version) {
     context.fillText(label, x1 + 4, y1 - 6);
   });
 }
-async function fetchReadiness() {
-  const requestId = ++readinessRequestId;
-  readinessController?.abort();
-  readinessController = new AbortController();
-  bcsStatus = null;
-  bcsReadiness.dataset.status = 'loading';
-  bcsReadiness.textContent = 'BCS: comprobando disponibilidad…';
-  updateBcsControls();
-  try {
-    const response = await fetch('/ready/bcs', { signal: readinessController.signal });
-    const payload = await responsePayload(response);
-    if (requestId !== readinessRequestId) return;
-    const status = payload && READINESS_STATUSES.has(payload.status) ? payload.status : 'unavailable';
-    bcsStatus = status;
-    bcsReadiness.dataset.status = status;
-    bcsReadiness.textContent = `${status}: ${READINESS_MESSAGES[status]}`;
-  } catch (error) {
-    if (error.name === 'AbortError' || requestId !== readinessRequestId) return;
-    bcsStatus = 'unavailable';
-    bcsReadiness.dataset.status = 'unavailable';
-    bcsReadiness.textContent = `unavailable: ${READINESS_MESSAGES.unavailable}`;
-  } finally {
-    if (requestId === readinessRequestId) {
-      readinessController = null;
-      updateBcsControls();
-    }
-  }
-}
-function updateBcsControls() {
-  calculateBcs.disabled = bcsLoading || !selectedFile || !['ready', 'not_loaded'].includes(bcsStatus);
-}
 function renderBcsResult(data) {
   bcsResults.replaceChildren();
   const score = Number(data.bcs_score);
@@ -407,41 +484,9 @@ function renderBcsResult(data) {
   card.append(detail);
   bcsResults.append(card);
 }
-calculateBcs.addEventListener('click', async () => {
-  if (calculateBcs.disabled || !selectedFile) return;
-  const version = selectionVersion;
-  bcsLoading = true;
-  updateBcsControls();
-  bcsResults.replaceChildren();
-  bcsProgress.textContent = 'Calculando BCS…';
-  bcsProgress.hidden = false;
-  bcsController = new AbortController();
-  const formData = new FormData();
-  formData.append('file', selectedFile);
-  try {
-    const response = await fetch('/bcs', {
-      method: 'POST', body: formData, signal: bcsController.signal,
-    });
-    const payload = await responsePayload(response);
-    if (!isCurrent(version)) return;
-    if (!response.ok) {
-      showError(bcsResults, response.status, mappedErrorMessage(response.status, payload, 'No se pudo calcular el BCS.'));
-      return;
-    }
-    renderBcsResult(payload);
-  } catch (error) {
-    if (!isCurrent(version) || error.name === 'AbortError') return;
-    showError(bcsResults, '—', 'Error de conexión con el servicio BCS.');
-  } finally {
-    if (isCurrent(version)) {
-      bcsLoading = false;
-      bcsController = null;
-      bcsProgress.hidden = true;
-      updateBcsControls();
-    }
-  }
-});
-refreshReadiness.addEventListener('click', fetchReadiness);
+calculateBcs.addEventListener('click', () => controller.calculateBcs());
+refreshReadiness.addEventListener('click', () => controller.refreshReadiness());
+window.addEventListener('beforeunload', () => controller.destroy());
 window.addEventListener('resize', () => {
   if (latestDetection && latestDetectionVersion === selectionVersion) {
     drawBoxes(latestDetection, latestDetectionVersion);
