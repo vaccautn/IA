@@ -27,6 +27,7 @@ from .constants import (
     SCORE_STEP,
 )
 from .dataset import build_transforms
+from .local_source import LOCAL_BCS_MAPPING
 from .model import BCSOrdinalModel
 
 CHECKPOINT_SCHEMA_VERSION = "bcs-ordinal-integer-checkpoint-v1"
@@ -47,7 +48,13 @@ _REQUIRED_FIELDS = frozenset(
         "snapshot_identity",
         "dataset_manifest_digest",
         "run_id",
+        "observed_classes",
+        "missing_classes",
+        "allow_partial_class_coverage",
+        "source_identity_scheme",
+        "source_mapping",
         "config",
+        "provenance",
         "model_state_dict",
     }
 )
@@ -94,6 +101,12 @@ class BCSLineageMetadata:
     snapshot_identity: str
     dataset_manifest_digest: str
     run_id: str
+    source_schema: str
+    source_identity_scheme: str | None
+    source_mapping: tuple[tuple[str, int], ...] | None
+    observed_classes: tuple[int, ...]
+    missing_classes: tuple[int, ...]
+    allow_partial_class_coverage: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +221,71 @@ def _valid_digest(value: object, length: int) -> bool:
     )
 
 
+def _valid_class_list(value: object) -> bool:
+    return (
+        type(value) is list
+        and all(type(item) is int for item in value)
+        and value == sorted(set(value))
+        and all(item in range(SCORE_MIN, SCORE_MAX + 1) for item in value)
+    )
+
+
+def _validate_coverage(checkpoint: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    observed = checkpoint["observed_classes"]
+    missing = checkpoint["missing_classes"]
+    policy = checkpoint["allow_partial_class_coverage"]
+    if (
+        not _valid_class_list(observed)
+        or not _valid_class_list(missing)
+        or len(observed) < 2
+        or type(policy) is not bool
+        or missing != [score for score in range(SCORE_MIN, SCORE_MAX + 1) if score not in observed]
+        or (missing and not policy)
+    ):
+        raise BCSCheckpointLoadError("BCS checkpoint class coverage is invalid")
+
+    provenance = checkpoint["provenance"]
+    manifest = provenance.get("dataset_manifest") if type(provenance) is dict else None
+    if type(manifest) is not dict:
+        raise BCSCheckpointLoadError("BCS checkpoint source lineage is invalid")
+    if (
+        manifest.get("observed_classes") != observed
+        or manifest.get("missing_classes") != missing
+        or manifest.get("allow_partial_class_coverage") != policy
+        or manifest.get("split_identity") != checkpoint["snapshot_identity"]
+        or manifest.get("sha256") != checkpoint["dataset_manifest_digest"]
+        or provenance.get("run_id") != checkpoint["run_id"]
+        or provenance.get("domain_id") != checkpoint["domain_id"]
+        or checkpoint["config"].get("allow_partial_class_coverage") != policy
+    ):
+        raise BCSCheckpointLoadError("BCS checkpoint source lineage is invalid")
+
+    source_schema = manifest.get("source_schema")
+    identity_scheme = checkpoint["source_identity_scheme"]
+    mapping = checkpoint["source_mapping"]
+    if source_schema == "bcs-local-folder-v1":
+        expected_mapping = dict(LOCAL_BCS_MAPPING.entries)
+        if (
+            identity_scheme != "local-path-sha256-v1"
+            or mapping != expected_mapping
+            or manifest.get("identity_scheme") != identity_scheme
+            or manifest.get("mapping") != expected_mapping
+            or observed != [3, 4]
+        ):
+            raise BCSCheckpointLoadError("BCS checkpoint source variant is invalid")
+    elif source_schema == "bcs-source-v1":
+        if (
+            identity_scheme is not None
+            or mapping is not None
+            or manifest.get("identity_scheme") is not None
+            or manifest.get("mapping") is not None
+        ):
+            raise BCSCheckpointLoadError("BCS checkpoint source variant is invalid")
+    else:
+        raise BCSCheckpointLoadError("BCS checkpoint source schema is invalid")
+    return source_schema, manifest
+
+
 def _resolve_checkpoint_path(raw_path: str | os.PathLike[str]) -> Path:
     try:
         path = Path(raw_path)
@@ -290,6 +368,7 @@ def _validate_checkpoint(checkpoint: object) -> dict[str, Any]:
     config = checkpoint["config"]
     if not isinstance(config, dict) or type(config.get("imgsz")) is not int or config["imgsz"] <= 0:
         raise BCSCheckpointLoadError("BCS checkpoint image size is invalid")
+    _validate_coverage(checkpoint)
 
     state_dict = checkpoint["model_state_dict"]
     if (
@@ -329,5 +408,13 @@ def load_bcs_model(
         checkpoint["snapshot_identity"],
         checkpoint["dataset_manifest_digest"],
         checkpoint["run_id"],
+        checkpoint["provenance"]["dataset_manifest"]["source_schema"],
+        checkpoint["source_identity_scheme"],
+        None
+        if checkpoint["source_mapping"] is None
+        else tuple(sorted(checkpoint["source_mapping"].items())),
+        tuple(checkpoint["observed_classes"]),
+        tuple(checkpoint["missing_classes"]),
+        checkpoint["allow_partial_class_coverage"],
     )
     return LoadedBCSModel(model, checkpoint["config"]["imgsz"], resolved_device, lineage)

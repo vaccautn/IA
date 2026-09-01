@@ -45,7 +45,30 @@ def checkpoint(tmp_path: Path) -> tuple[Path, dict[str, object]]:
         "snapshot_identity": "a" * 64,
         "dataset_manifest_digest": "b" * 64,
         "run_id": "c" * 32,
-        "config": {"imgsz": 32},
+        "observed_classes": [3, 4],
+        "missing_classes": [1, 2, 5],
+        "allow_partial_class_coverage": True,
+        "source_identity_scheme": "local-path-sha256-v1",
+        "source_mapping": {
+            "3.25": 3, "3.5": 3, "3.75": 4, "4.0": 4, "4.25": 4
+        },
+        "config": {"imgsz": 32, "allow_partial_class_coverage": True},
+        "provenance": {
+            "run_id": "c" * 32,
+            "domain_id": BCS_DOMAIN_ID,
+            "dataset_manifest": {
+                "source_schema": "bcs-local-folder-v1",
+                "identity_scheme": "local-path-sha256-v1",
+                "mapping": {
+                    "3.25": 3, "3.5": 3, "3.75": 4, "4.0": 4, "4.25": 4
+                },
+                "observed_classes": [3, 4],
+                "missing_classes": [1, 2, 5],
+                "allow_partial_class_coverage": True,
+                "split_identity": "a" * 64,
+                "sha256": "b" * 64,
+            }
+        },
         "model_state_dict": model.state_dict(),
     }
     path = tmp_path / "best.pt"
@@ -62,6 +85,9 @@ def test_loads_cpu_checkpoint_and_returns_immutable_metadata(checkpoint) -> None
     assert not loaded.model.training
     assert loaded.lineage.domain_id == BCS_DOMAIN_ID
     assert loaded.lineage.snapshot_identity == "a" * 64
+    assert loaded.lineage.source_schema == "bcs-local-folder-v1"
+    assert loaded.lineage.observed_classes == (3, 4)
+    assert loaded.lineage.missing_classes == (1, 2, 5)
     with pytest.raises(FrozenInstanceError):
         loaded.lineage.run_id = "d" * 32
 def test_uses_safe_load_and_pretrained_false(checkpoint, monkeypatch) -> None:
@@ -108,7 +134,14 @@ def test_rejects_tampered_contract(checkpoint, field, value) -> None:
     torch.save(tampered, path)
     with pytest.raises(serving.BCSCheckpointLoadError):
         serving.load_bcs_model(path)
-@pytest.mark.parametrize("field", ["model_state_dict", "config", "domain_id"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "model_state_dict", "config", "domain_id", "observed_classes",
+        "missing_classes", "allow_partial_class_coverage", "source_identity_scheme",
+        "source_mapping", "provenance",
+    ],
+)
 def test_rejects_missing_or_unexpected_fields(checkpoint, field: str) -> None:
     path, payload = checkpoint
     missing = copy.deepcopy(payload)
@@ -167,6 +200,89 @@ def test_rejects_symlink_when_supported(checkpoint, tmp_path: Path) -> None:
         serving.load_bcs_model(link)
 
 
+def test_accepts_full_backend_coverage(checkpoint) -> None:
+    path, payload = checkpoint
+    backend = copy.deepcopy(payload)
+    backend.update(
+        observed_classes=[1, 2, 3, 4, 5],
+        missing_classes=[],
+        allow_partial_class_coverage=False,
+        source_identity_scheme=None,
+        source_mapping=None,
+        config={"imgsz": 32, "allow_partial_class_coverage": False},
+        provenance={
+            "run_id": "c" * 32,
+            "domain_id": BCS_DOMAIN_ID,
+            "dataset_manifest": {
+                "source_schema": "bcs-source-v1",
+                "identity_scheme": None,
+                "mapping": None,
+                "observed_classes": [1, 2, 3, 4, 5],
+                "missing_classes": [],
+                "allow_partial_class_coverage": False,
+                "split_identity": "a" * 64,
+                "sha256": "b" * 64,
+            }
+        },
+    )
+    torch.save(backend, path)
+    loaded = serving.load_bcs_model(path)
+    assert loaded.lineage.source_schema == "bcs-source-v1"
+    assert loaded.lineage.source_identity_scheme is None
+    assert loaded.lineage.source_mapping is None
+    assert loaded.lineage.observed_classes == (1, 2, 3, 4, 5)
+    assert loaded.lineage.missing_classes == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("observed_classes", [4, 3]),
+        ("observed_classes", [3, 3, 4]),
+        ("observed_classes", [True, 4]),
+        ("observed_classes", [3]),
+        ("missing_classes", [1, 2]),
+        ("allow_partial_class_coverage", False),
+        ("source_identity_scheme", "backend-evidence-v1"),
+        ("source_mapping", {"3.25": 3}),
+    ],
+)
+def test_rejects_tampered_coverage_before_model_construction(
+    checkpoint, monkeypatch, field: str, value: object
+) -> None:
+    path, payload = checkpoint
+    tampered = copy.deepcopy(payload)
+    tampered[field] = value
+    torch.save(tampered, path)
+    calls: list[bool] = []
+
+    def forbidden_model(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("model construction must wait for lineage validation")
+
+    monkeypatch.setattr(serving, "BCSOrdinalModel", forbidden_model)
+    with pytest.raises(serving.BCSCheckpointLoadError):
+        serving.load_bcs_model(path)
+    assert calls == []
+
+
+def test_rejects_tampered_source_manifest_before_model_construction(checkpoint, monkeypatch) -> None:
+    path, payload = checkpoint
+    tampered = copy.deepcopy(payload)
+    tampered["provenance"]["dataset_manifest"]["source_schema"] = "bcs-source-v1"
+    torch.save(tampered, path)
+    calls: list[bool] = []
+
+    def forbidden_model(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("model construction must wait for source validation")
+
+    monkeypatch.setattr(serving, "BCSOrdinalModel", forbidden_model)
+    with pytest.raises(serving.BCSCheckpointLoadError):
+        serving.load_bcs_model(path)
+    assert calls == []
+
+
 class _InferenceModel(torch.nn.Module):
     def __init__(self, logits: torch.Tensor, failure: bool = False) -> None:
         super().__init__()
@@ -191,6 +307,12 @@ def _loaded_model(model: torch.nn.Module, imgsz: int = 8) -> serving.LoadedBCSMo
         "a" * 64,
         "b" * 64,
         "c" * 32,
+        "bcs-local-folder-v1",
+        "local-path-sha256-v1",
+        (("3.25", 3), ("3.5", 3), ("3.75", 4), ("4.0", 4), ("4.25", 4)),
+        (3, 4),
+        (1, 2, 5),
+        True,
     )
     return serving.LoadedBCSModel(model, imgsz, torch.device("cpu"), lineage)
 
