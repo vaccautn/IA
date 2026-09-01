@@ -236,7 +236,7 @@ ni validan operativamente `/ready/bcs` o `/bcs`.
 - Usá `file` como nombre exacto del campo multipart.
 - Ejecutá la suite con `.venv\Scripts\python.exe -m pytest -q`.
 
-La suite verificada para este estado de la rama terminó con `479 passed, 3
+La suite verificada para este estado de la rama terminó con `487 passed, 3
 skipped, 2 warnings` y `65 subtests`; las advertencias son deprecaciones
 conocidas de FastAPI `on_event`. Ruff global `0.15.20` terminó con `0 diagnostics`;
 este `.venv` no contiene Ruff, por lo que se usó el ejecutable global configurado.

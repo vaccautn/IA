@@ -51,7 +51,7 @@ se rechazan. El backend conserva su flujo opcional en sus raíces distintas
 
 | Gate | Resultado | Alcance |
 |---|---|---|
-| Suite completa | `479 passed`, `3 skipped`, `2 warnings`, `65 subtests` | `.venv\Scripts\python.exe -m pytest -q` en el estado documentado de esta rama; sin datos BCS reales ni entrenamiento. |
+| Suite completa | `487 passed`, `3 skipped`, `2 warnings`, `65 subtests` | `.venv\Scripts\python.exe -m pytest -q` en el estado documentado de esta rama; sin datos BCS reales ni entrenamiento. |
 | Contrato API/serving | Cubierto por pruebas | Upload compartido, `/bcs`, readiness, OpenAPI, redondeo, sanitización y aislamiento de `/health`/`/detect`. |
 | Pipeline BCS | Cubierto con temporales | Imágenes controladas, snapshot, transforms, forward/predict, optimizer, checkpoint y lineage en CPU. |
 | Ruff | Limpio | Ruff global configurado `0.15.20`: `0 diagnostics`. El `.venv` no contiene Ruff; se usó el fallback global. El extra `dev` lo fija para una instalación reproducible. |

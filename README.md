@@ -299,7 +299,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs -Method Post -Form @{file=Get-I
 ```
 
 Verification for this branch state: `.venv\Scripts\python.exe -m pytest -q`
-reports `479 passed, 3 skipped, 2 warnings, 65 subtests passed`. The warnings are the
+reports `487 passed, 3 skipped, 2 warnings, 65 subtests passed`. The warnings are the
 known FastAPI `on_event` deprecations. This verification did not access real BCS
 data, outputs, model weights, or run training.
 
