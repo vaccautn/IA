@@ -92,6 +92,31 @@
   .summary .positive { color:var(--success); font-weight:700; }
   .summary .negative { color:var(--danger); font-weight:700; }
 
+  /* --- Tabs and BCS prototype --- */
+  .tab-list { display:flex; gap:4px; border-bottom:1px solid var(--border); margin-bottom:16px; }
+  .tab { background:transparent; border:0; border-bottom:2px solid transparent; color:var(--muted); cursor:pointer; font-size:14px; font-weight:600; padding:10px 14px; margin-bottom:-1px; }
+  .tab:hover, .tab[aria-selected="true"] { color:var(--text); }
+  .tab[aria-selected="true"] { border-bottom-color:var(--accent); }
+  button:focus-visible, [role="tab"]:focus-visible, input:focus-visible { outline:3px solid var(--accent); outline-offset:2px; }
+  .tab-panel[hidden] { display:none; }
+  .readiness-row { display:flex; align-items:center; gap:10px; margin-bottom:16px; }
+  .readiness-badge { background:var(--bg); border:1px solid var(--border); border-radius:999px; color:var(--muted); flex:1; font-size:13px; padding:8px 12px; }
+  .readiness-badge[data-status="ready"] { border-color:var(--success); color:var(--success); }
+  .readiness-badge[data-status="unconfigured"],
+  .readiness-badge[data-status="unavailable"] { border-color:var(--danger); color:var(--danger); }
+  .readiness-badge[data-status="not_loaded"] { border-color:var(--warning); color:var(--warning); }
+  .secondary-button, .primary-button { border:1px solid var(--border); border-radius:6px; cursor:pointer; font-size:14px; font-weight:600; padding:10px 14px; }
+  .secondary-button { background:var(--surface); color:var(--text); }
+  .primary-button { background:var(--accent); border-color:var(--accent); color:#000; width:100%; }
+  button:disabled { cursor:not-allowed; opacity:.5; }
+  .bcs-help { color:var(--muted); font-size:14px; line-height:1.5; margin:0 0 16px; }
+  .progress { color:var(--accent); font-size:14px; padding:20px 0; text-align:center; }
+  .score-card { background:var(--bg); border:1px solid var(--accent); border-radius:8px; margin-top:16px; padding:20px; text-align:center; }
+  .score-label { color:var(--muted); font-size:13px; letter-spacing:.5px; text-transform:uppercase; }
+  .score-value { color:var(--accent); font-size:64px; font-weight:700; line-height:1; margin:8px 0 16px; }
+  .bcs-detail { border-top:1px solid var(--border); margin-top:16px; padding-top:12px; text-align:left; }
+  .error-message { color:var(--danger); }
+
   .spinner {
     display:none; width:24px; height:24px; border:3px solid var(--border);
     border-top-color:var(--accent); border-radius:50%;
@@ -122,7 +147,7 @@
   <div class="panel">
     <h2>📤 Imagen</h2>
     <div class="dropzone" id="dropzone">
-      <input type="file" id="fileInput" accept="image/*">
+      <input type="file" id="fileInput" accept="image/*" aria-label="Seleccionar imagen">
       <img id="preview" style="display:none" alt="Preview">
       <canvas id="bboxCanvas" class="overlay" style="display:none"></canvas>
       <div class="upload-hint" id="uploadHint">
@@ -134,15 +159,32 @@
     <div id="summary" class="summary" style="display:none"></div>
   </div>
 
-  <!-- RIGHT: Results -->
+  <!-- RIGHT: Results and BCS -->
   <div class="panel">
-    <h2>🔍 Detecciones</h2>
-    <div id="results"></div>
+    <div class="tab-list" role="tablist" aria-label="Prototype modes">
+      <button type="button" class="tab" id="detectTab" role="tab" aria-selected="true" aria-controls="detectPanel" tabindex="0">Detect</button>
+      <button type="button" class="tab" id="bcsTab" role="tab" aria-selected="false" aria-controls="bcsPanel" tabindex="-1">BCS</button>
+    </div>
+
+    <section class="tab-panel" id="detectPanel" role="tabpanel" aria-labelledby="detectTab">
+      <h2>🔍 Detecciones</h2>
+      <div id="results" aria-live="polite" aria-atomic="true"></div>
+    </section>
+
+    <section class="tab-panel" id="bcsPanel" role="tabpanel" aria-labelledby="bcsTab" hidden>
+      <h2>📊 Body Condition Score</h2>
+      <p class="bcs-help">Calculá el score BCS sobre la imagen completa. Esta capacidad necesita un checkpoint compatible.</p>
+      <div class="readiness-row"><span class="readiness-badge" id="bcsReadiness" role="status" aria-live="polite" data-status="unknown">BCS: estado no consultado.</span><button type="button" class="secondary-button" id="refreshReadiness">Actualizar</button></div>
+      <button type="button" class="primary-button" id="calculateBcs" disabled>Calculate BCS</button>
+      <div class="progress" id="bcsProgress" role="status" aria-live="polite" hidden></div>
+      <div id="bcsResults" aria-live="polite" aria-atomic="true"></div>
+    </section>
   </div>
 </main>
 
 <footer class="api-footer">
   Endpoints: <code>POST /detect</code> &nbsp;|&nbsp; <code>GET /health</code> &nbsp;|&nbsp;
+  <code>POST /bcs</code> &nbsp;|&nbsp; <code>GET /ready/bcs</code> &nbsp;|&nbsp;
   Modelo: combined-v2-finetune (Navid + BCS) &nbsp;|&nbsp; YOLO26n
 </footer>
 
@@ -155,146 +197,258 @@ const uploadHint = document.getElementById('uploadHint');
 const spinner = document.getElementById('spinner');
 const results = document.getElementById('results');
 const summary = document.getElementById('summary');
+const tabs = [document.getElementById('detectTab'), document.getElementById('bcsTab')];
+const tabPanels = { detectTab: document.getElementById('detectPanel'), bcsTab: document.getElementById('bcsPanel') };
 
 const COLORS = ['#58a6ff','#3fb950','#d2991d','#f85149','#bc8cff','#ff7b72'];
-
-fileInput.addEventListener('change', () => {
-  if (fileInput.files.length > 0) handleFile(fileInput.files[0]);
-});
-
-dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+function selectTab(tab) { tabs.forEach(candidate => { const selected = candidate === tab; candidate.setAttribute('aria-selected', String(selected)); candidate.tabIndex = selected ? 0 : -1; tabPanels[candidate.id].hidden = !selected; }); if (tab.id === 'bcsTab') fetchReadiness(); }
+tabs.forEach((tab, index) => { tab.addEventListener('click', () => selectTab(tab)); tab.addEventListener('keydown', event => { if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0; const targetIndex = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + offset + tabs.length) % tabs.length; tabs[targetIndex].focus(); selectTab(tabs[targetIndex]); }); });
+const bcsReadiness = document.getElementById('bcsReadiness'), refreshReadiness = document.getElementById('refreshReadiness'), calculateBcs = document.getElementById('calculateBcs'), bcsProgress = document.getElementById('bcsProgress'), bcsResults = document.getElementById('bcsResults');
+const READINESS_MESSAGES = Object.freeze({ ready: 'BCS listo para calcular.', not_loaded: 'BCS configurado, pero todavía no está cargado.', unconfigured: 'BCS no está configurado en este servidor.', unavailable: 'BCS no está disponible en este momento.' });
+const READINESS_STATUSES = new Set(Object.keys(READINESS_MESSAGES));
+const BCS_ERROR_MESSAGES = Object.freeze({ 'File must be an image (JPEG, PNG, etc.)': 'Seleccioná una imagen válida.', 'Empty file': 'El archivo está vacío.', 'Failed to read uploaded file': 'No se pudo leer la imagen.', 'BCS image input is invalid': 'La imagen no es válida para BCS.', 'BCS capability is unavailable': 'BCS no está disponible en este momento.', 'BCS inference failed': 'No se pudo calcular el BCS.', 'BCS score could not be produced': 'No se pudo producir un score BCS.' });
+let selectedFile = null, selectionVersion = 0, currentObjectUrl = null;
+let detectController = null, bcsController = null, readinessController = null;
+let readinessRequestId = 0, bcsStatus = null, latestDetection = null, latestDetectionVersion = 0, bcsLoading = false;
+fileInput.addEventListener('change', () => { if (fileInput.files.length > 0) handleFile(fileInput.files[0]); fileInput.value = ''; });
+dropzone.addEventListener('dragover', event => { event.preventDefault(); dropzone.classList.add('dragover'); });
 dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
-dropzone.addEventListener('drop', e => {
-  e.preventDefault();
-  dropzone.classList.remove('dragover');
-  if (e.dataTransfer.files.length > 0) handleFile(e.dataTransfer.files[0]);
-});
-
+dropzone.addEventListener('drop', event => { event.preventDefault(); dropzone.classList.remove('dragover'); if (event.dataTransfer.files.length > 0) handleFile(event.dataTransfer.files[0]); });
+function isCurrent(version) { return version === selectionVersion; }
+function createTextElement(tag, className, text) { const element = document.createElement(tag); if (className) element.className = className; element.textContent = text; return element; }
+function appendSummaryRow(container, label, value, className = '') { const row = createTextElement('div', 'summary-row', ''); row.append(createTextElement('span', '', label), createTextElement('span', className, value)); container.append(row); }
+function showError(container, status, message) { container.replaceChildren(createTextElement('div', 'results-empty error-message', `Error: ${status} — ${message}`)); }
+function safePayloadDetail(payload) { return payload && typeof payload.detail === 'string' ? payload.detail : ''; }
+function mappedErrorMessage(status, payload, fallback) { return BCS_ERROR_MESSAGES[safePayloadDetail(payload)] || (status === 400 ? 'La solicitud de imagen no es válida.' : fallback); }
+async function responsePayload(response) { try { return await response.json(); } catch (_) { return null; } }
 function handleFile(file) {
-  if (!file.type.startsWith('image/')) { alert('Solo imágenes (JPEG, PNG)'); return; }
-
-  const reader = new FileReader();
-  reader.onload = () => {
-    preview.src = reader.result;
-    preview.style.display = 'block';
-    uploadHint.style.display = 'none';
-    dropzone.classList.add('has-image');
-
-    // Show image, then detect
-    preview.onload = () => detectAndDraw(file);
-  };
-  reader.readAsDataURL(file);
-}
-
-async function detectAndDraw(file) {
-  spinner.classList.add('active');
-  results.innerHTML = '';
-  summary.style.display = 'none';
-  canvas.style.display = 'none';
-
-  const formData = new FormData();
-  formData.append('file', file);
-
-  try {
-    const resp = await fetch('/detect', { method: 'POST', body: formData });
-    if (!resp.ok) {
-      const err = await resp.text();
-      results.innerHTML = `<div class="results-empty" style="color:var(--danger)">Error: ${resp.status} — ${err}</div>`;
-      return;
-    }
-    const data = await resp.json();
-    renderResults(data);
-    drawBoxes(data);
-  } catch (e) {
-    results.innerHTML = `<div class="results-empty" style="color:var(--danger)">Error de conexión: ${e.message}</div>`;
-  } finally {
-    spinner.classList.remove('active');
-  }
-}
-
-function renderResults(data) {
-  if (!data.cow_detected) {
-    results.innerHTML = `<div class="results-empty">❌ No se detectaron vacas en la imagen.</div>`;
-    summary.innerHTML = `
-      <div class="summary-row"><span>Resultado</span><span class="negative">Sin detección</span></div>
-      <div class="summary-row"><span>Inferencia</span><span>${data.inference_time_ms} ms</span></div>
-      <div class="summary-row"><span>Tamaño</span><span>${data.image_width} × ${data.image_height}</span></div>
-    `;
-    summary.style.display = 'block';
+  if (!file || !file.type.startsWith('image/')) {
+    showError(results, 400, 'Seleccioná sólo imágenes (JPEG, PNG).');
     return;
   }
-
-  let cards = '';
-  data.detections.forEach((d, i) => {
-    cards += `
-      <div class="result-card">
-        <div class="result-rank" style="background:${COLORS[i % COLORS.length]}">${i+1}</div>
-        <div class="result-info">
-          <div class="result-class">🐄 ${d.class_name}</div>
-          <div class="result-conf">${(d.confidence*100).toFixed(1)}%</div>
-          <div class="result-bbox">
-            bbox: [${d.x1}, ${d.y1}, ${d.x2}, ${d.y2}]<br>
-            norm: [${d.bbox.x_center.toFixed(3)}, ${d.bbox.y_center.toFixed(3)}, ${d.bbox.width.toFixed(3)}, ${d.bbox.height.toFixed(3)}]
-          </div>
-        </div>
-      </div>`;
+  selectionVersion += 1;
+  const version = selectionVersion;
+  selectedFile = file;
+  latestDetection = null;
+  latestDetectionVersion = version;
+  detectController?.abort();
+  bcsController?.abort();
+  detectController = null;
+  bcsController = null;
+  bcsLoading = false;
+  spinner.classList.remove('active');
+  bcsProgress.hidden = true;
+  results.replaceChildren();
+  summary.replaceChildren();
+  summary.style.display = 'none';
+  canvas.style.display = 'none';
+  bcsResults.replaceChildren();
+  if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+  currentObjectUrl = URL.createObjectURL(file);
+  preview.onload = () => {
+    if (isCurrent(version)) detectAndDraw(file, version);
+  };
+  preview.onerror = () => {
+    if (isCurrent(version)) showError(results, 400, 'No se pudo mostrar la imagen.');
+  };
+  preview.src = currentObjectUrl;
+  preview.style.display = 'block';
+  uploadHint.style.display = 'none';
+  dropzone.classList.add('has-image');
+  updateBcsControls();
+}
+async function detectAndDraw(file, version) {
+  if (!isCurrent(version)) return;
+  spinner.classList.add('active');
+  results.replaceChildren();
+  summary.style.display = 'none';
+  canvas.style.display = 'none';
+  detectController = new AbortController();
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const response = await fetch('/detect', {
+      method: 'POST', body: formData, signal: detectController.signal,
+    });
+    const payload = await responsePayload(response);
+    if (!isCurrent(version)) return;
+    if (!response.ok) {
+      showError(results, response.status, mappedErrorMessage(response.status, payload, 'La detección no pudo completarse.'));
+      return;
+    }
+    latestDetection = payload;
+    latestDetectionVersion = version;
+    renderResults(payload);
+    drawBoxes(payload, version);
+  } catch (error) {
+    if (!isCurrent(version) || error.name === 'AbortError') return;
+    showError(results, '—', 'Error de conexión con el servicio.');
+  } finally {
+    if (isCurrent(version)) {
+      spinner.classList.remove('active');
+      detectController = null;
+    }
+  }
+}
+function renderResults(data) {
+  results.replaceChildren();
+  const detections = Array.isArray(data.detections) ? data.detections : [];
+  if (!data.cow_detected) {
+    results.append(createTextElement('div', 'results-empty', '❌ No se detectaron vacas en la imagen.'));
+    appendDetectionSummary(data, false);
+    return;
+  }
+  detections.forEach((detection, index) => {
+    const card = createTextElement('div', 'result-card', '');
+    const rank = createTextElement('div', 'result-rank', String(index + 1));
+    rank.style.backgroundColor = COLORS[index % COLORS.length];
+    const info = createTextElement('div', 'result-info', '');
+    info.append(createTextElement('div', 'result-class', `🐄 ${String(detection.class_name || 'cow')}`));
+    const confidence = Number(detection.confidence);
+    info.append(createTextElement('div', 'result-conf', `${(Number.isFinite(confidence) ? confidence * 100 : 0).toFixed(1)}%`));
+    const bbox = detection.bbox || {};
+    const norm = [bbox.x_center, bbox.y_center, bbox.width, bbox.height]
+      .map(value => Number.isFinite(Number(value)) ? Number(value).toFixed(3) : '—').join(', ');
+    info.append(createTextElement('div', 'result-bbox', `bbox: [${detection.x1}, ${detection.y1}, ${detection.x2}, ${detection.y2}]`));
+    info.append(createTextElement('div', 'result-bbox', `norm: [${norm}]`));
+    card.append(rank, info);
+    results.append(card);
   });
-
-  results.innerHTML = cards;
-  summary.innerHTML = `
-    <div class="summary-row"><span>Resultado</span><span class="positive">🐄 ${data.detection_count} vaca(s)</span></div>
-    <div class="summary-row"><span>Inferencia</span><span>${data.inference_time_ms} ms</span></div>
-    <div class="summary-row"><span>Tamaño</span><span>${data.image_width} × ${data.image_height}</span></div>
-  `;
+  appendDetectionSummary(data, true);
+}
+function appendDetectionSummary(data, detected) {
+  summary.replaceChildren();
+  appendSummaryRow(summary, 'Resultado', detected ? `🐄 ${data.detection_count} vaca(s)` : 'Sin detección', detected ? 'positive' : 'negative');
+  appendSummaryRow(summary, 'Inferencia', `${data.inference_time_ms} ms`);
+  appendSummaryRow(summary, 'Tamaño', `${data.image_width} × ${data.image_height}`);
   summary.style.display = 'block';
 }
-
-function drawBoxes(data) {
-  if (!data.cow_detected) return;
-
-  const img = preview;
-  const displayW = img.clientWidth;
-  const displayH = img.clientHeight;
-  const scaleX = displayW / data.image_width;
-  const scaleY = displayH / data.image_height;
-
+function drawBoxes(data, version) {
+  if (!isCurrent(version) || !data.cow_detected) return;
+  const displayW = preview.clientWidth;
+  const displayH = preview.clientHeight;
+  const imageWidth = Number(data.image_width);
+  const imageHeight = Number(data.image_height);
+  if (!displayW || !displayH || !imageWidth || !imageHeight) return;
+  const scaleX = displayW / imageWidth;
+  const scaleY = displayH / imageHeight;
   canvas.width = displayW;
   canvas.height = displayH;
   canvas.style.display = 'block';
-  canvas.style.width = displayW + 'px';
-  canvas.style.height = displayH + 'px';
-
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, displayW, displayH);
-
-  data.detections.forEach((d, i) => {
-    const color = COLORS[i % COLORS.length];
-    const x1 = d.x1 * scaleX;
-    const y1 = d.y1 * scaleY;
-    const w = (d.x2 - d.x1) * scaleX;
-    const h = (d.y2 - d.y1) * scaleY;
-
-    // Box
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(x1, y1, w, h);
-
-    // Label
-    const label = `cow ${(d.confidence*100).toFixed(0)}%`;
-    ctx.fillStyle = color;
-    ctx.font = '12px monospace';
-    const textW = ctx.measureText(label).width + 8;
-    ctx.fillRect(x1, y1 - 20, textW, 20);
-    ctx.fillStyle = '#000';
-    ctx.fillText(label, x1 + 4, y1 - 6);
+  canvas.style.width = `${displayW}px`;
+  canvas.style.height = `${displayH}px`;
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, displayW, displayH);
+  (Array.isArray(data.detections) ? data.detections : []).forEach((detection, index) => {
+    const color = COLORS[index % COLORS.length];
+    const x1 = Number(detection.x1) * scaleX;
+    const y1 = Number(detection.y1) * scaleY;
+    const width = (Number(detection.x2) - Number(detection.x1)) * scaleX;
+    const height = (Number(detection.y2) - Number(detection.y1)) * scaleY;
+    if (![x1, y1, width, height].every(Number.isFinite)) return;
+    context.strokeStyle = color;
+    context.lineWidth = 2;
+    context.strokeRect(x1, y1, width, height);
+    const confidence = Number(detection.confidence);
+    const label = `cow ${(Number.isFinite(confidence) ? confidence * 100 : 0).toFixed(0)}%`;
+    context.fillStyle = color;
+    context.font = '12px monospace';
+    const textWidth = context.measureText(label).width + 8;
+    context.fillRect(x1, y1 - 20, textWidth, 20);
+    context.fillStyle = '#000';
+    context.fillText(label, x1 + 4, y1 - 6);
   });
 }
-
-// Redraw on window resize
-window.addEventListener('resize', () => {
-  if (preview.style.display !== 'none' && canvas.style.display !== 'none') {
-    // Re-trigger draw with last data — we store it
+async function fetchReadiness() {
+  const requestId = ++readinessRequestId;
+  readinessController?.abort();
+  readinessController = new AbortController();
+  bcsStatus = null;
+  bcsReadiness.dataset.status = 'loading';
+  bcsReadiness.textContent = 'BCS: comprobando disponibilidad…';
+  updateBcsControls();
+  try {
+    const response = await fetch('/ready/bcs', { signal: readinessController.signal });
+    const payload = await responsePayload(response);
+    if (requestId !== readinessRequestId) return;
+    const status = payload && READINESS_STATUSES.has(payload.status) ? payload.status : 'unavailable';
+    bcsStatus = status;
+    bcsReadiness.dataset.status = status;
+    bcsReadiness.textContent = `${status}: ${READINESS_MESSAGES[status]}`;
+  } catch (error) {
+    if (error.name === 'AbortError' || requestId !== readinessRequestId) return;
+    bcsStatus = 'unavailable';
+    bcsReadiness.dataset.status = 'unavailable';
+    bcsReadiness.textContent = `unavailable: ${READINESS_MESSAGES.unavailable}`;
+  } finally {
+    if (requestId === readinessRequestId) {
+      readinessController = null;
+      updateBcsControls();
+    }
   }
+}
+function updateBcsControls() {
+  calculateBcs.disabled = bcsLoading || !selectedFile || !['ready', 'not_loaded'].includes(bcsStatus);
+}
+function renderBcsResult(data) {
+  bcsResults.replaceChildren();
+  const score = Number(data.bcs_score);
+  if (!Number.isInteger(score) || score < 1 || score > 5) {
+    showError(bcsResults, 500, 'La respuesta no contiene un score BCS válido.');
+    return;
+  }
+  const card = createTextElement('section', 'score-card', '');
+  card.append(createTextElement('p', 'score-label', 'Score BCS'));
+  card.append(createTextElement('p', 'score-value', String(score)));
+  const detail = createTextElement('div', 'bcs-detail', '');
+  appendSummaryRow(detail, 'Estado', String(data.status || 'ok'));
+  appendSummaryRow(detail, 'Mensaje', String(data.message || 'BCS calculado.'));
+  appendSummaryRow(detail, 'Cow detected', data.cow_detected === null ? 'Not reported' : (data.cow_detected ? 'Detected' : 'Not detected'));
+  card.append(detail);
+  bcsResults.append(card);
+}
+calculateBcs.addEventListener('click', async () => {
+  if (calculateBcs.disabled || !selectedFile) return;
+  const version = selectionVersion;
+  bcsLoading = true;
+  updateBcsControls();
+  bcsResults.replaceChildren();
+  bcsProgress.textContent = 'Calculando BCS…';
+  bcsProgress.hidden = false;
+  bcsController = new AbortController();
+  const formData = new FormData();
+  formData.append('file', selectedFile);
+  try {
+    const response = await fetch('/bcs', {
+      method: 'POST', body: formData, signal: bcsController.signal,
+    });
+    const payload = await responsePayload(response);
+    if (!isCurrent(version)) return;
+    if (!response.ok) {
+      showError(bcsResults, response.status, mappedErrorMessage(response.status, payload, 'No se pudo calcular el BCS.'));
+      return;
+    }
+    renderBcsResult(payload);
+  } catch (error) {
+    if (!isCurrent(version) || error.name === 'AbortError') return;
+    showError(bcsResults, '—', 'Error de conexión con el servicio BCS.');
+  } finally {
+    if (isCurrent(version)) {
+      bcsLoading = false;
+      bcsController = null;
+      bcsProgress.hidden = true;
+      updateBcsControls();
+    }
+  }
+});
+refreshReadiness.addEventListener('click', fetchReadiness);
+window.addEventListener('resize', () => {
+  if (latestDetection && latestDetectionVersion === selectionVersion) {
+    drawBoxes(latestDetection, latestDetectionVersion);
+  }
+});
+window.addEventListener('beforeunload', () => {
+  if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
 });
 </script>
 </body>

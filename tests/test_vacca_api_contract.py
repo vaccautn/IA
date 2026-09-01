@@ -294,3 +294,18 @@ def test_bcs_readiness_openapi_and_health_remain_bcs_independent(monkeypatch) ->
 def test_prototype_ui_uses_active_detection_model_label() -> None:
     html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
     assert "Modelo: combined-v2-finetune (Navid + BCS)" in html
+
+
+def test_prototype_ui_delivery_and_bcs_contract() -> None:
+    response = main.prototype_ui()
+    assert response.status_code == 200
+    html = response.body.decode("utf-8")
+    for fragment in (
+        'role="tablist"', 'id="detectTab"', 'id="bcsTab"', 'aria-selected=',
+        'id="bcsReadiness"', 'GET /ready/bcs', 'POST /bcs', 'Calculate BCS',
+        'bcs_score', 'Not reported', 'aria-live="polite"', 'combined-v2-finetune',
+        'ready', 'not_loaded', 'unconfigured', 'unavailable',
+    ):
+        assert fragment in html
+    assert "innerHTML" not in html
+    assert "FileReader" not in html
