@@ -15,7 +15,7 @@ validado. La detección HTTP de Fase 1 y el serving BCS son capacidades separada
 | `src/vacca_bcs/` comprometido | Integer snapshot, dataset ordinal y pipeline de modelo/transformaciones. | `constants.py`, `integer_snapshot.py`, `dataset.py`, `model.py` y source-plan modules |
 | Cliente de fuente BCS | Cliente HTTP autenticado y estricto para consumir el export versionado de la fuente. | `source_client.py` y `tests/test_bcs_source_client.py` |
 | Modelo ordinal BCS | Versionado, probado con fixtures temporales y expuesto mediante un servicio de imagen completa cuando hay checkpoint. | `BCSOrdinalModel`, `CORALHead`, `coral_loss` y `predict` en `model.py`; `serving.py` |
-| Entrenamiento y reanudación ordinales | Código, configuración y pruebas versionados; no hay una ejecución real comprometida. | `scripts/train_bcs_ordinal.py`, `configs/training_bcs_ordinal.yaml` y artefactos `weights/last.pt`/`run_info.json` sólo cuando una operación local los genera |
+| Entrenamiento y reanudación ordinales | Código, configuración, pruebas y un run local completado. | `scripts/train_bcs_ordinal.py`, `configs/training_bcs_ordinal.yaml`, runbook y artefactos locales `weights/last.pt`/`run_info.json` |
 | `tests/` | Gates de contratos, baseline, Phase 1 pipeline y BCS ordinal. | Archivos `test_*.py` versionados en la rama, incluidos los caminos reales temporales |
 
 ## Flujo actual de detección HTTP
@@ -90,6 +90,26 @@ internally, but its semantic class projection is the integer score `1..5`. The
 trainer records configuration, the live manifest, and runtime identity to reject
 incompatible resumes. Unsupported legacy or stale-lineage artifacts are rejected
 and are not migrated.
+
+### Invariantes de entrenamiento y determinismo
+
+- El loader de entrenamiento conserva `num_workers=0`: las transformaciones
+  aleatorias permanecen en el proceso principal y no cambia la trayectoria
+  histórica de RNG ni las actualizaciones del modelo.
+- La validación puede usar `val_num_workers` independientes (por defecto `2`),
+  semilla y generador propios, workers con seeding seguro para Windows,
+  `prefetch_factor=2`, `persistent_workers=false` y pin memory sólo en CUDA.
+  Sus transformaciones son deterministas y no consumen el RNG de entrenamiento.
+- La arquitectura, LANCZOS, augmentations, batch size, optimizer, modo numérico,
+  algoritmos deterministas, frecuencia de validación y checkpoints atómicos con
+  `fsync` son invariantes. La acumulación de loss y métricas en el dispositivo
+  sólo reduce sincronizaciones; no cambia gradients ni updates.
+- El progreso se imprime en ASCII y con flush en cada límite estable; la cadencia
+  configurable por defecto es cada 50 batches y siempre incluye el batch final.
+
+El baseline local completado, sus gates y la evidencia de benchmark están en
+`reports/bcs-training-baseline-2026-09-02.md`. La cobertura efectiva sigue
+limitada a `[3,4]`; `[1,2,5]` no está validada.
 
 ## Frontera de serving BCS
 

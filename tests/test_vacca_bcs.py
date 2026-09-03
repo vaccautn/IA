@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import os
 import random
@@ -25,6 +26,7 @@ from scripts.train_bcs_ordinal import (  # noqa: E402
     RESUMABLE_CHECKPOINT_FIELDS,
     _build_last_checkpoint,
     _build_provenance,
+    _checkpoint_lineage,
     _coverage_from_manifest,
     _validate_class_coverage,
     _runtime_identity,
@@ -40,9 +42,11 @@ from scripts.train_bcs_ordinal import (  # noqa: E402
     _restore_rng_state,
     set_seed,
     load_config,
+    TORCH_SEED_MAX,
 )
 from scripts.train_bcs_ordinal import main as train_main  # noqa: E402
 import scripts.train_bcs_ordinal as trainer  # noqa: E402
+from scripts.run_bcs_overnight import _validate_best_checkpoint  # noqa: E402
 from vacca_bcs.constants import (  # noqa: E402
     BCS_CLASS_SCORES,
     BCS_DOMAIN_ID,
@@ -226,6 +230,9 @@ def _write_config(tmp_path: Path, name: str = "config.yaml", **overrides: object
         "optimizer": "AdamW",
         "patience": 2,
         "num_workers": 0,
+        "val_num_workers": 0,
+        "val_seed": 1,
+        "progress_every_batches": 50,
         "imgsz": 32,
         "device": "cpu",
         "seed": 0,
@@ -276,6 +283,128 @@ def test_load_config_rejects_invalid_training_boundaries(
 def test_load_config_rejects_warmup_longer_than_training(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="warmup_epochs"):
         load_config(_write_config(tmp_path, epochs=2, warmup_epochs=3))
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "valid"),
+    [
+        ("seed", TORCH_SEED_MAX, True),
+        ("seed", TORCH_SEED_MAX + 1, False),
+        ("val_seed", TORCH_SEED_MAX, True),
+        ("val_seed", TORCH_SEED_MAX + 1, False),
+    ],
+)
+def test_torch_seed_bounds_are_validated_before_output_creation(
+    tmp_path: Path, key: str, value: int, valid: bool
+) -> None:
+    values = {"seed": 42}
+    values[key] = value
+    path = _write_config(tmp_path, **values)
+    output = tmp_path / "out"
+    output.mkdir()
+    marker = output / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    if valid:
+        loaded = load_config(path)
+        assert loaded[key] == value
+    else:
+        with pytest.raises(ValueError, match="seed|val_seed"):
+            load_config(path)
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_derived_validation_seed_is_rejected_before_output_creation(tmp_path: Path) -> None:
+    path = _write_config(tmp_path, seed=TORCH_SEED_MAX)
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    config.pop("val_seed")
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    output = tmp_path / "out"
+    output.mkdir()
+    marker = output / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    with pytest.raises(ValueError, match="val_seed"):
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        trainer.train(config)
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_training_workers_are_fixed_at_zero_and_validation_workers_are_configurable(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="num_workers must be 0"):
+        load_config(_write_config(tmp_path, num_workers=1))
+    config = load_config(_write_config(tmp_path, val_num_workers=2, val_seed=99))
+    assert config["val_num_workers"] == 2
+    assert config["val_seed"] == 99
+
+
+def test_data_loader_omits_multiprocessing_kwargs_for_worker_zero(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    class _Loader:
+        def __init__(self, dataset, **kwargs) -> None:
+            captured.append(kwargs)
+
+    monkeypatch.setattr(trainer, "DataLoader", _Loader)
+    trainer._build_data_loader(
+        object(),
+        batch_size=2,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+    )
+    trainer._build_data_loader(
+        object(),
+        batch_size=2,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        generator=trainer._validation_generator(99),
+    )
+    assert "prefetch_factor" not in captured[0]
+    assert "persistent_workers" not in captured[0]
+    assert "worker_init_fn" not in captured[0]
+    assert captured[1]["prefetch_factor"] == 2
+    assert captured[1]["persistent_workers"] is False
+    assert captured[1]["worker_init_fn"] is trainer._worker_init_fn
+
+
+def test_validation_generator_and_worker_seed_are_independent(monkeypatch) -> None:
+    torch.manual_seed(123)
+    before = torch.get_rng_state()
+    first = trainer._validation_generator(99)
+    second = trainer._validation_generator(99)
+    after = torch.get_rng_state()
+    assert torch.equal(before, after)
+    assert torch.equal(torch.rand(4, generator=first), torch.rand(4, generator=second))
+
+    seeds: list[int] = []
+    monkeypatch.setattr(trainer.random, "seed", lambda seed: seeds.append(seed))
+    monkeypatch.setattr(trainer.torch, "initial_seed", lambda: 2**32 + 17)
+    trainer._worker_init_fn(0)
+    assert seeds == [17]
+
+
+def test_validation_workers_preserve_order_and_parent_training_rng() -> None:
+    dataset = [(torch.tensor([float(index)]), index) for index in range(5)]
+    set_seed(1234)
+    before = torch.get_rng_state()
+    loader = trainer._build_data_loader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=False,
+        generator=trainer._validation_generator(99),
+    )
+    observed = [(images[:, 0].tolist(), levels.tolist()) for images, levels in loader]
+    after = torch.get_rng_state()
+    assert torch.equal(before, after)
+    assert observed == [
+        ([0.0, 1.0], [0, 1]),
+        ([2.0, 3.0], [2, 3]),
+        ([4.0], [4]),
+    ]
 
 
 def test_coverage_policy_is_strict_and_canonical_local_roots_are_supported(tmp_path: Path) -> None:
@@ -998,6 +1127,157 @@ def test_validate_reports_null_recall_for_unobserved_validation_classes() -> Non
     assert metrics["recall"]["5"] is None
 
 
+def test_optimized_validation_matches_reference_with_partial_final_batch() -> None:
+    class _FixedLogitsModel(torch.nn.Module):
+        def forward(self, images: torch.Tensor) -> torch.Tensor:
+            logits = torch.tensor(
+                [
+                    [-8.0, -8.0, -8.0, -8.0],
+                    [8.0, 8.0, -8.0, -8.0],
+                    [8.0, 8.0, 8.0, 8.0],
+                ]
+            )
+            return logits[images[:, 0, 0, 0].long()]
+
+    loader = [
+        (torch.tensor([[[[0.0]]], [[[1.0]]]]), torch.tensor([0, 2])),
+        (torch.tensor([[[[2.0]]]]), torch.tensor([3])),
+    ]
+    model = _FixedLogitsModel()
+    optimized = trainer._validate(model, loader, torch.device("cpu"))
+
+    exact = 0
+    pm1 = 0
+    absolute_error = 0
+    total = 0
+    class_total = [0] * len(CLASS_NAMES)
+    class_correct = [0] * len(CLASS_NAMES)
+    with torch.no_grad():
+        for images, levels in loader:
+            pred_idx, _ = predict(model(images))
+            errors = (pred_idx - levels).abs()
+            exact += int((errors == 0).sum().item())
+            pm1 += int((errors <= 1).sum().item())
+            absolute_error += int(errors.sum().item())
+            total += levels.shape[0]
+            for class_idx in range(len(CLASS_NAMES)):
+                mask = levels == class_idx
+                class_total[class_idx] += int(mask.sum().item())
+                class_correct[class_idx] += int(((pred_idx == class_idx) & mask).sum().item())
+    reference = {
+        "exact_acc": exact / total,
+        "pm1_acc": pm1 / total,
+        "mae": absolute_error / total,
+        "recall": {
+            name: (
+                class_correct[index] / class_total[index]
+                if class_total[index]
+                else None
+            )
+            for index, name in enumerate(CLASS_NAMES)
+        },
+        "total": total,
+    }
+    assert optimized == reference
+
+
+def test_training_updates_and_loss_match_reference_with_seeded_batches(capsys) -> None:
+    batches = [
+        (
+            torch.tensor([[float((index % 7) + 1)]]),
+            torch.tensor([index % 4]),
+        )
+        for index in range(512)
+    ]
+
+    def run_optimized() -> tuple[dict[str, torch.Tensor], dict, float]:
+        set_seed(17)
+        model = torch.nn.Linear(1, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        loss = trainer._train_epoch(model, batches, optimizer, torch.device("cpu"))
+        return model.state_dict(), optimizer.state_dict(), loss
+
+    def run_reference() -> tuple[dict[str, torch.Tensor], dict, float]:
+        set_seed(17)
+        model = torch.nn.Linear(1, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        loss_total = 0.0
+        samples = 0
+        for images, levels in batches:
+            optimizer.zero_grad(set_to_none=True)
+            loss = coral_loss(model(images), levels)
+            loss.backward()
+            optimizer.step()
+            loss_total += loss.item()
+            samples += levels.shape[0]
+        return model.state_dict(), optimizer.state_dict(), loss_total / samples
+
+    optimized = run_optimized()
+    reference = run_reference()
+    assert f"{optimized[2]:.8f}" == f"{reference[2]:.8f}"
+    assert all(
+        torch.equal(optimized[0][key], reference[0][key])
+        for key in optimized[0]
+    )
+    assert optimized[1]["param_groups"] == reference[1]["param_groups"]
+    assert optimized[1]["state"].keys() == reference[1]["state"].keys()
+    for parameter_id, state in optimized[1]["state"].items():
+        for key, value in state.items():
+            reference_value = reference[1]["state"][parameter_id][key]
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(value, reference_value)
+            else:
+                assert value == reference_value
+    assert capsys.readouterr().out == ""
+
+
+def test_progress_uses_cadence_final_batch_and_ascii_flush(capsys) -> None:
+    set_seed(18)
+    model = torch.nn.Linear(1, 4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    batches = [
+        (torch.ones(1, 1), torch.tensor([0])),
+        (torch.ones(1, 1), torch.tensor([1])),
+        (torch.ones(1, 1), torch.tensor([2])),
+    ]
+    trainer._train_epoch(
+        model,
+        batches,
+        optimizer,
+        torch.device("cpu"),
+        epoch=11,
+        total_epochs=30,
+        progress_every_batches=2,
+    )
+    lines = capsys.readouterr().out.splitlines()
+    assert [line.split("]", 1)[0] + "]" for line in lines] == [
+        "[TRAIN 11/30 2/3]",
+        "[TRAIN 11/30 3/3]",
+    ]
+    assert all(line.isascii() for line in lines)
+    assert all("loss=" in line and "elapsed=" in line and "eta=" in line for line in lines)
+
+
+def test_training_progress_prints_are_flushed(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *args, **kwargs: calls.append(kwargs),
+    )
+    model = torch.nn.Linear(1, 4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    trainer._train_epoch(
+        model,
+        [(torch.ones(1, 1), torch.tensor([0]))],
+        optimizer,
+        torch.device("cpu"),
+        epoch=1,
+        total_epochs=1,
+        progress_every_batches=50,
+    )
+    assert calls and all(call.get("flush") is True for call in calls)
+
+
 def test_results_csv_validates_deterministic_partial_recall_json() -> None:
     row = [
         "1", "0.001", "1.0", "0.5", "0.9", "0.25",
@@ -1078,6 +1358,105 @@ def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -
         "seed": 7,
         "_config_path": str(tmp_path / "config.yaml"),
     }
+
+
+def _valid_best_artifacts(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output)
+    config["allow_partial_class_coverage"] = False
+    config["data_root"] = config["data_dir"]
+    config["output_dir"] = config["output"]
+    config_path = Path(config["_config_path"])
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    data_dir = Path(config["data_dir"])
+    manifest_path = data_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for record in manifest["records"]:
+        image_path = data_dir / record["relative_path"]
+        image = Image.new("RGB", (8, 8), (record["bcs_score"] * 20, 40, 80))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG")
+        content = buffer.getvalue()
+        image_path.write_bytes(content)
+        record["sha256"] = hashlib.sha256(content).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    provenance = _build_provenance(
+        config,
+        data_dir=data_dir,
+        output_dir=output,
+        device=torch.device("cpu"),
+        run_id="a" * 32,
+    )
+    model = BCSOrdinalModel(pretrained=False)
+    best_path = output / "weights" / "best.pt"
+    _atomic_torch_save(
+        {
+            **_checkpoint_lineage(provenance, provenance["run_id"]),
+            "model_state_dict": model.state_dict(),
+            "config": config,
+            "classes": list(CLASS_NAMES),
+            "provenance": provenance,
+            "epoch": 1,
+            "val_mae": 0.0356609410,
+        },
+        best_path,
+    )
+    _atomic_write_json(
+        trainer._results_lineage(provenance, provenance["run_id"]),
+        output / RESULTS_LINEAGE_FILENAME,
+    )
+    with (output / "results.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(RESULTS_FIELDNAMES)
+        writer.writerow(
+            [
+                1,
+                "0.01",
+                "1.0",
+                "0.96433906",
+                "1.0",
+                "0.03566094",
+                json.dumps({name: 1.0 for name in CLASS_NAMES}, sort_keys=True),
+            ]
+        )
+    return best_path, output, data_dir, config_path
+
+
+def test_overnight_validates_best_checkpoint_and_regression_direction(
+    tmp_path: Path, monkeypatch
+) -> None:
+    best, output, data_dir, config_path = _valid_best_artifacts(tmp_path)
+    monkeypatch.setattr(
+        trainer,
+        "_validate",
+        lambda *args: {
+            "exact_acc": 0.96433906,
+            "pm1_acc": 1.0,
+            "mae": 0.03566094,
+        },
+    )
+    result = _validate_best_checkpoint(best, output, data_dir, config_path)
+    assert result["best"] == {
+        "epoch": 1,
+        "mae": 0.03566094,
+        "exact_acc": 0.96433906,
+        "pm1_acc": 1.0,
+    }
+
+
+@pytest.mark.parametrize("mutation", ["corrupt", "foreign"])
+def test_overnight_rejects_corrupt_or_foreign_best_checkpoint(
+    tmp_path: Path, mutation: str
+) -> None:
+    best, output, data_dir, config_path = _valid_best_artifacts(tmp_path)
+    if mutation == "corrupt":
+        best.write_bytes(b"corrupt")
+    else:
+        checkpoint = torch.load(best, map_location="cpu", weights_only=True)
+        checkpoint["run_id"] = "b" * 32
+        torch.save(checkpoint, best)
+    with pytest.raises(RuntimeError, match="best checkpoint"):
+        _validate_best_checkpoint(best, output, data_dir, config_path)
 
 
 def test_cpu_runtime_identity_is_canonical_and_does_not_query_cuda(monkeypatch) -> None:
@@ -1345,7 +1724,7 @@ def _install_tiny_training_fakes(monkeypatch, calls: list[float], interrupt_at: 
     monkeypatch.setattr(trainer, "BCSOrdinalModel", _TinyModel)
     call_count = 0
 
-    def fake_train(model, loader, optimizer, device) -> float:
+    def fake_train(model, loader, optimizer, device, **kwargs) -> float:
         nonlocal call_count
         call_count += 1
         if interrupt_at == call_count:
@@ -1443,6 +1822,71 @@ def test_interrupted_and_resumed_workflow_matches_uninterrupted_run(
         resume=interrupted_output / "weights" / "last.pt",
     )
 
+    assert resumed_calls == pytest.approx(baseline_calls[1:])
+    assert (interrupted_output / "results.csv").read_bytes() == (
+        baseline_output / "results.csv"
+    ).read_bytes()
+
+
+@pytest.mark.parametrize("setting", ["val_num_workers", "val_seed", "progress_every_batches"])
+def test_resume_excluded_runtime_settings_preserve_training_state(
+    tmp_path: Path, monkeypatch, setting: str
+) -> None:
+    interrupted_output = tmp_path / "interrupted"
+    interrupted_config = _tiny_training_config(tmp_path, interrupted_output)
+    interrupted_config.update(
+        {"val_num_workers": 0, "val_seed": 11, "progress_every_batches": 2}
+    )
+    interrupted_calls: list[float] = []
+    _install_tiny_training_fakes(monkeypatch, interrupted_calls, interrupt_at=2)
+    with pytest.raises(KeyboardInterrupt):
+        trainer.train(interrupted_config, overwrite=True)
+
+    baseline_output = tmp_path / "baseline"
+    baseline_config = _tiny_training_config(tmp_path, baseline_output)
+    baseline_config.update(
+        {"val_num_workers": 0, "val_seed": 11, "progress_every_batches": 2}
+    )
+    baseline_calls: list[float] = []
+    _install_tiny_training_fakes(monkeypatch, baseline_calls)
+    trainer.train(baseline_config, overwrite=True)
+
+    changed_value = {
+        "val_num_workers": 2,
+        "val_seed": 23,
+        "progress_every_batches": 7,
+    }[setting]
+    interrupted_config[setting] = changed_value
+    resumed_calls: list[float] = []
+    _install_tiny_training_fakes(monkeypatch, resumed_calls)
+    trainer.train(
+        interrupted_config,
+        resume=interrupted_output / "weights" / "last.pt",
+    )
+
+    interrupted_checkpoint = torch.load(
+        interrupted_output / "weights" / "last.pt", map_location="cpu", weights_only=True
+    )
+    baseline_checkpoint = torch.load(
+        baseline_output / "weights" / "last.pt", map_location="cpu", weights_only=True
+    )
+    assert all(
+        torch.equal(interrupted_checkpoint["model_state_dict"][key], baseline_checkpoint["model_state_dict"][key])
+        for key in baseline_checkpoint["model_state_dict"]
+    )
+    assert interrupted_checkpoint["optimizer_state_dict"]["param_groups"] == baseline_checkpoint["optimizer_state_dict"]["param_groups"]
+    for parameter_id, state in interrupted_checkpoint["optimizer_state_dict"]["state"].items():
+        for key, value in state.items():
+            expected = baseline_checkpoint["optimizer_state_dict"]["state"][parameter_id][key]
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(value, expected)
+            else:
+                assert value == expected
+    assert interrupted_checkpoint["rng_state"]["python"] == baseline_checkpoint["rng_state"]["python"]
+    assert torch.equal(
+        interrupted_checkpoint["rng_state"]["torch_cpu"],
+        baseline_checkpoint["rng_state"]["torch_cpu"],
+    )
     assert resumed_calls == pytest.approx(baseline_calls[1:])
     assert (interrupted_output / "results.csv").read_bytes() == (
         baseline_output / "results.csv"

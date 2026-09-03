@@ -68,6 +68,11 @@ RESULTS_LINEAGE_FILENAME = "results_lineage.json"
 RESULTS_LINEAGE_SCHEMA_VERSION = "bcs-ordinal-integer-results-v1"
 _DEFAULT_RUN_ID = "0" * 32
 _DEFAULT_SNAPSHOT_ID = "0" * 64
+TORCH_SEED_MAX = 2**64 - 1
+DEFAULT_PROGRESS_EVERY_BATCHES = 50
+_NON_MODEL_CONFIG_KEYS = frozenset(
+    {"val_num_workers", "val_seed", "progress_every_batches"}
+)
 
 RESULTS_FIELDNAMES = [
     "epoch",
@@ -172,6 +177,8 @@ def _validate_training_config(config: dict[str, Any]) -> None:
     if "output" not in config and "output_dir" in config:
         config["output"] = config["output_dir"]
     config.setdefault("allow_partial_class_coverage", False)
+    config.setdefault("val_num_workers", 2)
+    config.setdefault("progress_every_batches", DEFAULT_PROGRESS_EVERY_BATCHES)
     if type(config.get("allow_partial_class_coverage")) is not bool:
         raise ValueError("allow_partial_class_coverage must be a strict boolean")
     warmup_epochs = config.get("warmup_epochs", 2)
@@ -188,6 +195,25 @@ def _validate_training_config(config: dict[str, Any]) -> None:
         value = warmup_epochs if key == "warmup_epochs" else config.get(key)
         if type(value) is not int or value < minimum:
             raise ValueError(f"{key} must be an integer >= {minimum}")
+
+    if config["seed"] > TORCH_SEED_MAX:
+        raise ValueError(f"seed must be <= {TORCH_SEED_MAX} for Torch")
+    if "val_seed" not in config:
+        config["val_seed"] = config["seed"] + 1
+
+    for key, minimum in (
+        ("val_num_workers", 0),
+        ("val_seed", 0),
+        ("progress_every_batches", 1),
+    ):
+        value = config[key]
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{key} must be an integer >= {minimum}")
+    if config["val_seed"] > TORCH_SEED_MAX:
+        raise ValueError(f"val_seed must be <= {TORCH_SEED_MAX} for Torch")
+
+    if config["num_workers"] != 0:
+        raise ValueError("num_workers must be 0 for reproducible training")
 
     if warmup_epochs > config["epochs"]:
         raise ValueError("warmup_epochs cannot exceed epochs")
@@ -372,7 +398,9 @@ def _build_provenance(
     run_id: str = _DEFAULT_RUN_ID,
 ) -> dict[str, Any]:
     config_for_hash = {
-        key: value for key, value in config.items() if not key.startswith("_")
+        key: value
+        for key, value in config.items()
+        if not key.startswith("_") and key not in _NON_MODEL_CONFIG_KEYS
     }
     config_for_hash.setdefault("allow_partial_class_coverage", False)
     config_for_hash["data_dir"] = str(data_dir.resolve())
@@ -940,8 +968,9 @@ def _reconcile_results_csv(results_path: Path, *, checkpoint_epoch: int) -> int:
     _atomic_write_results_prefix(results_path, committed_rows)
     if len(data_rows) > checkpoint_epoch:
         print(
-            f"[INFO] results.csv tenía {len(data_rows)} épocas; truncado a la"
-            f" época {checkpoint_epoch} para coincidir con el checkpoint."
+            f"[INFO] results.csv had {len(data_rows)} epochs; truncated to epoch "
+            f"{checkpoint_epoch} to match the checkpoint.",
+            flush=True,
         )
     return checkpoint_epoch
 
@@ -1122,89 +1151,195 @@ def _set_learning_rate(optimizer: torch.optim.Optimizer, lr: float) -> None:
         group["lr"] = lr
 
 
+def _format_duration(seconds: float) -> str:
+    return f"{seconds:.1f}s"
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    """Seed worker-local Python randomness without touching the parent process."""
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+
+
+def _build_data_loader(
+    dataset: BCSFolderDataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    generator: torch.Generator | None = None,
+) -> DataLoader[tuple[Tensor, int]]:
+    """Build a loader without passing multiprocessing-only options to worker=0."""
+    kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if generator is not None:
+        kwargs["generator"] = generator
+    if num_workers > 0:
+        kwargs.update(
+            {
+                "prefetch_factor": 2,
+                "persistent_workers": False,
+                "worker_init_fn": _worker_init_fn,
+            }
+        )
+    return DataLoader(dataset, **kwargs)
+
+
+def _validation_generator(seed: int) -> torch.Generator:
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
 def _train_epoch(
     model: BCSOrdinalModel,
     loader: DataLoader[tuple[Tensor, int]],
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    *,
+    epoch: int | None = None,
+    total_epochs: int | None = None,
+    progress_every_batches: int = DEFAULT_PROGRESS_EVERY_BATCHES,
 ) -> float:
     model.train()
-    loss_total = 0.0
+    loss_total = torch.zeros((), dtype=torch.float64, device=device)
     samples = 0
-    for images, levels in loader:
+    total_batches = len(loader)
+    started = time.perf_counter()
+    for batch_number, (images, levels) in enumerate(loader, start=1):
         images = images.to(device, non_blocking=True)
         levels = levels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         loss = coral_loss(model(images), levels)
         loss.backward()
         optimizer.step()
-        loss_total += loss.item()
+        loss_total += loss.detach().to(torch.float64)
         samples += levels.shape[0]
-    return loss_total / max(1, samples)
+        if epoch is not None and total_epochs is not None and (
+            batch_number % progress_every_batches == 0 or batch_number == total_batches
+        ):
+            elapsed = time.perf_counter() - started
+            eta = elapsed * max(0, total_batches - batch_number) / batch_number
+            print(
+                f"[TRAIN {epoch}/{total_epochs} {batch_number}/{total_batches}] "
+                f"loss={loss_total.item() / max(1, samples):.8f} "
+                f"elapsed={_format_duration(elapsed)} eta={_format_duration(eta)}",
+                flush=True,
+            )
+    return float(loss_total.item()) / max(1, samples)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def _validate(
     model: BCSOrdinalModel,
     loader: DataLoader[tuple[Tensor, int]],
     device: torch.device,
 ) -> dict[str, Any]:
     model.eval()
-    exact = 0
-    plus_minus_one = 0
-    absolute_index_error = 0
-    total = 0
-    class_total = [0] * len(CLASS_NAMES)
-    class_correct = [0] * len(CLASS_NAMES)
+    exact = torch.zeros((), dtype=torch.int64, device=device)
+    plus_minus_one = torch.zeros((), dtype=torch.int64, device=device)
+    absolute_index_error = torch.zeros((), dtype=torch.int64, device=device)
+    total = torch.zeros((), dtype=torch.int64, device=device)
+    class_total = torch.zeros(len(CLASS_NAMES), dtype=torch.int64, device=device)
+    class_correct = torch.zeros(len(CLASS_NAMES), dtype=torch.int64, device=device)
 
     for images, levels in loader:
         images = images.to(device, non_blocking=True)
         levels = levels.to(device, non_blocking=True)
         pred_idx, _ = predict(model(images))
         errors = (pred_idx - levels).abs()
-        exact += int((errors == 0).sum().item())
-        plus_minus_one += int((errors <= 1).sum().item())
-        absolute_index_error += int(errors.sum().item())
-        total += levels.shape[0]
+        exact += (errors == 0).sum()
+        plus_minus_one += (errors <= 1).sum()
+        absolute_index_error += errors.sum()
+        total += levels.numel()
         for class_idx in range(len(CLASS_NAMES)):
             mask = levels == class_idx
-            class_total[class_idx] += int(mask.sum().item())
-            class_correct[class_idx] += int(((pred_idx == class_idx) & mask).sum().item())
+            class_total[class_idx] += mask.sum()
+            class_correct[class_idx] += ((pred_idx == class_idx) & mask).sum()
+
+    summary = torch.cat(
+        (
+            exact.reshape(1),
+            plus_minus_one.reshape(1),
+            absolute_index_error.reshape(1),
+            total.reshape(1),
+            class_total,
+            class_correct,
+        )
+    ).cpu().tolist()
+    exact_value, pm1_value, absolute_error_value, total_value = summary[:4]
+    class_total_values = summary[4 : 4 + len(CLASS_NAMES)]
+    class_correct_values = summary[4 + len(CLASS_NAMES) :]
 
     recalls = {
         class_name: (
-            class_correct[index] / class_total[index]
-            if class_total[index]
+            class_correct_values[index] / class_total_values[index]
+            if class_total_values[index]
             else None
         )
         for index, class_name in enumerate(CLASS_NAMES)
     }
     return {
-        "exact_acc": exact / max(1, total),
-        "pm1_acc": plus_minus_one / max(1, total),
-        "mae": SCORE_STEP * absolute_index_error / max(1, total),
+        "exact_acc": exact_value / max(1, total_value),
+        "pm1_acc": pm1_value / max(1, total_value),
+        "mae": SCORE_STEP * absolute_error_value / max(1, total_value),
         "recall": recalls,
-        "total": total,
+        "total": total_value,
     }
 
 
-def train(
-    config: dict[str, Any],
-    *,
-    resume: Path | None = None,
-    overwrite: bool = False,
-) -> dict[str, Any]:
+@dataclass
+class TrainingContext:
+    config: dict[str, Any]
+    total_epochs: int
+    device: torch.device
+    data_dir: Path
+    output_dir: Path
+    resume: Path | None
+    checkpoint: dict[str, Any] | None
+    run_id: str
+    provenance: dict[str, Any]
+    start_epoch: int
+    best_mae: float
+    epochs_without_improvement: int
+    weights_dir: Path
+    results_path: Path
+    run_info_context: RunInfoContext
+    train_loader: DataLoader[tuple[Tensor, int]] | None
+    val_loader: DataLoader[tuple[Tensor, int]] | None
+    model: torch.nn.Module | None
+    optimizer: torch.optim.Optimizer | None
+    epoch_range: range
+
+
+@dataclass(frozen=True)
+class TrainingResult:
+    final_metrics: dict[str, Any]
+    train_loss: float
+    best_mae: float
+    epochs_without_improvement: int
+
+
+def _initialize_training(
+    config: dict[str, Any], *, resume: Path | None, overwrite: bool
+) -> TrainingContext:
+    """Validate inputs and assemble the resumable training context."""
     _validate_training_config(config)
     total_epochs = int(config["epochs"])
     device = resolve_device(str(config["device"]))
     data_dir = _resolve_path(config["data_dir"])
     output_dir = _resolve_path(config["output"])
+    if device.type == "cuda":
+        print(f"[DEVICE] {device} {torch.cuda.get_device_name(device)}", flush=True)
+    else:
+        print(f"[DEVICE] {device}", flush=True)
 
-    start_epoch = 0
-    best_mae = float("inf")
-    epochs_without_improvement = 0
     checkpoint: dict[str, Any] | None = None
-
     if resume is None and _existing_run_artifacts(output_dir) and not overwrite:
         _prepare_output_dir(output_dir, overwrite=False)
     if resume is not None:
@@ -1227,19 +1362,23 @@ def train(
         output_dir.mkdir(parents=True, exist_ok=True)
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
+
     set_seed(int(config["seed"]))
+    start_epoch = 0
+    best_mae = float("inf")
+    epochs_without_improvement = 0
     if resume is not None:
         _restore_rng_state(checkpoint)
         start_epoch = int(checkpoint["epoch"])
         best_mae = float(checkpoint["best_mae"])
         epochs_without_improvement = int(checkpoint["epochs_without_improvement"])
         print(
-            f"[INFO] Reanudando desde {resume}: época {start_epoch} completada, "
-            f"mejor MAE={best_mae:.4f} BCS. Objetivo total: {total_epochs} épocas."
+            f"[INFO] Resuming from {resume}: epoch {start_epoch} completed; "
+            f"best MAE={best_mae:.4f}. Target total: {total_epochs} epochs.",
+            flush=True,
         )
 
     weights_dir = output_dir / "weights"
-
     train_dataset = BCSFolderDataset(
         data_dir / "train", train=True, imgsz=int(config["imgsz"])
     )
@@ -1265,25 +1404,28 @@ def train(
     results_path = output_dir / "results.csv"
     if checkpoint is not None:
         _reconcile_results_csv(results_path, checkpoint_epoch=start_epoch)
-        if start_epoch == total_epochs:
-            run_info = _build_run_info(
-                replace(run_info_context, terminal_finalization=True)
-            )
-            _atomic_write_json(run_info, output_dir / "run_info.json")
-            return {
-                "run_info": run_info,
-                "final_metrics": {},
-                "best_mae": best_mae,
-                "output_dir": output_dir,
-            }
-    loader_kwargs = {
-        "batch_size": int(config["batch_size"]),
-        "num_workers": int(config["num_workers"]),
-        "pin_memory": device.type == "cuda",
-    }
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    if checkpoint is not None and start_epoch == total_epochs:
+        return TrainingContext(
+            config, total_epochs, device, data_dir, output_dir, resume, checkpoint,
+            run_id, provenance, start_epoch, best_mae, epochs_without_improvement,
+            weights_dir, results_path, run_info_context, None, None, None, None, range(0)
+        )
 
+    train_loader = _build_data_loader(
+        train_dataset,
+        batch_size=int(config["batch_size"]),
+        shuffle=True,
+        num_workers=0,
+        pin_memory=device.type == "cuda",
+    )
+    val_loader = _build_data_loader(
+        val_dataset,
+        batch_size=int(config["batch_size"]),
+        shuffle=False,
+        num_workers=int(config["val_num_workers"]),
+        pin_memory=device.type == "cuda",
+        generator=_validation_generator(int(config["val_seed"])),
+    )
     model = BCSOrdinalModel(pretrained=checkpoint is None).to(device)
     optimizer_name = str(config["optimizer"]).lower()
     if optimizer_name != "adamw":
@@ -1307,27 +1449,85 @@ def train(
     if checkpoint is not None and epochs_without_improvement >= int(config["patience"]):
         print(
             f"[INFO] Early stopping already reached at epoch {start_epoch}; "
-            "no additional epoch was run."
+            "no additional epoch was run.",
+            flush=True,
         )
         epoch_range = range(0)
+    return TrainingContext(
+        config, total_epochs, device, data_dir, output_dir, resume, checkpoint,
+        run_id, provenance, start_epoch, best_mae, epochs_without_improvement,
+        weights_dir, results_path, run_info_context, train_loader, val_loader,
+        model, optimizer, epoch_range
+    )
 
-    csv_file, writer = _open_results_csv(results_path, append=checkpoint is not None)
+
+def _save_best_checkpoint(
+    context: TrainingContext, *, epoch: int, best_mae: float
+) -> None:
+    assert context.model is not None
+    state_dict = {
+        key: value.detach().cpu() for key, value in context.model.state_dict().items()
+    }
+    _atomic_torch_save(
+        {
+            **_checkpoint_lineage(context.provenance, context.run_id),
+            "model_state_dict": state_dict,
+            "config": context.config,
+            "classes": list(CLASS_NAMES),
+            "provenance": context.provenance,
+            "epoch": epoch,
+            "val_mae": best_mae,
+        },
+        context.weights_dir / "best.pt",
+    )
+
+
+def _execute_training(context: TrainingContext) -> TrainingResult:
+    """Run epochs and persist each committed history/checkpoint unit."""
+    assert context.model is not None
+    assert context.optimizer is not None
+    assert context.train_loader is not None
+    assert context.val_loader is not None
     final_metrics: dict[str, Any] = {}
     train_loss = 0.0
+    best_mae = context.best_mae
+    epochs_without_improvement = context.epochs_without_improvement
+    csv_file, writer = _open_results_csv(
+        context.results_path, append=context.checkpoint is not None
+    )
     with csv_file:
-        for epoch in epoch_range:
-            current_lr = float(config["lr"]) * _lr_factor(
+        for epoch in context.epoch_range:
+            current_lr = float(context.config["lr"]) * _lr_factor(
                 epoch,
-                total_epochs,
-                int(config.get("warmup_epochs", 2)),
+                context.total_epochs,
+                int(context.config.get("warmup_epochs", 2)),
             )
-            _set_learning_rate(optimizer, current_lr)
-            train_loss = _train_epoch(model, train_loader, optimizer, device)
-            metrics = _validate(model, val_loader, device)
+            _set_learning_rate(context.optimizer, current_lr)
+            epoch_number = epoch + 1
+            print(
+                f"[EPOCH {epoch_number}/{context.total_epochs}] training: "
+                f"{len(context.train_loader)} batches",
+                flush=True,
+            )
+            train_loss = _train_epoch(
+                context.model,
+                context.train_loader,
+                context.optimizer,
+                context.device,
+                epoch=epoch_number,
+                total_epochs=context.total_epochs,
+                progress_every_batches=int(context.config["progress_every_batches"]),
+            )
+            print(
+                f"[EPOCH {epoch_number}/{context.total_epochs}] validating: "
+                f"{len(context.val_loader)} batches",
+                flush=True,
+            )
+            metrics = _validate(context.model, context.val_loader, context.device)
             final_metrics = metrics
             writer.writerow(
                 {
-                    "epoch": epoch + 1,
+                    "epoch": epoch_number,
                     "lr": f"{current_lr:.10g}",
                     "train_loss": f"{train_loss:.8f}",
                     "val_exact_acc": f"{metrics['exact_acc']:.8f}",
@@ -1337,89 +1537,117 @@ def train(
                 }
             )
             _flush_and_fsync(csv_file)
+            elapsed = time.perf_counter() - context.run_info_context.started_time
+            epochs_done = epoch - context.start_epoch + 1
+            remaining_epochs = max(0, context.total_epochs - epoch_number)
+            eta = elapsed * remaining_epochs / max(1, epochs_done)
             print(
-                f"[ÉPOCA {epoch + 1}/{total_epochs}] "
-                f"loss={train_loss:.5f} "
-                f"exact={metrics['exact_acc']:.4f} "
-                f"±1={metrics['pm1_acc']:.4f} "
-                f"MAE={metrics['mae']:.4f} BCS"
+                f"[EPOCH {epoch_number}/{context.total_epochs}] complete: "
+                f"loss={train_loss:.8f} exact={metrics['exact_acc']:.8f} "
+                f"pm1={metrics['pm1_acc']:.8f} MAE={metrics['mae']:.8f} "
+                f"elapsed={_format_duration(elapsed)} eta={_format_duration(eta)}",
+                flush=True,
             )
             print(
                 "  Recall: "
                 + ", ".join(
                     f"{class_name}={recall if recall is None else format(recall, '.3f')}"
                     for class_name, recall in metrics["recall"].items()
-                )
+                ),
+                flush=True,
             )
-
             if metrics["mae"] < best_mae:
                 best_mae = metrics["mae"]
                 epochs_without_improvement = 0
-                state_dict = {
-                    key: value.detach().cpu()
-                    for key, value in model.state_dict().items()
-                }
-                _atomic_torch_save(
-                    {
-                        **_checkpoint_lineage(provenance, run_id),
-                        "model_state_dict": state_dict,
-                        "config": config,
-                        "classes": list(CLASS_NAMES),
-                        "provenance": provenance,
-                        "epoch": epoch + 1,
-                        "val_mae": best_mae,
-                    },
-                    weights_dir / "best.pt",
-                )
+                _save_best_checkpoint(context, epoch=epoch_number, best_mae=best_mae)
             else:
                 epochs_without_improvement += 1
-
             _atomic_torch_save(
                 _build_last_checkpoint(
-                    model,
-                    optimizer,
-                    epoch=epoch + 1,
+                    context.model,
+                    context.optimizer,
+                    epoch=epoch_number,
                     best_mae=best_mae,
                     epochs_without_improvement=epochs_without_improvement,
-                    config=config,
-                    provenance=provenance,
+                    config=context.config,
+                    provenance=context.provenance,
                 ),
-                weights_dir / "last.pt",
+                context.weights_dir / "last.pt",
             )
-
-            if epochs_without_improvement >= int(config["patience"]):
-                print(f"[INFO] Early stopping en época {epoch + 1}.")
+            if epochs_without_improvement >= int(context.config["patience"]):
+                print(f"[INFO] Early stopping at epoch {epoch_number}.", flush=True)
                 break
+    return TrainingResult(
+        final_metrics, train_loss, best_mae, epochs_without_improvement
+    )
 
-    run_info = _build_run_info(run_info_context)
-    _atomic_write_json(run_info, output_dir / "run_info.json")
-    print(f"\n[LISTO] Entrenamiento BCS completado en {run_info['wall_time_seconds']:.1f}s.")
-    print(f"  Directorio: {output_dir}")
-    print(f"  Mejor checkpoint: {weights_dir / 'best.pt'}")
-    print(f"  Checkpoint reanudable: {weights_dir / 'last.pt'}")
-    if final_metrics:
+
+def _finalize_training(context: TrainingContext, result: TrainingResult) -> dict[str, Any]:
+    run_info = _build_run_info(context.run_info_context)
+    _atomic_write_json(run_info, context.output_dir / "run_info.json")
+    print(
+        f"\n[DONE] BCS training completed in {run_info['wall_time_seconds']:.1f}s.",
+        flush=True,
+    )
+    print(f"  Directory: {context.output_dir}", flush=True)
+    print(f"  Best checkpoint: {context.weights_dir / 'best.pt'}", flush=True)
+    print(f"  Resumable checkpoint: {context.weights_dir / 'last.pt'}", flush=True)
+    if result.final_metrics:
         print(
-            f"  Final: loss={train_loss:.5f}, "
-            f"exact={final_metrics['exact_acc']:.4f}, "
-            f"±1={final_metrics['pm1_acc']:.4f}, "
-            f"MAE={final_metrics['mae']:.4f} BCS"
+            f"  Final: loss={result.train_loss:.5f}, "
+            f"exact={result.final_metrics['exact_acc']:.4f}, "
+            f"pm1={result.final_metrics['pm1_acc']:.4f}, "
+            f"MAE={result.final_metrics['mae']:.4f}",
+            flush=True,
         )
     return {
         "run_info": run_info,
-        "final_metrics": final_metrics,
-        "best_mae": best_mae,
-        "output_dir": output_dir,
+        "final_metrics": result.final_metrics,
+        "best_mae": result.best_mae,
+        "output_dir": context.output_dir,
     }
+
+
+def train(
+    config: dict[str, Any],
+    *,
+    resume: Path | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    context = _initialize_training(config, resume=resume, overwrite=overwrite)
+    if context.checkpoint is not None and context.start_epoch == context.total_epochs:
+        run_info = _build_run_info(
+            replace(context.run_info_context, terminal_finalization=True)
+        )
+        _atomic_write_json(run_info, context.output_dir / "run_info.json")
+        return {
+            "run_info": run_info,
+            "final_metrics": {},
+            "best_mae": context.best_mae,
+            "output_dir": context.output_dir,
+        }
+    result = _execute_training(context)
+    return _finalize_training(context, result)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the VACCA ordinal BCS model")
     parser.add_argument("--config", required=True, help="YAML training configuration")
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--data-dir", default=None)
-    parser.add_argument("--output", default=None)
+    parser.add_argument("--epochs", type=int, default=None, help="Override total epochs")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Training device: auto, cpu, or cuda[:index] (config default)",
+    )
+    parser.add_argument("--data-dir", default=None, help="Override the snapshot directory")
+    parser.add_argument("--output", default=None, help="Override the run output directory")
+    parser.add_argument(
+        "--progress-every-batches",
+        type=int,
+        default=None,
+        help="Override the configured training progress cadence in batches",
+    )
     guard = parser.add_mutually_exclusive_group()
     guard.add_argument(
         "--overwrite",
@@ -1438,7 +1666,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config_path = _resolve_path(args.config)
     if not config_path.is_file():
-        print(f"[ERROR] Config file not found: {config_path}", file=sys.stderr)
+        print(f"[ERROR] Config file not found: {config_path}", file=sys.stderr, flush=True)
         return 1
     try:
         config = load_config(config_path)
@@ -1448,6 +1676,7 @@ def main(argv: list[str] | None = None) -> int:
             "device": args.device,
             "data_dir": args.data_dir,
             "output": args.output,
+            "progress_every_batches": args.progress_every_batches,
         }
         for key, value in overrides.items():
             if value is not None:
@@ -1455,7 +1684,7 @@ def main(argv: list[str] | None = None) -> int:
         resume_path = _resolve_path(args.resume) if args.resume else None
         train(config, resume=resume_path, overwrite=args.overwrite)
     except (FileExistsError, FileNotFoundError, RuntimeError, ValueError, yaml.YAMLError) as exc:
-        print(f"[ERROR] Training failed: {exc}", file=sys.stderr)
+        print(f"[ERROR] Training failed: {exc}", file=sys.stderr, flush=True)
         return 1
     return 0
 

@@ -11,7 +11,10 @@ optimizer: AdamW
 lr_schedule: cosine
 warmup_epochs: 2
 patience: 8
-num_workers: 0
+num_workers: 0 # Keep randomized training transforms in the main process.
+val_num_workers: 2 # Validation is deterministic and may use independent workers.
+val_seed: 43 # Independent DataLoader worker/startup seed; not training RNG.
+progress_every_batches: 50 # Live training progress cadence; final batch is always shown.
 imgsz: 224
 device: auto
 seed: 42
