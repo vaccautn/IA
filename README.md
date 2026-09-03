@@ -7,17 +7,18 @@ Microservicio de detección de bovinos con YOLO26n fine-tuneado sobre Navid HSM 
 
 - [Estado del repositorio](docs/estado-del-repositorio.md): estado operativo, gates, riesgos y próximos pasos.
 - [Arquitectura](docs/arquitectura.md): responsabilidades, flujos y límites entre detección, builder BCS y backend.
-- [API](docs/api.md): prerrequisitos, rutas, contratos actuales y troubleshooting.
+- [API](docs/api.md): serving, contratos actuales y troubleshooting.
+- [Runbook de entrenamiento BCS](docs/bcs-training-runbook.md): ejecución fresca,
+  resume, progreso, logs y handoff al API.
 
 ## Estado actual
 
 La detección de Fase 1 mantiene un camino local de prototipo. El pipeline entero
 de fuente a snapshot, el núcleo ordinal BCS, el trainer y el serving BCS están
-implementados y cubiertos por pruebas deterministas. No se ha producido ni
-accedido todavía a un dataset, entrenamiento o checkpoint BCS real: sin
-`VACCA_BCS_CHECKPOINT`, `/bcs` responde `503` y `/ready/bcs` no está listo. Esto
-no representa un despliegue de usuario final. Ver el [estado detallado](docs/estado-del-repositorio.md)
-antes de operar o revisar Phase 2.
+implementados y cubiertos por pruebas deterministas. El run local BCS se completó
+en CUDA hasta la época 30; la API no fue iniciada y el checkpoint permanece como
+artefacto local ignorado. Ver el [estado detallado](docs/estado-del-repositorio.md)
+y el [baseline de entrenamiento](reports/bcs-training-baseline-2026-09-02.md).
 
 ## Requisitos
 
@@ -49,9 +50,8 @@ entorno del proyecto:
 .venv\Scripts\python -m ruff check src scripts tests
 ```
 
-La verificación actual usó el fallback global configurado `ruff 0.15.20` porque
-este `.venv` no contiene Ruff; el resultado fue `0 diagnostics`. La instalación
-del extra `dev` sigue siendo el camino reproducible.
+La verificación reproducible usa Ruff `0.15.20` desde el `.venv` y terminó con
+`0 diagnostics`. El extra `dev` conserva esa versión fijada.
 
 ## Setup rápido
 
@@ -103,9 +103,10 @@ $env:VACCA_BCS_CHECKPOINT = "C:\secure\models\bcs-ordinal-integer-checkpoint-v1.
 Después arrastrá una imagen o seleccioná un archivo. La pestaña `Detect` conserva
 el envío automático y dibuja bounding boxes; la pestaña `BCS` consulta
 `/ready/bcs` al abrirse y sólo envía la imagen a `/bcs` al pulsar `Calculate BCS`.
-El checkpoint BCS real todavía no existe en este checkout: sin configuración la
-UI muestra honestamente `unconfigured` y mantiene el cálculo deshabilitado. Las
-pruebas de API usan un runtime falso controlado; no sustituyen un checkpoint real.
+El checkpoint BCS real del run local existe sólo como artefacto ignorado: sin
+configuración la UI muestra honestamente `unconfigured` y mantiene el cálculo
+deshabilitado. Las pruebas de API usan un runtime falso controlado; no sustituyen
+la validación operativa del checkpoint local.
 
 > ⚠ La UI es un prototipo para validación. Para producción, borrá `src/vacca_api/static/index.html` y la ruta `/ui` de `main.py`.
 
@@ -187,121 +188,28 @@ change. This path remains separate from the integer BCS pipeline below.
 
 ## Phase 2 — Integer ordinal BCS pipeline
 
-The supported Phase 2 workflow has exactly three stages:
+The supported workflow has source, deterministic integer snapshot, and ordinal
+training stages. The complete command set, preflight, resume rules, live progress,
+and log handling are in the [canonical BCS training runbook](docs/bcs-training-runbook.md).
 
-1. **Source:** use the local `bcs-local-folder-v1` folders by default, or select the authenticated backend export explicitly.
-2. **Integer snapshot v2:** normalize the selected source, create the deterministic split, materialize records, and publish a transactional snapshot.
-3. **Trainer:** validate that snapshot and train the ordinal model with `scripts/train_bcs_ordinal.py` into the source-specific output root.
-
-```powershell
-# Local source (default; no backend credentials, R2, or network)
-.venv\Scripts\python scripts/build_bcs_integer.py --source local --local-root data/bcs/dataset --output data/bcs-local-integer-v1
-.venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
-
-# Backend source (explicit future path; requires the authenticated export/R2 path)
-$env:VACCA_BACKEND_URL = "https://backend.example"
-$env:VACCA_BACKEND_TOKEN = "<token-from-your-secret-store>"
-.venv\Scripts\python scripts/build_bcs_integer.py --source backend --output data/bcs-integer-v1
-.venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml --data-dir data/bcs-integer-v1 --output outputs/bcs-ordinal-integer-v1
-```
-
-The local builder defaults to `--local-root data/bcs/dataset` and snapshot
-`data/bcs-local-integer-v1`; its fixed mapping is `3.25/3.5 → 3` and
-`3.75/4.0/4.25 → 4`. The current folder source observes only classes `3` and `4`
-(`1`, `2`, and `5` have no source folder), so
-`[3, 4]` is documented coverage, not a five-class validation result. The model
-domain remains `1..5`; an initial checkpoint is valid only for this observed
-`3/4` coverage until classes `1`, `2`, and `5` are supplied. Backend mode keeps
-the distinct `data/bcs-integer-v1` and `outputs/bcs-ordinal-integer-v1` roots and
-is an optional future path requiring backend source-export and signed-evidence
-endpoints. Both modes refuse an existing output root and report safe counts.
-Use `--base-url` instead of `VACCA_BACKEND_URL` when appropriate, plus `--seed`,
-`--val-ratio`, `--timeout`, `--max-source-bytes`, and `--max-image-bytes` to make
-operational limits explicit. The token is read only from `VACCA_BACKEND_TOKEN`.
-The active domain is `bcs-integer-1-5` with classes `1..5`.
-
-The local path needs no backend, R2, or token. The optional backend path has the
-backend owning authentication and R2; IA sends the Bearer token only to the
-backend, receives source metadata and signed evidence URLs, and downloads the
-evidence from those URLs without forwarding the token. Signed URLs are not
-retained. Only the optional backend workflow requires real backend access; neither
-path is run by the repository verification below.
-
-Artifacts with an unsupported schema or stale lineage are rejected by the active
-loader and trainer. There is no conversion, fallback, or legacy workflow.
-
-### Training and verification
-
-The ordinal core, trainer, checkpoint loader, and API boundary are versioned and
-covered by deterministic tests using controlled images and tensors. A checkpoint
-is accepted only with a validated integer snapshot manifest, matching snapshot
-identity, domain, scale, configuration, and run lineage. The serving path uses
-the full image (no YOLO detection or crop), returns no confidence, and rounds its
-continuous CORAL expectation to the integer `1..5` only at the HTTP boundary;
-exact `.5` ties round down.
+The local mapping is `3.25/3.5 -> 3` and `3.75/4.0/4.25 -> 4`. Current coverage
+is only `[3,4]`; classes `1`, `2`, and `5` are absent and are not validated. The
+model domain remains integer `1..5`. The optional backend path keeps its separate
+roots and credentials boundary. Unsupported schema or stale lineage is rejected.
 
 ### Serving BCS
 
-Configure a real, lineage-compatible checkpoint only when one exists:
+Configure the completed local checkpoint only after validating its lineage:
 
 ```powershell
-$env:VACCA_BCS_CHECKPOINT = "C:\secure\models\bcs-ordinal-integer-checkpoint-v1.pt"
+$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-local-integer-v1\weights\best.pt").Path
 $env:VACCA_BCS_DEVICE = "cpu" # optional; cpu is the default
 .venv\Scripts\python scripts/run_api.py
 ```
 
 The BCS loader is lazy and isolated from `/health` and `/detect`. `/ready/bcs`
-reports readiness without loading. Until a real checkpoint is configured and
-loaded, `/bcs` returns `503`; no end-user deployment is claimed.
-
-### Prerrequisitos y ejecución
-
-- Python 3.11 or later.
-- A `.venv` with the BCS dependencies installed (`.venv\Scripts\python -m pip install -e ".[bcs]"`).
-- A generated local snapshot at `data/bcs-local-integer-v1/` with its v2 manifest validated before training.
-- A fresh operational run may require ImageNet backbone weights; transition tests use `pretrained=False` and do not download models.
-
-Start an operational run with:
-
-```powershell
-.venv\Scripts\python scripts/train_bcs_ordinal.py --config configs/training_bcs_ordinal.yaml
-```
-
-The local configured directory contains `results.csv`, `run_info.json`,
-`weights/best.pt`, and the resumable checkpoint `weights/last.pt`. A fresh run
-rejects existing artifacts; `--overwrite` allows replacement after validation.
-`--resume outputs/bcs-ordinal-local-integer-v1/weights/last.pt` requires
-compatible configuration, live manifest/dataset, snapshot identity, domain, and
-`run_id`. Serving validation preserves the five-class `1..5` model contract but
-the initial local checkpoint must be treated as validated only on classes `3,4`.
-
-### Orquestación overnight (preparada, no ejecutada)
-
-Valida rutas, entorno y artefactos antes de iniciar cualquier CLI; no inicia la API
-y conserva logs en el directorio ignorado `logs/bcs-overnight/`.
-
-```powershell
-# Preflight local (sin build, entrenamiento, red ni datos)
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --preflight-only
-# Noche nueva
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset
-# Reanudar (conserva el snapshot y usa weights/last.pt)
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --skip-build --resume
-```
-Por la mañana, revisar el log y el `weights/best.pt` compatible; configurar el
-checkpoint, iniciar la API manualmente y verificar las dos rutas:
-
-```powershell
-$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-local-integer-v1\weights\best.pt").Path
-.venv\Scripts\python.exe scripts/run_api.py
-Invoke-RestMethod http://127.0.0.1:8000/ready/bcs
-Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs -Method Post -Form @{file=Get-Item "vaca.jpg"}
-```
-
-Verification for this branch state: `.venv\Scripts\python.exe -m pytest -q`
-reports `487 passed, 3 skipped, 2 warnings, 65 subtests passed`. The warnings are the
-known FastAPI `on_event` deprecations. This verification did not access real BCS
-data, outputs, model weights, or run training.
+reports readiness without loading; start the API manually only for the serving
+handoff described in [API](docs/api.md).
 
 ## Resultados de entrenamiento
 

@@ -1,13 +1,14 @@
 # Estado del repositorio
 
-Esta es la referencia rápida para saber qué está implementado y probado en
-`IA`, y qué sigue pendiente como operación real. El estado corresponde a la rama
-`feature/bcs-ordinal-phase-2`; no implica un despliegue de usuario final ni la
-existencia de pesos BCS reales.
+Esta es la referencia rápida para saber qué está implementado, probado y
+ejecutado en `IA`, y qué sigue pendiente como operación de servicio. El estado
+corresponde a la rama `feature/bcs-ordinal-phase-2`; no implica un despliegue de
+usuario final.
 
 ## Ruta rápida
 
 - Para operar la detección y BCS: [API](api.md).
+- Para entrenar o reanudar BCS: [runbook canónico](bcs-training-runbook.md).
 - Para entender módulos, flujos y límites: [Arquitectura](arquitectura.md).
 - Para instalar y ejecutar el flujo entero: [README](../README.md).
 
@@ -17,17 +18,24 @@ existencia de pesos BCS reales.
 |---|---|---|---|
 | Detección de Fase 1 | Implementada y probada en código | `/health`, `/detect`, `/ui`, detector YOLO y esquemas versionados. | El servidor requiere el output YOLO local bajo `outputs/`; no se registró un arranque en esta auditoría. |
 | Baseline de detección | Verificado | Modelo, fixture, manifiesto y reporte baseline están intencionalmente versionados. | El baseline no equivale a una evaluación de calidad ni a un despliegue. |
-| Fuente BCS | Local implementada y probada; backend opcional | `data/bcs/dataset` usa carpetas fraccionales y no requiere backend/R2/token; `BCSSourceClient` queda para el futuro backend. | Falta revisar un árbol local real y, por separado, autorizar acceso backend. |
-| Snapshot BCS | Implementada y probada | Local: `data/bcs-local-integer-v1/`; backend futuro: `data/bcs-integer-v1/`; ambos usan `bcs-integer-snapshot-v2`. | No se ha ejecutado un build real en esta auditoría. |
-| Modelo y trainer BCS | Implementados y probados con temporales | ResNet18 + CORAL conserva clases `1..5`, trainer, resume y validación de lineage; la fuente local observada sólo cubre `[3,4]`. | Falta entrenamiento real; `[1,2,5]` no están validadas. |
-| Checkpoint BCS | Loader implementado y probado | Se exige `bcs-ordinal-integer-checkpoint-v1`, dominio/escala estrictos y lineage de snapshot/run; el checkpoint local inicial sólo se valida para `[3,4]`. | No existe ni se ha accedido a un checkpoint BCS real. |
-| Serving BCS | Implementado y probado | `/bcs` usa imagen completa, no YOLO/crop, lazy loading, half-down en el límite, sin confidence y fallos sanitizados. | Requiere configurar y verificar un checkpoint real antes de operar. |
+| Fuente BCS | Local implementada y ejecutada; backend opcional | `data/bcs/dataset` usa carpetas fraccionales y no requiere backend/R2/token; `BCSSourceClient` queda para el futuro backend. | Autorizar y verificar por separado un export backend si se necesita. |
+| Snapshot BCS | Implementada, probada y ejecutada | `data/bcs-local-integer-v1/` usa `bcs-integer-snapshot-v2` y conserva identidad/digests. | El snapshot es un artefacto local ignorado. |
+| Modelo y trainer BCS | Implementados, probados y ejecutados | ResNet18 + CORAL conserva clases `1..5`; el run local completó 30 épocas y el trainer optimizado mantiene resume/lineage. | `[1,2,5]` no están validadas. |
+| Checkpoint BCS | Loader implementado y probado; checkpoint local generado | Se exige `bcs-ordinal-integer-checkpoint-v1`, dominio/escala estrictos y lineage de snapshot/run; `best.pt` y `last.pt` existen localmente. | Configurar y verificar el checkpoint antes de servir. |
+| Serving BCS | Implementado y probado | `/bcs` usa imagen completa, no YOLO/crop, lazy loading, half-down en el límite, sin confidence y fallos sanitizados. | Falta el handoff operativo controlado del API. |
 | Readiness BCS | Implementada y probada | `/ready/bcs` no carga; sólo `ready` devuelve 200. Los otros tres estados devuelven 503 con `BCSReadinessResponse`. | La transición a `ready` depende del checkpoint real. |
-| Integración final | No completada | La frontera y el cliente están definidos; `/health` y `/detect` permanecen independientes. | Export real, entrenamiento, pesos, despliegue y verificación end-to-end. |
+| Integración final | No completada | La frontera y el cliente están definidos; `/health` y `/detect` permanecen independientes. | Configuración del checkpoint, despliegue y verificación end-to-end del API. |
 
 La presencia de un archivo, test o commit demuestra una implementación versionada,
 no disponibilidad productiva. `data/`, `outputs/`, checkpoints, runs y reportes
 generados están ignorados por Git.
+
+## Baseline completado
+
+El run local reanudado desde la época 10 terminó en la época 30 sobre CUDA. Sus
+métricas, identidad, hashes y gates direccionales pertenecen al [reporte
+baseline inmutable](../reports/bcs-training-baseline-2026-09-02.md). Las clases
+1, 2 y 5 faltan explícitamente.
 
 ## Flujo soportado
 
@@ -51,14 +59,14 @@ se rechazan. El backend conserva su flujo opcional en sus raíces distintas
 
 | Gate | Resultado | Alcance |
 |---|---|---|
-| Suite completa | `487 passed`, `3 skipped`, `2 warnings`, `65 subtests` | `.venv\Scripts\python.exe -m pytest -q` en el estado documentado de esta rama; sin datos BCS reales ni entrenamiento. |
+| Suite completa | `509 passed`, `3 skipped`, `2 warnings`, `65 subtests` | `.venv\Scripts\python.exe -m pytest -q`; sin otro entrenamiento completo. |
 | Contrato API/serving | Cubierto por pruebas | Upload compartido, `/bcs`, readiness, OpenAPI, redondeo, sanitización y aislamiento de `/health`/`/detect`. |
 | Pipeline BCS | Cubierto con temporales | Imágenes controladas, snapshot, transforms, forward/predict, optimizer, checkpoint y lineage en CPU. |
-| Ruff | Limpio | Ruff global configurado `0.15.20`: `0 diagnostics`. El `.venv` no contiene Ruff; se usó el fallback global. El extra `dev` lo fija para una instalación reproducible. |
+| Ruff | Limpio | `.venv\Scripts\python.exe -m ruff check src scripts tests` terminó con `0 diagnostics`. |
 
-Las dos omisiones y las advertencias pertenecen a la ejecución verificada; las
-advertencias son las deprecaciones conocidas de FastAPI `on_event`. Ningún test
-demuestra rendimiento de un dataset real ni habilita por sí solo un despliegue.
+Las tres omisiones y las advertencias pertenecen a la ejecución verificada; las
+advertencias son las deprecaciones conocidas de FastAPI `on_event`. Los tests no
+habilitan por sí solos un despliegue ni sustituyen la cobertura faltante de clases.
 
 ## Artefactos y Git
 
@@ -74,38 +82,17 @@ signed URLs a documentación, commits o archivos de configuración versionados.
 
 ## Próximos pasos operacionales
 
-1. Revisar el árbol local autorizado bajo `data/bcs/dataset` sin modificarlo.
-2. Generar y revisar el snapshot local bajo `data/bcs-local-integer-v1/`.
-3. Entrenar el modelo ordinal y conservar la procedencia de
-   `outputs/bcs-ordinal-local-integer-v1/` fuera de Git.
-4. Configurar `VACCA_BCS_CHECKPOINT` y opcionalmente `VACCA_BCS_DEVICE=cpu`.
-5. Verificar `/ready/bcs`, `/bcs`, fallos y despliegue en un entorno controlado.
+1. Configurar `VACCA_BCS_CHECKPOINT` con el `best.pt` local compatible.
+2. Iniciar la API manualmente y verificar `/ready/bcs`, `/bcs`, fallos y
+   despliegue en un entorno controlado.
 
 La ruta backend futura requiere autorización separada, `VACCA_BACKEND_URL` y
 `VACCA_BACKEND_TOKEN` sólo en el entorno del builder.
 
-Hasta completar esos pasos, el estado correcto es “código implementado y
-probado; operación BCS real pendiente”.
+Hasta completar esos pasos, el estado correcto es “código y entrenamiento BCS
+implementados y probados; serving BCS real pendiente”.
 
-## Runbook overnight (preparado, no ejecutado)
+## Runbook
 
-El script es inerte hasta invocarlo, no inicia la API y deja salidas en el directorio
-ignorado `logs/bcs-overnight/<run-id>/`. Ejecutar desde `IA`:
-
-```powershell
-# Preflight local: no requiere backend, no escanea imágenes ni inicia subprocess
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --preflight-only
-# Noche nueva
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset
-# Reanudar sin reconstruir snapshot local
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --skip-build --resume
-```
-No se ejecutó este runbook. Por la mañana, revisar `weights/best.pt`, configurar el
-entorno, arrancar la API manualmente y comprobar `/ready/bcs` y `/bcs`:
-
-```powershell
-$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-local-integer-v1\weights\best.pt").Path
-.venv\Scripts\python.exe scripts/run_api.py
-Invoke-RestMethod http://127.0.0.1:8000/ready/bcs
-Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs -Method Post -Form @{file=Get-Item "vaca.jpg"}
-```
+La ejecución fresca, el resume, el progreso, los logs tee y el handoff al API
+están documentados únicamente en el [runbook canónico](bcs-training-runbook.md).

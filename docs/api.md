@@ -2,9 +2,9 @@
 
 Esta es la guía operativa del servicio FastAPI actual. La detección de Fase 1 y
 el endpoint BCS están implementados, pero son capacidades independientes:
-`/detect` usa el detector YOLO local; `/bcs` usa, bajo demanda, un checkpoint
-ordinal BCS configurado por entorno. No se ha producido todavía un checkpoint BCS
-real, por lo que una instalación sin configuración BCS responde `503`.
+`/detect` usa el detector YOLO local; `/bcs` usa, bajo demanda, el checkpoint
+ordinal BCS configurado por entorno. El run local produjo un checkpoint ignorado
+por Git; una instalación sin configuración BCS responde `503`.
 
 ## Camino rápido
 
@@ -42,7 +42,7 @@ ruta `VACCA_BCS_CHECKPOINT`; no carga el modelo durante la importación ni al
 consultar `/ready/bcs`. `VACCA_BCS_DEVICE` es opcional y por defecto vale `cpu`.
 
 ```powershell
-$env:VACCA_BCS_CHECKPOINT = "C:\secure\models\bcs-ordinal-integer-checkpoint-v1.pt"
+$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-local-integer-v1\weights\best.pt").Path
 $env:VACCA_BCS_DEVICE = "cpu"
 .venv\Scripts\python scripts/run_api.py
 ```
@@ -77,13 +77,13 @@ requiere pulsar `Calculate BCS`. Al seleccionar la pestaña se consulta
 rutas se muestran con mensajes sanitizados y el score exitoso se presenta como un
 entero `1..5`, sin confianza; `cow_detected: null` se muestra como `Not reported`.
 
-El checkpoint BCS real todavía no está presente. Por eso una ejecución sin
+El checkpoint BCS real del run local permanece fuera de Git. Una ejecución sin
 `VACCA_BCS_CHECKPOINT` debe mostrar `unconfigured` y no debe interpretarse como un
 score. Para probar la UI con una capacidad real, configurá únicamente un
 checkpoint compatible y arrancá la API:
 
 ```powershell
-$env:VACCA_BCS_CHECKPOINT = "C:\secure\models\bcs-ordinal-integer-checkpoint-v1.pt"
+$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-local-integer-v1\weights\best.pt").Path
 $env:VACCA_BCS_DEVICE = "cpu" # opcional
 .venv\Scripts\python scripts/run_api.py
 ```
@@ -187,48 +187,17 @@ Estados y status HTTP:
 | `ready` | 200 | `BCS capability is ready.` |
 | `unavailable` | 503 | `BCS capability is unavailable.` |
 
-## Arquitectura y límites
+## Handoff desde entrenamiento
 
-La ejecución overnight soportada por defecto es local: lee `data/bcs/dataset`, no
-requiere backend, R2, token ni red. El backend sigue siendo dueño de autenticación,
-persistencia y R2 para la ruta futura opcional; IA consume `GET /api/bcs-source-v1`
-con Bearer sólo en ese modo.
-
-El flujo de build es:
-
-```text
-  data/bcs/dataset (3.25/3.5→3; 3.75/4.0/4.25→4)
-  → scripts/run_bcs_overnight.py (local default)
-  → data/bcs-local-integer-v1/ (bcs-integer-snapshot-v2)
-  → scripts/train_bcs_ordinal.py
-  → outputs/bcs-ordinal-local-integer-v1/
-  → VACCA_BCS_CHECKPOINT (serving)
-```
-
-Las carpetas fraccionales se mapean a las clases enteras `3` y `4`; la cobertura
-observada es `[3,4]` y `[1,2,5]` está explícitamente ausente, por lo que no se
-validan esos scores. El modelo y su dominio siguen siendo cinco clases `1..5`.
-`data/bcs-local-integer-v1/` y `outputs/bcs-ordinal-local-integer-v1/` son las
-raíces locales; la ruta backend futura conserva las raíces distintas
-`data/bcs-integer-v1/` y `outputs/bcs-ordinal-integer-v1/`. Los snapshots son
-deterministas y loader/trainer validan dominio, escala y lineage.
-
-### Runbook local
-
-```powershell
-# No lee contenidos de imágenes ni inicia subprocess
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --preflight-only
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset
-# Sólo después de una interrupción, reutiliza snapshot y last.pt
-.venv\Scripts\python.exe scripts/run_bcs_overnight.py --source local --local-root data/bcs/dataset --skip-build --resume
-```
-
-Estas instrucciones preparan una ejecución; no documentan una ejecución realizada
-ni validan operativamente `/ready/bcs` o `/bcs`.
+La construcción del snapshot, el entrenamiento fresco o reanudado, la validación
+de checkpoints y los logs están documentados únicamente en el [runbook canónico
+de entrenamiento BCS](bcs-training-runbook.md). Esta página se limita a configurar
+el checkpoint y comprobar el serving.
 
 ## Troubleshooting y verificación
 
-- Confirmá que el output YOLO de Fase 1 existe antes de arrancar la API.
+- Confirmá que el output YOLO de Fase 1 y el checkpoint BCS compatible existen antes
+  de arrancar la API.
 - Consultá `/ready/bcs` para distinguir `unconfigured`, `not_loaded`, `ready` y
   `unavailable` sin forzar la carga.
 - Si `/bcs` devuelve `503`, no lo interpretes como score: falta una capacidad
@@ -236,8 +205,5 @@ ni validan operativamente `/ready/bcs` o `/bcs`.
 - Usá `file` como nombre exacto del campo multipart.
 - Ejecutá la suite con `.venv\Scripts\python.exe -m pytest -q`.
 
-La suite verificada para este estado de la rama terminó con `487 passed, 3
-skipped, 2 warnings` y `65 subtests`; las advertencias son deprecaciones
-conocidas de FastAPI `on_event`. Ruff global `0.15.20` terminó con `0 diagnostics`;
-este `.venv` no contiene Ruff, por lo que se usó el ejecutable global configurado.
-El extra `dev` mantiene la instalación reproducible.
+La verificación de entrenamiento y del proyecto se mantiene en el runbook y en el
+estado del repositorio; esta página no duplica esos comandos.
