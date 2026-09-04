@@ -1,174 +1,50 @@
-# Arquitectura
+# Arquitectura BCS category 1..5
 
-`IA` contiene un prototipo de detección de bovinos y un pipeline ordinal BCS
-versionado para preparar datos, entrenar un modelo CORAL y servir un checkpoint
-validado. La detección HTTP de Fase 1 y el serving BCS son capacidades separadas;
-`/bcs` no usa YOLO ni el pipeline `vacca_vision`.
+La migración BCS usa únicamente la fuente local original, una frontera de
+filtración basada en grupos de captura derivados del nombre de archivo y el
+modelo CORAL como primera arquitectura de referencia.
 
-## Mapa de responsabilidades
-
-| Área | Responsabilidad actual | Referencias |
-|---|---|---|
-| `src/vacca_api/` | Adaptador FastAPI, carga del detector YOLO, runtime BCS lazy, esquemas HTTP, validación común y UI de prototipo. | `main.py`, `detection.py`, `bcs_runtime.py`, `bcs.py`, `schemas.py`, `upload_validation.py` |
-| `src/vacca_vision/` | Contratos de detección, validación de imágenes, reglas de aptitud y adaptador Ultralytics. | `contracts.py`, `image_validation.py`, `pipeline.py`, `ultralytics_adapter.py` |
-| `scripts/run_baseline.py` | Ejecuta el camino validado por manifiesto: snapshot, detector, pipeline y salida JSON. | `configs/baseline_manifest.json` |
-| `src/vacca_bcs/` comprometido | Integer snapshot, dataset ordinal y pipeline de modelo/transformaciones. | `constants.py`, `integer_snapshot.py`, `dataset.py`, `model.py` y source-plan modules |
-| Cliente de fuente BCS | Cliente HTTP autenticado y estricto para consumir el export versionado de la fuente. | `source_client.py` y `tests/test_bcs_source_client.py` |
-| Modelo ordinal BCS | Versionado, probado con fixtures temporales y expuesto mediante un servicio de imagen completa cuando hay checkpoint. | `BCSOrdinalModel`, `CORALHead`, `coral_loss` y `predict` en `model.py`; `serving.py` |
-| Entrenamiento y reanudación ordinales | Código, configuración, pruebas y un run local completado. | `scripts/train_bcs_ordinal.py`, `configs/training_bcs_ordinal.yaml`, runbook y artefactos locales `weights/last.pt`/`run_info.json` |
-| `tests/` | Gates de contratos, baseline, Phase 1 pipeline y BCS ordinal. | Archivos `test_*.py` versionados en la rama, incluidos los caminos reales temporales |
-
-## Flujo actual de detección HTTP
+## Flujo
 
 ```text
-UploadFile multipart
-    ↓
-POST /detect en vacca_api.main
-    ↓ valida content_type image/* y archivo no vacío
-bytes de imagen
-    ↓
-`vacca_api.detection.VACCADetector` → PIL → Ultralytics YOLO (conf=0.25)
-    ↓
-detecciones ordenadas por confianza
-    ↓
-DetectResponse JSON
+data/bcs/dataset/ (3.25, 3.5, 3.75, 4.0, 4.25)
+  ↓ scan + mapping + capture-group/digest validation
+data/bcs-category-v1/ (train/val/test × categories 1..5)
+  ↓ train_bcs_ordinal.py
+outputs/bcs-category-coral-v1/
+  ↓ validated hard-category serving
+POST /bcs → bcs_category: 1..5
 ```
 
-Detalles comprobables en el código:
-
-1. `scripts/run_api.py` añade `src/` al `sys.path` y entrega `vacca_api.main:app` a Uvicorn.
-2. El evento de startup llama `get_detector(model_path=MODEL_PATH)` y precarga el peso YOLO local `outputs/training/combined-v2-finetune/weights/best.pt`.
-3. `vacca_api.detection` abre los bytes con Pillow, convierte a RGB cuando corresponde y ejecuta YOLO con confianza `0.25`.
-4. `vacca_api.schemas` serializa `cow_detected`, `detection_count`, detecciones, dimensiones e `inference_time_ms`.
-
-El endpoint HTTP no usa `AptitudePipeline`, `ImageValidationConfig` ni `ClassificationResult` de `vacca_vision`. Ese camino desacoplado se usa desde `scripts/run_baseline.py` y tiene sus propios contratos y pruebas.
-
-## Integer BCS source-to-training flows
-
-```text
-data/bcs/dataset
-    ↓ local folder mapping
-data/bcs-local-integer-v1/ → train_bcs_ordinal.py
-    ↓
-outputs/bcs-ordinal-local-integer-v1/
-    ↓
-ResNet18 + CORAL → canonical integer BCS score 1..5
-
-optional backend export/R2
-    ↓ authenticated backend builder
-data/bcs-integer-v1/ → train_bcs_ordinal.py
-    ↓
-outputs/bcs-ordinal-integer-v1/
-```
-
-- The local path needs no backend, R2, token, network, or signed URL.
-- `source_client.py` and the backend path remain an optional future integration.
-- `source_plan.py` normalizes immutable source records and preserves provenance.
-- `source_split_plan.py` creates a deterministic train/validation layout for classes `1..5`.
-- `integer_snapshot.py` validates image bytes, writes the v2 manifest, and rejects unsupported legacy manifest families.
-- `data/` and `outputs/` are Git-ignored operational roots; no local dataset or checkpoint is part of the tracked checkout.
-
-### Local folder source
-
-`local_source.py` defines the bounded `bcs-local-folder-v1` source contract for
-`data/bcs/dataset` without scanning it in repository verification. It accepts only
-the exact folders `3.25`, `3.5`, `3.75`, `4.0` and `4.25`, mapping them to integer
-scores `3`, `3`, `4`, `4` and `4`; the five-class model domain remains `1..5`.
-The current observed coverage is `[3,4]`; `[1,2,5]` is missing and not validated.
-JPEG/PNG files are records. An XML file is only a paired unused sidecar and never
-supplies labels or content. Discovery rejects links, nested/unexpected paths,
-normalized collisions and duplicate content.
-Record identity is `sha256("bcs-local-folder-v1\\0" + normalized_relative_path)`.
-Materialization rechecks the root/path, reads one bounded file, and returns
-source-neutral bytes plus SHA-256; image decoding remains the snapshot builder's
-responsibility. Snapshot and training integration are intentionally separate.
-
-The folder dataset preserves the five ordered classes. `dataset.py` applies square
-letterboxing, training-only augmentation, and ImageNet normalization; `model.py`
-uses ResNet18 with an ordered CORAL head. The model may use floating-point tensors
-internally, but its semantic class projection is the integer score `1..5`. The
-trainer records configuration, the live manifest, and runtime identity to reject
-incompatible resumes. Unsupported legacy or stale-lineage artifacts are rejected
-and are not migrated.
-
-### Invariantes de entrenamiento y determinismo
-
-- El loader de entrenamiento conserva `num_workers=0`: las transformaciones
-  aleatorias permanecen en el proceso principal y no cambia la trayectoria
-  histórica de RNG ni las actualizaciones del modelo.
-- La validación puede usar `val_num_workers` independientes (por defecto `2`),
-  semilla y generador propios, workers con seeding seguro para Windows,
-  `prefetch_factor=2`, `persistent_workers=false` y pin memory sólo en CUDA.
-  Sus transformaciones son deterministas y no consumen el RNG de entrenamiento.
-- La arquitectura, LANCZOS, augmentations, batch size, optimizer, modo numérico,
-  algoritmos deterministas, frecuencia de validación y checkpoints atómicos con
-  `fsync` son invariantes. La acumulación de loss y métricas en el dispositivo
-  sólo reduce sincronizaciones; no cambia gradients ni updates.
-- El progreso se imprime en ASCII y con flush en cada límite estable; la cadencia
-  configurable por defecto es cada 50 batches y siempre incluye el batch final.
-
-El baseline local completado, sus gates y la evidencia de benchmark están en
-`reports/bcs-training-baseline-2026-09-02.md`. La cobertura efectiva sigue
-limitada a `[3,4]`; `[1,2,5]` no está validada.
-
-## Frontera de serving BCS
-
-`bcs_runtime.py` mantiene un runtime por proceso con cuatro estados:
-`unconfigured`, `not_loaded`, `ready` y `unavailable`. La configuración se lee
-de `VACCA_BCS_CHECKPOINT` y `VACCA_BCS_DEVICE` (por defecto `cpu`). El runtime
-no carga al importar ni al consultar `/ready/bcs`; la primera solicitud `/bcs`
-dispara una carga única y cachea éxito o fallo.
-
-`serving.py` valida el checkpoint `bcs-ordinal-integer-checkpoint-v1`, su dominio
-`bcs-integer-1-5`, escala/clases `1..5` y lineage del snapshot
-`bcs-integer-snapshot-v2`. Luego decodifica el upload como JPEG/PNG, aplica el
-preprocesamiento determinista de imagen completa y ejecuta CORAL. La expectativa
-continua se convierte a entero sólo en `vacca_api.bcs` con half-down (`3.5 → 3`);
-la API devuelve `cow_detected: null` y no devuelve confianza.
-
-Si el checkpoint falta o no es utilizable, `/bcs` devuelve `503` con un detalle
-sanitizado. Inputs inválidos devuelven `400`, fallos de inferencia `500`, y
-`/ready/bcs` devuelve el mismo `BCSReadinessResponse` con `503` salvo en `ready`.
-`/health` y `/detect` no consultan este runtime.
-
-## Relación con el backend
-
-El PRD establece que el prototipo de IA es independiente del backend actual. La
-rama incluye un cliente acotado para el export versionado `bcs-source-v1` y el
-serving BCS local, pero no un despliegue final ni una operación real de datos o
-pesos. En el estado observado:
-
-- IA ejecuta la detección YOLO y el serving ordinal en el servicio local.
-- El backend posee autenticación, persistencia y R2; `source_client` envía Bearer
-  sólo al backend, solicita signed URLs y descarga el objeto desde R2 sin reenviar
-  el token ni retener la URL.
-- El build materializa imágenes y snapshots; no migra etiquetas ni sustituye la
-  persistencia u orquestación del backend.
-
-## BCS source export client
-
-`src/vacca_bcs/source_client.py` exposes `BCSSourceClient` for the admin-only backend contract `GET /api/bcs-source-v1`.
-
-- The constructor requires an origin-only `base_url`, a Bearer token, a finite positive `timeout`, and accepts injectable HTTP transports. `max_response_bytes` defaults to 64 MiB; the materializer's `max_image_bytes` defaults to 10 MiB, matching `ImageValidationConfig`.
-- The client requests the exact versioned path with `Authorization: Bearer ...`, disables redirects, streams the response, and rejects oversized declared or actual bodies before JSON parsing.
-- HTTP uses HTTPS except for localhost loopback development (`localhost`, `127.0.0.1`, or `::1`). Only an empty path or exactly `/` is accepted; backslashes, query strings, fragments, userinfo, and malformed hosts/ports are rejected.
-- `fetch()` returns frozen, tuple-backed `BCSSourceExport`, `BCSSourceEvaluationRow`, and `BCSSourceEvidence` values. Valid exports preserve empty storage keys and do not deduplicate repeated keys.
-- Configuration, transport, HTTP, JSON, response-size, and contract failures use typed exceptions. Tokens and full response payloads are never included in exception messages or the client representation.
-- `BCSEvidenceMaterializer.materialize(evidence_id)` resolves one signed URL and returns bytes plus SHA-256 without retaining the signed URL; the backend token is not sent to R2. El builder usa este materializador para escribir el snapshot, mientras que el serving BCS sólo consume checkpoints ya creados. Requests may canonicalize percent-escape case; byte-identical wire encoding is not guaranteed.
-
-## Deterministic integer source plan
-
-`src/vacca_bcs/source_plan.py` provides the pure `normalize_source_export` function. It excludes empty or whitespace-only storage keys with explicit reasons, rejects surrounding whitespace in non-empty keys, collapses exact-key same-label records using the lowest evidence ID, and fails on conflicts using stable evidence/evaluation provenance without exposing key text. Each candidate carries immutable provenance records that preserve evidence/evaluation correspondence, sorted by IDs. Its immutable output is ordered by `(bcs_score, evidence_id)` with counts for classes `1..5`; it performs no download, filesystem write, image decode, split, hash, or label migration.
-
-`src/vacca_bcs/source_split_plan.py` creates the pure integer train/validation layout. It sorts each class canonically before using an independent seed, applies `floor(n * ratio)` clamped to `[1, n - 1]` for eligible classes, keeps singletons in training, and preserves source exclusions. Assignments expose only evidence-ID-based relative path stems; this module does not materialize, write files, decode images, or migrate domain labels.
-
-## Límites de artefactos y datos
-
-| Contenido | Tratamiento |
+| Layer | Responsibility |
 |---|---|
-| `models/deploy/vacca-yolo26n-v1.pt`, `fixtures/cow_female_black_white.jpg`, `configs/baseline_manifest.json` y `reports/baseline-inference-2026-08-02.md` | Artefactos intencionalmente versionados para reproducibilidad y despliegue. |
-| Código, tests, configs, PRD y documentación | Versionables; el código y la documentación bajo `models/` también permanecen visibles para Git. |
-| `data/`, datasets, imágenes y archivos de imagen generados | Ignorados por `.gitignore`; no son parte del checkout portable, excepto el fixture versionado explícitamente. |
-| `outputs/`, `runs/`, `artifacts/`, `mlruns/`, `reports/generated/` y checkpoints | Resultados locales ignorados; incluyen pesos de entrenamiento no garantizados. |
-| Pesos locales bajo `models/checkpoints/` o `models/weights/` y formatos de peso exportados | Ignorados por `.gitignore`; el modelo de deploy tiene una excepción explícita. |
-| `.venv/`, caches y archivos `.env*` salvo `.env.example` | Entorno/configuración local ignorados; `.env.example` permanece disponible para documentar configuración. |
+| `local_source.py` | Exact source mapping, filename identity, safe hashing and materialization. |
+| `source_plan.py` | Normalized local records without animal-ID claims. |
+| `category_split_plan.py` | Transitive same-digest union and deterministic group-aware 80/10/10 planning. |
+| `category_snapshot.py` | Atomic snapshot publication and strict manifest/lineage validation. |
+| `dataset.py` | Deterministic validation transforms and folder loading. |
+| `model.py` | ResNet18 + CORAL reference model. |
+| `serving.py` | New-lineage checkpoint loading and hard category prediction. |
+
+## Leakage boundary
+
+`GS_<series>_<view>` and `YM_<series>_<view>` share a group by prefix and
+series. `L-i<index>` and `R-i<index>` share a group by index. Malformed names,
+duplicate members, duplicate identities and cross-category identical digests
+fail closed. Groups containing multiple labels remain intact; they are never
+majority-relabeled. Same-digest groups are unioned transitively before split.
+
+The planner balances category-count vectors against 80% train, 10% validation
+and 10% test targets, while keeping every capture group and digest in one
+partition. Leakage prevention takes priority over exact ratios.
+
+## Lineage and serving
+
+Active identifiers are `bcs-category-1-5-v1`, `bcs-local-category-source-v1`,
+`bcs-category-snapshot-v1`, `bcs-category-coral-checkpoint-v1` and
+`bcs-category-coral-results-v1`. Old snapshots and checkpoints are rejected
+even when tensor shapes are compatible. The API emits the CORAL hard class plus
+one; no fractional expectation or half-down rounding is used.
+
+The backend source client and backend-only provenance/materialization path are
+removed. Detection assets and behavior remain separate from this pipeline.

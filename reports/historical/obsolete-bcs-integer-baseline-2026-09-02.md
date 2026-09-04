@@ -1,4 +1,4 @@
-# Baseline de entrenamiento BCS — 2026-09-02
+# OBSOLETE FOR NEW MODEL — Historical BCS Integer Baseline — 2026-09-02
 
 Este reporte es evidencia inmutable del run local completado antes de la
 optimización de carga y visibilidad. No es una nueva evaluación ni habilita el

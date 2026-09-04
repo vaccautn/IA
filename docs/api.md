@@ -2,9 +2,10 @@
 
 Esta es la guía operativa del servicio FastAPI actual. La detección de Fase 1 y
 el endpoint BCS están implementados, pero son capacidades independientes:
-`/detect` usa el detector YOLO local; `/bcs` usa, bajo demanda, el checkpoint
-ordinal BCS configurado por entorno. El run local produjo un checkpoint ignorado
-por Git; una instalación sin configuración BCS responde `503`.
+`/detect` usa el detector YOLO local; `/bcs` usa, bajo demanda, un checkpoint
+ordinal BCS configurado por entorno. No existe un checkpoint NUEVO entrenado para
+la categoría, por lo que BCS permanece deshabilitado y responde `503` sin la
+configuración conjunta del checkpoint y su digest confiable.
 
 ## Camino rápido
 
@@ -21,7 +22,11 @@ dir outputs\training\combined-v2-finetune\weights\best.pt
 El detector de Fase 1 necesita el output local
 `outputs/training/combined-v2-finetune/weights/best.pt`. Ese archivo no está en
 este checkout; `models/deploy/vacca-yolo26n-v1.pt` es un artefacto versionado,
-pero la API no lo usa como fallback ni lo selecciona por configuración.
+pero la API no lo usa como fallback ni lo selecciona por configuración. El
+checkpoint BCS es independiente: la API puede arrancar en modo detección sin
+`VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256`; BCS permanece
+`unconfigured` hasta configurar explícitamente un checkpoint compatible y aceptado
+junto con su digest exacto.
 
 El launcher acepta:
 
@@ -37,21 +42,38 @@ mantiene CORS abierto para el prototipo; revisar ambos límites antes de exponer
 
 ## Configuración BCS
 
-El runtime BCS es opcional, aislado y lazy. Sólo se configura cuando existe la
-ruta `VACCA_BCS_CHECKPOINT`; no carga el modelo durante la importación ni al
-consultar `/ready/bcs`. `VACCA_BCS_DEVICE` es opcional y por defecto vale `cpu`.
+El runtime BCS es opcional, aislado y lazy. Sólo se configura cuando existen
+`VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256`; no carga el modelo durante
+la importación ni al consultar `/ready/bcs`. `VACCA_BCS_DEVICE` es opcional y por
+defecto vale `cpu`.
+
+No configure `VACCA_BCS_CHECKPOINT` ni `VACCA_BCS_CHECKPOINT_SHA256` todavía. El
+fallback seguro es:
 
 ```powershell
-$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-local-integer-v1\weights\best.pt").Path
-$env:VACCA_BCS_DEVICE = "cpu"
+Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
+Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 .venv\Scripts\python scripts/run_api.py
 ```
 
-El checkpoint debe tener schema `bcs-ordinal-integer-checkpoint-v1`, dominio
-`bcs-integer-1-5`, escala/clases `1..5` y lineage compatible con
-`bcs-integer-snapshot-v2`, incluyendo identidad del snapshot, digest del
+Sólo un candidato finalizado que pase los gates provisionales y el handoff estricto
+del runbook puede habilitarse posteriormente.
+
+El checkpoint debe tener schema `bcs-category-coral-checkpoint-v1`, dominio
+`bcs-category-1-5-v1`, escala/clases `1..5` y lineage compatible con
+`bcs-category-snapshot-v1`, incluyendo identidad del snapshot, digest del
 manifiesto y `run_id`. Los checkpoints viejos o de otra escala se rechazan.
-Nunca pongas tokens en el archivo `.env`, el código ni los comandos compartidos.
+La configuración requiere además `VACCA_BCS_CHECKPOINT_SHA256`, que debe ser el
+SHA-256 hexadecimal exacto de 64 caracteres del archivo `best.pt` validado; no se
+acepta sólo la metadata declarada por el checkpoint.
+
+Después del handoff estricto, configurá ambas variables con el valor exacto
+reportado por el overnight (el placeholder no es un digest válido):
+
+```powershell
+$env:VACCA_BCS_CHECKPOINT = "outputs\bcs-category-coral-v1\weights\best.pt"
+$env:VACCA_BCS_CHECKPOINT_SHA256 = "<EXACT_SHA256_FROM_OVERNIGHT_VALIDATION>"
+```
 
 ## Rutas registradas
 
@@ -74,17 +96,17 @@ seleccionada con la pestaña `BCS`. BCS no se ejecuta al seleccionar una imagen:
 requiere pulsar `Calculate BCS`. Al seleccionar la pestaña se consulta
 `/ready/bcs`; `ready` y `not_loaded` habilitan el cálculo, mientras que
 `unconfigured` y `unavailable` lo mantienen deshabilitado. Los errores de las
-rutas se muestran con mensajes sanitizados y el score exitoso se presenta como un
+rutas se muestran con mensajes sanitizados y la categoría exitosa se presenta como un
 entero `1..5`, sin confianza; `cow_detected: null` se muestra como `Not reported`.
 
-El checkpoint BCS real del run local permanece fuera de Git. Una ejecución sin
-`VACCA_BCS_CHECKPOINT` debe mostrar `unconfigured` y no debe interpretarse como un
-score. Para probar la UI con una capacidad real, configurá únicamente un
-checkpoint compatible y arrancá la API:
+No existe un checkpoint BCS nuevo del run local. Una ejecución sin
+`VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256` ausentes deben mostrar
+`unconfigured` y no debe interpretarse como una categoría. Configurá ambos sólo
+después del handoff de un candidato que pase los gates; mientras tanto no arranques BCS:
 
 ```powershell
-$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-local-integer-v1\weights\best.pt").Path
-$env:VACCA_BCS_DEVICE = "cpu" # opcional
+Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
+Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 .venv\Scripts\python scripts/run_api.py
 ```
 
@@ -134,26 +156,24 @@ Una respuesta exitosa contiene `cow_detected`, `detection_count`, `detections`,
 
 ## `POST /bcs`
 
-La ruta estima el score desde la imagen completa. `BCSResponse` tiene esta forma:
+La ruta estima la categoría desde la imagen completa. `BCSResponse` tiene esta forma:
 
 ```json
 {
   "status": "ok",
-  "message": "BCS score computed successfully.",
+  "message": "BCS category 1..5 computed successfully.",
   "cow_detected": null,
-  "bcs_score": 3
+  "bcs_category": 3
 }
 ```
 
-`bcs_score` es `null` únicamente en el esquema de respuesta que admite
-compatibilidad; una respuesta HTTP 200 exitosa contiene un entero estricto de
-`1` a `5`. `cow_detected` es siempre `null` en el éxito BCS porque esta ruta no
+Una respuesta HTTP 200 exitosa contiene un entero estricto de
+`1` a `5`; `bcs_category` es obligatorio y no-null. `cow_detected` es siempre `null` en el éxito BCS porque esta ruta no
 ejecuta detección. No se expone confianza.
 
-El modelo calcula internamente una expectativa CORAL continua y la adapta al
-contrato entero sólo en el límite HTTP mediante redondeo decimal half-down: un
-empate exacto `.5` baja (`3.5 → 3`). Valores no finitos o fuera de `1..5` no se
-publican.
+El servicio toma la clase CORAL dura (`1 + cantidad de umbrales superados`) y
+publica directamente la categoría discreta. No hay expectativa fraccional ni
+redondeo half-down. Categorías fuera de `1..5` nunca se publican.
 
 Errores de operación, todos con body estándar `{"detail": "..."}`:
 
@@ -162,12 +182,11 @@ Errores de operación, todos con body estándar `{"detail": "..."}`:
 | 400 | `File must be an image (JPEG, PNG, etc.)` / `Empty file` / `Failed to read uploaded file` | Validación común del upload. |
 | 400 | `BCS image input is invalid` | La carga no es un JPEG/PNG decodificable o viola límites de imagen. |
 | 500 | `BCS inference failed` | El modelo no pudo producir inferencia. |
-| 500 | `BCS score could not be produced` | El score no pasó la validación de frontera. |
 | 503 | `BCS capability is unavailable` | Falta el checkpoint, no se pudo cargar o el dispositivo no está disponible. |
 
 Ejemplo de capacidad no configurada: `POST /bcs` devuelve HTTP `503` y
 `{"detail":"BCS capability is unavailable"}`; no devuelve un `BCSResponse`
-exitoso ni un score nulo como sustituto.
+exitoso ni una categoría nula como sustituto.
 
 ## `GET /ready/bcs`
 
@@ -196,11 +215,11 @@ el checkpoint y comprobar el serving.
 
 ## Troubleshooting y verificación
 
-- Confirmá que el output YOLO de Fase 1 y el checkpoint BCS compatible existen antes
-  de arrancar la API.
+- Confirmá que el output YOLO de Fase 1 existe antes de arrancar la API; el
+  checkpoint BCS sólo es necesario para habilitar esa capacidad opcional.
 - Consultá `/ready/bcs` para distinguir `unconfigured`, `not_loaded`, `ready` y
   `unavailable` sin forzar la carga.
-- Si `/bcs` devuelve `503`, no lo interpretes como score: falta una capacidad
+- Si `/bcs` devuelve `503`, no lo interpretes como categoría: falta una capacidad
   BCS operable.
 - Usá `file` como nombre exacto del campo multipart.
 - Ejecutá la suite con `.venv\Scripts\python.exe -m pytest -q`.

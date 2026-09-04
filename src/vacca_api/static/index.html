@@ -111,9 +111,9 @@
   button:disabled { cursor:not-allowed; opacity:.5; }
   .bcs-help { color:var(--muted); font-size:14px; line-height:1.5; margin:0 0 16px; }
   .progress { color:var(--accent); font-size:14px; padding:20px 0; text-align:center; }
-  .score-card { background:var(--bg); border:1px solid var(--accent); border-radius:8px; margin-top:16px; padding:20px; text-align:center; }
-  .score-label { color:var(--muted); font-size:13px; letter-spacing:.5px; text-transform:uppercase; }
-  .score-value { color:var(--accent); font-size:64px; font-weight:700; line-height:1; margin:8px 0 16px; }
+  .category-card { background:var(--bg); border:1px solid var(--accent); border-radius:8px; margin-top:16px; padding:20px; text-align:center; }
+  .category-label { color:var(--muted); font-size:13px; letter-spacing:.5px; text-transform:uppercase; }
+  .category-value { color:var(--accent); font-size:64px; font-weight:700; line-height:1; margin:8px 0 16px; }
   .bcs-detail { border-top:1px solid var(--border); margin-top:16px; padding-top:12px; text-align:left; }
   .error-message { color:var(--danger); }
 
@@ -172,8 +172,8 @@
     </section>
 
     <section class="tab-panel" id="bcsPanel" role="tabpanel" aria-labelledby="bcsTab" hidden>
-      <h2>📊 Body Condition Score</h2>
-      <p class="bcs-help">Calculá el score BCS sobre la imagen completa. Esta capacidad necesita un checkpoint compatible.</p>
+       <h2>📊 BCS category 1..5</h2>
+       <p class="bcs-help">Calculá la categoría BCS 1..5 sobre la imagen completa. Esta capacidad necesita un checkpoint compatible y su digest SHA-256 confiable.</p>
       <div class="readiness-row"><span class="readiness-badge" id="bcsReadiness" role="status" aria-live="polite" data-status="unknown">BCS: estado no consultado.</span><button type="button" class="secondary-button" id="refreshReadiness">Actualizar</button></div>
       <button type="button" class="primary-button" id="calculateBcs" disabled>Calculate BCS</button>
       <div class="progress" id="bcsProgress" role="status" aria-live="polite" hidden></div>
@@ -204,7 +204,6 @@
     'BCS image input is invalid': 'La imagen no es válida para BCS.',
     'BCS capability is unavailable': 'BCS no está disponible en este momento.',
     'BCS inference failed': 'No se pudo calcular el BCS.',
-    'BCS score could not be produced': 'No se pudo producir un score BCS.',
   });
 
   function createUiController({
@@ -469,14 +468,14 @@ function drawBoxes(data, version) {
 }
 function renderBcsResult(data) {
   bcsResults.replaceChildren();
-  const score = Number(data.bcs_score);
-  if (!Number.isInteger(score) || score < 1 || score > 5) {
-    showError(bcsResults, 500, 'La respuesta no contiene un score BCS válido.');
+  const category = Number(data.bcs_category);
+  if (!Number.isInteger(category) || category < 1 || category > 5) {
+    showError(bcsResults, 500, 'La respuesta no contiene una categoría BCS válida.');
     return;
   }
-  const card = createTextElement('section', 'score-card', '');
-  card.append(createTextElement('p', 'score-label', 'Score BCS'));
-  card.append(createTextElement('p', 'score-value', String(score)));
+  const card = createTextElement('section', 'category-card', '');
+  card.append(createTextElement('p', 'category-label', 'BCS category (1..5)'));
+  card.append(createTextElement('p', 'category-value', String(category)));
   const detail = createTextElement('div', 'bcs-detail', '');
   appendSummaryRow(detail, 'Estado', String(data.status || 'ok'));
   appendSummaryRow(detail, 'Mensaje', String(data.message || 'BCS calculado.'));

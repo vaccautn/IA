@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import json
 from types import SimpleNamespace
 
@@ -10,84 +9,34 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from vacca_api import main
-from vacca_api.bcs import BCSScoreValidationError, round_bcs_score_for_backend
 from vacca_api.schemas import BCSReadinessResponse, BCSResponse
 from vacca_bcs.serving import BCSInferenceExecutionError, BCSInferenceInputError
 
 
-@pytest.mark.parametrize(
-    ("score", "expected"),
-    [
-        (3.25, 3),
-        (3.49, 3),
-        (3.5, 3),
-        (3.51, 4),
-        (3.75, 4),
-        (4.5, 4),
-        (1, 1),
-        (5, 5),
-    ],
-)
-def test_backend_bcs_score_uses_decimal_half_down_rounding(
-    score: float | int, expected: int
-) -> None:
-    assert round_bcs_score_for_backend(score) == expected
+@pytest.mark.parametrize("category", [1, 2, 3, 4, 5])
+def test_bcs_response_accepts_categories(category: int) -> None:
+    assert BCSResponse(bcs_category=category).bcs_category == category
 
 
-@pytest.mark.parametrize("score", [math.nan, math.inf, -math.inf])
-def test_backend_bcs_score_rejects_nonfinite_values(score: float) -> None:
-    with pytest.raises(BCSScoreValidationError, match="finite"):
-        round_bcs_score_for_backend(score)
-
-
-@pytest.mark.parametrize("score", [0, 5.01, 6])
-def test_backend_bcs_score_rejects_out_of_range_values(score: float | int) -> None:
-    with pytest.raises(BCSScoreValidationError, match="inclusive range 1..5"):
-        round_bcs_score_for_backend(score)
-
-
-@pytest.mark.parametrize("score", [None, "3.5", object(), True])
-def test_backend_bcs_score_rejects_non_numeric_values(score: object) -> None:
-    with pytest.raises(BCSScoreValidationError, match="numeric"):
-        round_bcs_score_for_backend(score)
-
-
-@pytest.mark.parametrize("score", [1, 2, 3, 4, 5])
-def test_bcs_response_accepts_integer_scores(score: int) -> None:
-    assert BCSResponse(bcs_score=score).bcs_score == score
-
-
-def test_bcs_response_accepts_none_score() -> None:
-    assert BCSResponse(bcs_score=None).bcs_score is None
-
-
-@pytest.mark.parametrize("score", [True, False, "3", 3.0, 3.5, 0, 6])
-def test_bcs_response_rejects_non_strict_or_out_of_range_scores(
-    score: object,
+@pytest.mark.parametrize("category", [True, False, "3", 3.0, 3.5, 0, 6, None])
+def test_bcs_response_rejects_non_strict_or_out_of_range_categories(
+    category: object,
 ) -> None:
     with pytest.raises(ValidationError):
-        BCSResponse(bcs_score=score)
+        BCSResponse(bcs_category=category)
 
 
-def test_openapi_declares_nullable_integer_bcs_score() -> None:
-    property_schema = main.app.openapi()["components"]["schemas"]["BCSResponse"][
-        "properties"
-    ]["bcs_score"]
+def test_openapi_declares_required_integer_bcs_category() -> None:
+    schema = main.app.openapi()["components"]["schemas"]["BCSResponse"]
+    property_schema = schema["properties"]["bcs_category"]
 
-    if "anyOf" in property_schema:
-        assert {item["type"] for item in property_schema["anyOf"]} == {
-            "integer",
-            "null",
-        }
-    else:
-        assert property_schema["type"] == "integer"
-
-    integer_schema = next(
-        item for item in property_schema.get("anyOf", [property_schema])
-        if item.get("type") == "integer"
-    )
+    assert property_schema["type"] == "integer"
+    integer_schema = property_schema
     assert integer_schema["minimum"] == 1
     assert integer_schema["maximum"] == 5
+    assert "bcs_category" in schema["required"]
+    with pytest.raises(ValidationError):
+        BCSResponse()
 
 
 class _Upload:
@@ -105,8 +54,8 @@ class _Upload:
 
 
 class _FakeService:
-    def __init__(self, score: object = 3.5, failure: Exception | None = None) -> None:
-        self.score = score
+    def __init__(self, category: object = 4, failure: Exception | None = None) -> None:
+        self.category = category
         self.failure = failure
         self.received: list[bytes] = []
 
@@ -114,7 +63,7 @@ class _FakeService:
         if self.failure is not None:
             raise self.failure
         self.received.append(image_bytes)
-        return SimpleNamespace(continuous_score=self.score)
+        return SimpleNamespace(bcs_category=self.category)
 
 
 class _FakeRuntime:
@@ -181,7 +130,7 @@ def test_detect_uses_uploaded_bytes_once_and_preserves_success(monkeypatch) -> N
     assert upload.read_count == 1
 
 
-def test_bcs_valid_upload_returns_integer_score(monkeypatch) -> None:
+def test_bcs_valid_upload_returns_category(monkeypatch) -> None:
     service = _FakeService()
     runtime = _FakeRuntime(service)
     upload = _Upload("image/png")
@@ -190,19 +139,11 @@ def test_bcs_valid_upload_returns_integer_score(monkeypatch) -> None:
     response = asyncio.run(main.bcs(upload))
 
     assert response.status == "ok"
-    assert response.message == "BCS score computed successfully."
-    assert response.bcs_score == 3
+    assert response.message == "BCS category 1..5 computed successfully."
+    assert response.bcs_category == 4
     assert response.cow_detected is None
     assert service.received == [b"image"]
     assert upload.read_count == 1
-
-
-@pytest.mark.parametrize("score, expected", [(1.0, 1), (3.5, 3), (5.0, 5)])
-def test_bcs_rounds_only_at_http_boundary(monkeypatch, score: float, expected: int) -> None:
-    service = _FakeService(score)
-    monkeypatch.setattr(main, "get_bcs_runtime", lambda: _FakeRuntime(service))
-    response = asyncio.run(main.bcs(_Upload("image/jpeg")))
-    assert response.bcs_score == expected
 
 
 @pytest.mark.parametrize(
@@ -223,22 +164,6 @@ def test_bcs_failure_mapping_is_typed_and_sanitized(
     with pytest.raises(HTTPException) as captured:
         asyncio.run(main.bcs(_Upload("image/jpeg")))
     assert (captured.value.status_code, captured.value.detail) == (status, detail)
-    assert "secret" not in str(captured.value)
-
-
-def test_bcs_rounding_failure_is_sanitized_500(monkeypatch) -> None:
-    monkeypatch.setattr(main, "get_bcs_runtime", lambda: _FakeRuntime(_FakeService()))
-    monkeypatch.setattr(
-        main,
-        "round_bcs_score_for_backend",
-        lambda score: (_ for _ in ()).throw(RuntimeError("secret score")),
-    )
-    with pytest.raises(HTTPException) as captured:
-        asyncio.run(main.bcs(_Upload("image/jpeg")))
-    assert (captured.value.status_code, captured.value.detail) == (
-        500,
-        "BCS score could not be produced",
-    )
     assert "secret" not in str(captured.value)
 
 
@@ -303,7 +228,7 @@ def test_prototype_ui_delivery_and_bcs_contract() -> None:
     for fragment in (
         'role="tablist"', 'id="detectTab"', 'id="bcsTab"', 'aria-selected=',
         'id="bcsReadiness"', 'GET /ready/bcs', 'POST /bcs', 'Calculate BCS',
-        'bcs_score', 'Not reported', 'aria-live="polite"', 'combined-v2-finetune',
+        'bcs_category', 'Not reported', 'aria-live="polite"', 'combined-v2-finetune',
         'ready', 'not_loaded', 'unconfigured', 'unavailable',
     ):
         assert fragment in html

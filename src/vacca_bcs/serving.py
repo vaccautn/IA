@@ -1,23 +1,31 @@
-"""Safe, capability-scoped loading of integer BCS serving checkpoints."""
-
+"""Safe loading and hard-category serving for BCS CORAL checkpoints."""
 from __future__ import annotations
 
-import math
-import os
-import warnings
 from collections.abc import Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from io import BytesIO
+import os
 from pathlib import Path
 from typing import Any
+import warnings
 
 import torch
 from PIL import Image, ImageOps
 
 from vacca_vision.image_validation import ImageValidationConfig, _validate_dimensions
 
+from .category_snapshot import SNAPSHOT_SCHEMA_VERSION
+from .checkpoint_io import (
+    CheckpointByteError,
+    CheckpointBytes,
+    CheckpointByteUnavailableError,
+    load_checkpoint_bytes,
+)
 from .constants import (
     BCS_DOMAIN_ID,
+    BCS_CLASS_SCORES,
+    CHECKPOINT_SCHEMA_VERSION,
     CLASS_NAMES,
     NUM_CLASSES,
     NUM_THRESHOLDS,
@@ -27,38 +35,14 @@ from .constants import (
     SCORE_STEP,
 )
 from .dataset import build_transforms
-from .local_source import LOCAL_BCS_MAPPING
+from .local_source import LOCAL_BCS_MAPPING, LOCAL_SOURCE_SCHEMA
 from .model import BCSOrdinalModel
+from .path_safety import SafePathError
 
-CHECKPOINT_SCHEMA_VERSION = "bcs-ordinal-integer-checkpoint-v1"
-SNAPSHOT_SCHEMA_VERSION = "bcs-integer-snapshot-v2"
-_REQUIRED_FIELDS = frozenset(
-    {
-        "checkpoint_schema_version",
-        "domain_id",
-        "classes",
-        "class_mapping",
-        "score_min",
-        "score_max",
-        "score_base",
-        "score_step",
-        "num_classes",
-        "num_thresholds",
-        "snapshot_schema",
-        "snapshot_identity",
-        "dataset_manifest_digest",
-        "run_id",
-        "observed_classes",
-        "missing_classes",
-        "allow_partial_class_coverage",
-        "source_identity_scheme",
-        "source_mapping",
-        "config",
-        "provenance",
-        "model_state_dict",
-    }
-)
-_OPTIONAL_TRAINING_FIELDS = frozenset({"epoch", "val_mae", "provenance"})
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CHECKPOINT_ROOT = REPO_ROOT / "outputs"
+_REQUIRED_FIELDS = frozenset({"checkpoint_schema_version", "domain_id", "source_schema", "classes", "class_mapping", "score_min", "score_max", "score_base", "score_step", "num_classes", "num_thresholds", "snapshot_schema", "snapshot_identity", "dataset_manifest_digest", "run_id", "config_sha256", "observed_classes", "missing_classes", "source_identity_scheme", "source_mapping", "config", "provenance", "model_state_dict"})
+_OPTIONAL_FIELDS = frozenset({"epoch", "val_ordinal_mae", "best_epoch", "best_validation", "selection_identity", "best_results_row"})
 _IMAGE_CONFIG = ImageValidationConfig()
 
 
@@ -71,30 +55,23 @@ class BCSCheckpointUnavailableError(BCSCheckpointError):
 
 
 class BCSCheckpointLoadError(BCSCheckpointError):
-    """Raised when a checkpoint cannot be safely loaded or validated."""
-
-
-BCSServingError = BCSCheckpointError
-BCSServingUnavailableError = BCSCheckpointUnavailableError
-BCSServingLoadError = BCSCheckpointLoadError
+    pass
 
 
 class BCSInferenceError(Exception):
-    """Base class for sanitized BCS inference failures."""
+    pass
 
 
 class BCSInferenceInputError(BCSInferenceError):
-    """Raised when uploaded image bytes are not a safe supported image."""
+    pass
 
 
 class BCSInferenceExecutionError(BCSInferenceError):
-    """Raised when model inference cannot produce a valid ordinal result."""
+    pass
 
 
 @dataclass(frozen=True, slots=True)
 class BCSLineageMetadata:
-    """Safe immutable lineage values exposed to the serving boundary."""
-
     checkpoint_schema_version: str
     domain_id: str
     snapshot_schema: str
@@ -102,42 +79,28 @@ class BCSLineageMetadata:
     dataset_manifest_digest: str
     run_id: str
     source_schema: str
-    source_identity_scheme: str | None
-    source_mapping: tuple[tuple[str, int], ...] | None
+    source_identity_scheme: str
+    source_mapping: tuple[tuple[str, int], ...]
     observed_classes: tuple[int, ...]
     missing_classes: tuple[int, ...]
-    allow_partial_class_coverage: bool
 
 
 @dataclass(frozen=True, slots=True)
 class LoadedBCSModel:
-    """An evaluated model and immutable serving metadata."""
-
     model: BCSOrdinalModel
     imgsz: int
     device: torch.device
     lineage: BCSLineageMetadata
+    checkpoint_sha256: str | None = None
+    checkpoint: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class BCSInferenceResult:
-    """Immutable continuous BCS output and safe model lineage."""
-
-    continuous_score: float
+    bcs_category: int
     lineage: BCSLineageMetadata
 
-    @property
-    def score(self) -> float:
-        return self.continuous_score
-
-
 class BCSInferenceService:
-    """Run deterministic full-image inference for one loaded BCS model.
-
-    The service owns no global state. Validation transforms are deterministic and
-    each request allocates its own tensor, so concurrent calls only read the model.
-    """
-
     def __init__(self, loaded: LoadedBCSModel) -> None:
         if not isinstance(loaded, LoadedBCSModel):
             raise BCSInferenceInputError("loaded BCS model is invalid")
@@ -155,29 +118,21 @@ class BCSInferenceService:
                 logits = self._loaded.model(tensor.to(self._loaded.device))
         except Exception:
             raise BCSInferenceExecutionError("BCS inference failed") from None
-        if (
-            not isinstance(logits, torch.Tensor)
-            or tuple(logits.shape) != (1, NUM_THRESHOLDS)
-            or not bool(torch.isfinite(logits).all())
-        ):
+        if not isinstance(logits, torch.Tensor) or tuple(logits.shape) != (1, NUM_THRESHOLDS) or not bool(torch.isfinite(logits).all()):
             raise BCSInferenceExecutionError("BCS model returned invalid logits")
         try:
-            score = float(SCORE_BASE + torch.sigmoid(logits).sum().item())
+            category = int((torch.sigmoid(logits) > 0.5).sum().item()) + 1
         except Exception:
-            raise BCSInferenceExecutionError("BCS model returned an invalid score") from None
-        if not math.isfinite(score) or not SCORE_BASE <= score <= SCORE_MAX:
-            raise BCSInferenceExecutionError("BCS model returned an out-of-range score")
-        return BCSInferenceResult(score, self._loaded.lineage)
+            raise BCSInferenceExecutionError("BCS model returned an invalid category") from None
+        if category not in BCS_CLASS_SCORES:
+            raise BCSInferenceExecutionError("BCS model returned an out-of-range category")
+        return BCSInferenceResult(category, self._loaded.lineage)
 
     def _prepare(self, image_bytes: bytes | bytearray | memoryview) -> torch.Tensor:
         if not isinstance(image_bytes, (bytes, bytearray, memoryview)):
             raise BCSInferenceInputError("BCS image input must be bytes")
         try:
-            if not image_bytes or len(image_bytes) > _IMAGE_CONFIG.max_size_bytes:
-                raise BCSInferenceInputError("BCS image input is empty or too large")
             payload = bytes(image_bytes)
-        except BCSInferenceInputError:
-            raise
         except (TypeError, ValueError):
             raise BCSInferenceInputError("BCS image input is invalid") from None
         if not payload or len(payload) > _IMAGE_CONFIG.max_size_bytes:
@@ -205,216 +160,104 @@ class BCSInferenceService:
             raise BCSInferenceInputError("BCS image cannot be decoded safely") from None
 
 
-def infer_bcs(
-    loaded: LoadedBCSModel, image_bytes: bytes | bytearray | memoryview
-) -> BCSInferenceResult:
-    """Infer one continuous integer-domain BCS score from a full image."""
+def infer_bcs(loaded: LoadedBCSModel, image_bytes: bytes | bytearray | memoryview) -> BCSInferenceResult:
     return BCSInferenceService(loaded).infer(image_bytes)
 
 
 def _valid_digest(value: object, length: int) -> bool:
-    return (
-        type(value) is str
-        and len(value) == length
-        and value == value.lower()
-        and all(character in "0123456789abcdef" for character in value)
-    )
-
-
-def _valid_class_list(value: object) -> bool:
-    return (
-        type(value) is list
-        and all(type(item) is int for item in value)
-        and value == sorted(set(value))
-        and all(item in range(SCORE_MIN, SCORE_MAX + 1) for item in value)
-    )
-
-
-def _validate_coverage(checkpoint: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    observed = checkpoint["observed_classes"]
-    missing = checkpoint["missing_classes"]
-    policy = checkpoint["allow_partial_class_coverage"]
-    if (
-        not _valid_class_list(observed)
-        or not _valid_class_list(missing)
-        or len(observed) < 2
-        or type(policy) is not bool
-        or missing != [score for score in range(SCORE_MIN, SCORE_MAX + 1) if score not in observed]
-        or (missing and not policy)
-    ):
-        raise BCSCheckpointLoadError("BCS checkpoint class coverage is invalid")
-
-    provenance = checkpoint["provenance"]
-    manifest = provenance.get("dataset_manifest") if type(provenance) is dict else None
-    if type(manifest) is not dict:
-        raise BCSCheckpointLoadError("BCS checkpoint source lineage is invalid")
-    if (
-        manifest.get("observed_classes") != observed
-        or manifest.get("missing_classes") != missing
-        or manifest.get("allow_partial_class_coverage") != policy
-        or manifest.get("split_identity") != checkpoint["snapshot_identity"]
-        or manifest.get("sha256") != checkpoint["dataset_manifest_digest"]
-        or provenance.get("run_id") != checkpoint["run_id"]
-        or provenance.get("domain_id") != checkpoint["domain_id"]
-        or checkpoint["config"].get("allow_partial_class_coverage") != policy
-    ):
-        raise BCSCheckpointLoadError("BCS checkpoint source lineage is invalid")
-
-    source_schema = manifest.get("source_schema")
-    identity_scheme = checkpoint["source_identity_scheme"]
-    mapping = checkpoint["source_mapping"]
-    if source_schema == "bcs-local-folder-v1":
-        expected_mapping = dict(LOCAL_BCS_MAPPING.entries)
-        if (
-            identity_scheme != "local-path-sha256-v1"
-            or mapping != expected_mapping
-            or manifest.get("identity_scheme") != identity_scheme
-            or manifest.get("mapping") != expected_mapping
-            or observed != [3, 4]
-        ):
-            raise BCSCheckpointLoadError("BCS checkpoint source variant is invalid")
-    elif source_schema == "bcs-source-v1":
-        if (
-            identity_scheme is not None
-            or mapping is not None
-            or manifest.get("identity_scheme") is not None
-            or manifest.get("mapping") is not None
-        ):
-            raise BCSCheckpointLoadError("BCS checkpoint source variant is invalid")
-    else:
-        raise BCSCheckpointLoadError("BCS checkpoint source schema is invalid")
-    return source_schema, manifest
-
-
-def _resolve_checkpoint_path(raw_path: str | os.PathLike[str]) -> Path:
-    try:
-        path = Path(raw_path)
-        if path.is_symlink():
-            raise BCSCheckpointLoadError("BCS checkpoint path must not be a symlink")
-        if not path.exists():
-            raise BCSCheckpointUnavailableError("BCS checkpoint is unavailable")
-        if not path.is_file():
-            raise BCSCheckpointLoadError("BCS checkpoint must be a regular file")
-    except BCSCheckpointError:
-        raise
-    except (OSError, TypeError, ValueError):
-        raise BCSCheckpointLoadError("BCS checkpoint path is invalid") from None
-    return path
-
-
-def _resolve_device(raw_device: str | torch.device) -> torch.device:
-    try:
-        device = torch.device(raw_device)
-    except (RuntimeError, TypeError, ValueError):
-        raise BCSCheckpointLoadError("BCS serving device is invalid") from None
-    if device.type == "cuda":
-        if not torch.cuda.is_available():
-            raise BCSCheckpointUnavailableError("requested CUDA device is unavailable")
-        count = torch.cuda.device_count()
-        if count <= 0 or device.index is not None and not 0 <= device.index < count:
-            raise BCSCheckpointUnavailableError("requested CUDA device is unavailable")
-    return device
+    return type(value) is str and len(value) == length and value == value.lower() and all(character in "0123456789abcdef" for character in value)
 
 
 def _validate_checkpoint(checkpoint: object) -> dict[str, Any]:
-    if not isinstance(checkpoint, dict):
-        raise BCSCheckpointLoadError("BCS checkpoint has an invalid schema")
-    fields = set(checkpoint)
-    if not _REQUIRED_FIELDS.issubset(fields):
-        raise BCSCheckpointLoadError("BCS checkpoint is missing required fields")
-    if fields.difference(_REQUIRED_FIELDS | _OPTIONAL_TRAINING_FIELDS):
-        raise BCSCheckpointLoadError("BCS checkpoint has unexpected fields")
-
-    if checkpoint["checkpoint_schema_version"] != CHECKPOINT_SCHEMA_VERSION:
-        raise BCSCheckpointLoadError("BCS checkpoint schema is unsupported")
-    if checkpoint["domain_id"] != BCS_DOMAIN_ID:
-        raise BCSCheckpointLoadError("BCS checkpoint domain is invalid")
-
-    classes = checkpoint["classes"]
-    mapping = checkpoint["class_mapping"]
-    expected_mapping = {name: index for index, name in enumerate(CLASS_NAMES)}
-    if (
-        type(classes) is not list
-        or any(type(value) is not str for value in classes)
-        or classes != list(CLASS_NAMES)
-        or type(mapping) is not dict
-        or mapping != expected_mapping
-        or any(type(value) is not int for value in mapping.values())
-    ):
+    if not isinstance(checkpoint, dict) or not _REQUIRED_FIELDS.issubset(checkpoint) or set(checkpoint).difference(_REQUIRED_FIELDS | _OPTIONAL_FIELDS):
+        raise BCSCheckpointLoadError("BCS checkpoint schema is invalid")
+    if checkpoint["checkpoint_schema_version"] != CHECKPOINT_SCHEMA_VERSION or checkpoint["domain_id"] != BCS_DOMAIN_ID or checkpoint["snapshot_schema"] != SNAPSHOT_SCHEMA_VERSION:
+        raise BCSCheckpointLoadError("BCS checkpoint lineage is unsupported")
+    if checkpoint["source_schema"] != LOCAL_SOURCE_SCHEMA:
+        raise BCSCheckpointLoadError("BCS checkpoint source schema is invalid")
+    if checkpoint["classes"] != list(CLASS_NAMES) or checkpoint["class_mapping"] != {name: index for index, name in enumerate(CLASS_NAMES)}:
         raise BCSCheckpointLoadError("BCS checkpoint classes are invalid")
-
-    expected_scale = {
-        "score_min": SCORE_MIN,
-        "score_max": SCORE_MAX,
-        "score_base": SCORE_BASE,
-        "score_step": SCORE_STEP,
-        "num_classes": NUM_CLASSES,
-        "num_thresholds": NUM_THRESHOLDS,
-    }
-    if any(
-        type(checkpoint[field]) is not int or checkpoint[field] != expected
-        for field, expected in expected_scale.items()
-    ):
+    if any(type(checkpoint[field]) is not int or checkpoint[field] != expected for field, expected in (("score_min", SCORE_MIN), ("score_max", SCORE_MAX), ("score_base", SCORE_BASE), ("score_step", SCORE_STEP), ("num_classes", NUM_CLASSES), ("num_thresholds", NUM_THRESHOLDS))):
         raise BCSCheckpointLoadError("BCS checkpoint scale is invalid")
-
-    if (
-        checkpoint["snapshot_schema"] != SNAPSHOT_SCHEMA_VERSION
-        or not _valid_digest(checkpoint["snapshot_identity"], 64)
-        or not _valid_digest(checkpoint["dataset_manifest_digest"], 64)
-        or not _valid_digest(checkpoint["run_id"], 32)
-    ):
+    if not _valid_digest(checkpoint["snapshot_identity"], 64) or not _valid_digest(checkpoint["dataset_manifest_digest"], 64) or not _valid_digest(checkpoint["config_sha256"], 64) or not _valid_digest(checkpoint["run_id"], 32):
         raise BCSCheckpointLoadError("BCS checkpoint lineage is invalid")
-
+    if checkpoint["observed_classes"] != list(BCS_CLASS_SCORES) or checkpoint["missing_classes"] != []:
+        raise BCSCheckpointLoadError("BCS checkpoint must cover all five categories")
+    if checkpoint["source_identity_scheme"] != "local-path-sha256-v1" or checkpoint["source_mapping"] != dict(LOCAL_BCS_MAPPING.entries):
+        raise BCSCheckpointLoadError("BCS checkpoint source lineage is invalid")
     config = checkpoint["config"]
     if not isinstance(config, dict) or type(config.get("imgsz")) is not int or config["imgsz"] <= 0:
-        raise BCSCheckpointLoadError("BCS checkpoint image size is invalid")
-    _validate_coverage(checkpoint)
-
-    state_dict = checkpoint["model_state_dict"]
-    if (
-        not isinstance(state_dict, Mapping)
-        or not state_dict
-        or any(type(key) is not str for key in state_dict)
-        or any(not isinstance(value, torch.Tensor) for value in state_dict.values())
-    ):
+        raise BCSCheckpointLoadError("BCS checkpoint configuration is invalid")
+    provenance = checkpoint["provenance"]
+    manifest = provenance.get("dataset_manifest") if isinstance(provenance, dict) else None
+    if not isinstance(manifest, dict) or provenance.get("run_id") != checkpoint["run_id"] or provenance.get("config_sha256") != checkpoint["config_sha256"] or provenance.get("domain_id") != BCS_DOMAIN_ID or provenance.get("source_schema") != checkpoint["source_schema"] or provenance.get("identity_scheme") != checkpoint["source_identity_scheme"] or provenance.get("mapping") != checkpoint["source_mapping"] or manifest.get("schema_version") != SNAPSHOT_SCHEMA_VERSION or manifest.get("source_schema") != checkpoint["source_schema"] or manifest.get("identity_scheme") != checkpoint["source_identity_scheme"] or manifest.get("mapping") != checkpoint["source_mapping"] or manifest.get("observed_classes") != list(BCS_CLASS_SCORES) or manifest.get("missing_classes") != [] or manifest.get("split_identity") != checkpoint["snapshot_identity"] or manifest.get("sha256") != checkpoint["dataset_manifest_digest"]:
+        raise BCSCheckpointLoadError("BCS checkpoint source lineage is invalid")
+    state = checkpoint["model_state_dict"]
+    if not isinstance(state, Mapping) or not state or any(type(key) is not str or not isinstance(value, torch.Tensor) for key, value in state.items()):
         raise BCSCheckpointLoadError("BCS checkpoint model state is invalid")
     return checkpoint
 
 
 def load_bcs_model(
-    checkpoint_path: str | os.PathLike[str], device: str | torch.device = "cpu"
+    checkpoint_path: str | os.PathLike[str],
+    device: str | torch.device = "cpu",
+    *,
+    expected_sha256: str | None = None,
+    approved_roots: Iterable[Path] | None = None,
 ) -> LoadedBCSModel:
-    """Load one validated integer checkpoint without unsafe deserialization."""
-    path = _resolve_checkpoint_path(checkpoint_path)
-    resolved_device = _resolve_device(device)
     try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        if not _valid_digest(expected_sha256, 64):
+            raise BCSCheckpointLoadError("BCS checkpoint digest is required and invalid")
+        loaded = load_checkpoint_bytes(
+            checkpoint_path,
+            approved_roots=(CHECKPOINT_ROOT,) if approved_roots is None else approved_roots,
+            expected_sha256=expected_sha256,
+            require_checkpoint_set=True,
+        )
+        resolved = torch.device(device)
+        if resolved.type == "cuda" and not torch.cuda.is_available():
+            raise BCSCheckpointUnavailableError("requested CUDA device is unavailable")
+        return _build_loaded_bcs_model(loaded, resolved)
+    except CheckpointByteUnavailableError:
+        raise BCSCheckpointUnavailableError("BCS checkpoint is unavailable") from None
+    except CheckpointByteError as error:
+        raise BCSCheckpointLoadError(str(error)) from None
+    except BCSCheckpointError:
+        raise
+    except SafePathError:
+        raise BCSCheckpointLoadError("BCS checkpoint path is unsafe") from None
     except Exception:
         raise BCSCheckpointLoadError("BCS checkpoint could not be loaded safely") from None
-    checkpoint = _validate_checkpoint(checkpoint)
 
+
+def _build_loaded_bcs_model(loaded: CheckpointBytes, device: torch.device) -> LoadedBCSModel:
     try:
+        checkpoint = _validate_checkpoint(loaded.payload)
         model = BCSOrdinalModel(pretrained=False)
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-        model.to(resolved_device)
-        model.eval()
+        model.to(device).eval()
+    except BCSCheckpointError:
+        raise
     except Exception:
         raise BCSCheckpointLoadError("BCS checkpoint model architecture is invalid") from None
-
     lineage = BCSLineageMetadata(
-        checkpoint["checkpoint_schema_version"],
-        checkpoint["domain_id"],
-        checkpoint["snapshot_schema"],
-        checkpoint["snapshot_identity"],
-        checkpoint["dataset_manifest_digest"],
-        checkpoint["run_id"],
-        checkpoint["provenance"]["dataset_manifest"]["source_schema"],
-        checkpoint["source_identity_scheme"],
-        None
-        if checkpoint["source_mapping"] is None
-        else tuple(sorted(checkpoint["source_mapping"].items())),
-        tuple(checkpoint["observed_classes"]),
-        tuple(checkpoint["missing_classes"]),
-        checkpoint["allow_partial_class_coverage"],
+        checkpoint_schema_version=checkpoint["checkpoint_schema_version"],
+        domain_id=checkpoint["domain_id"],
+        snapshot_schema=checkpoint["snapshot_schema"],
+        snapshot_identity=checkpoint["snapshot_identity"],
+        dataset_manifest_digest=checkpoint["dataset_manifest_digest"],
+        run_id=checkpoint["run_id"],
+        source_schema=LOCAL_SOURCE_SCHEMA,
+        source_identity_scheme=checkpoint["source_identity_scheme"],
+        source_mapping=tuple(sorted(checkpoint["source_mapping"].items())),
+        observed_classes=tuple(BCS_CLASS_SCORES),
+        missing_classes=(),
     )
-    return LoadedBCSModel(model, checkpoint["config"]["imgsz"], resolved_device, lineage)
+    return LoadedBCSModel(
+        model,
+        checkpoint["config"]["imgsz"],
+        device,
+        lineage,
+        loaded.sha256,
+        checkpoint,
+    )

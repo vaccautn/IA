@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import os
+import string
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from vacca_bcs.serving import (
     BCSCheckpointLoadError,
     BCSCheckpointUnavailableError,
     BCSInferenceService,
+    CHECKPOINT_ROOT,
     LoadedBCSModel,
     load_bcs_model,
 )
+from vacca_bcs.path_safety import SafePathError, safe_path
 
 _CHECKPOINT_ENV = "VACCA_BCS_CHECKPOINT"
+_CHECKPOINT_SHA256_ENV = "VACCA_BCS_CHECKPOINT_SHA256"
 _DEVICE_ENV = "VACCA_BCS_DEVICE"
 
 
@@ -53,15 +58,18 @@ class BCSRuntime:
         *,
         loader: Loader | None = None,
         service_factory: ServiceFactory | None = None,
+        checkpoint_root: Path | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._loader = load_bcs_model if loader is None else loader
         self._service_factory = (
             BCSInferenceService if service_factory is None else service_factory
         )
+        self._checkpoint_root = CHECKPOINT_ROOT if checkpoint_root is None else Path(checkpoint_root)
         self._service: Any = None
         self._failure: BCSRuntimeFailure | None = None
         self._checkpoint: str | None = None
+        self._checkpoint_sha256: str | None = None
         self._device: Any = "cpu"
         self._status = BCSRuntimeStatus.UNCONFIGURED
         self._configure(environment if environment is not None else os.environ)
@@ -87,7 +95,11 @@ class BCSRuntime:
                 raise BCSRuntimeUnavailableError("BCS capability is unavailable")
 
             try:
-                loaded = self._loader(self._checkpoint, device=self._device)
+                loaded = self._loader(
+                    self._checkpoint,
+                    device=self._device,
+                    expected_sha256=self._checkpoint_sha256,
+                )
             except BCSCheckpointUnavailableError:
                 self._cache_failure("checkpoint_unavailable", "BCS checkpoint is unavailable")
                 raise BCSRuntimeUnavailableError("BCS capability is unavailable") from None
@@ -112,6 +124,7 @@ class BCSRuntime:
             self._service = None
             self._failure = None
             self._checkpoint = None
+            self._checkpoint_sha256 = None
             self._device = "cpu"
             self._status = BCSRuntimeStatus.UNCONFIGURED
             self._configure(environment if environment is not None else os.environ)
@@ -119,16 +132,41 @@ class BCSRuntime:
     def _configure(self, environment: Mapping[str, str | None]) -> None:
         try:
             checkpoint = environment.get(_CHECKPOINT_ENV)
+            checkpoint_sha256 = environment.get(_CHECKPOINT_SHA256_ENV)
             device = environment.get(_DEVICE_ENV, "cpu")
         except Exception:
             self._cache_failure("configuration", "BCS environment configuration is invalid")
             return
         if checkpoint is None or (isinstance(checkpoint, str) and not checkpoint.strip()):
+            if checkpoint_sha256 is not None and (
+                not isinstance(checkpoint_sha256, str) or checkpoint_sha256.strip()
+            ):
+                self._cache_failure("configuration", "BCS environment configuration is invalid")
             return
-        if not isinstance(checkpoint, str):
+        if (
+            not isinstance(checkpoint, str)
+            or not isinstance(checkpoint_sha256, str)
+            or len(checkpoint_sha256) != 64
+            or checkpoint_sha256 != checkpoint_sha256.lower()
+            or any(character not in string.hexdigits[:16] for character in checkpoint_sha256)
+        ):
             self._cache_failure("configuration", "BCS environment configuration is invalid")
             return
         self._checkpoint = checkpoint
+        self._checkpoint_sha256 = checkpoint_sha256
+        try:
+            self._checkpoint = str(
+                safe_path(
+                    checkpoint,
+                    base=self._checkpoint_root.parent,
+                    approved_roots=(self._checkpoint_root,),
+                    allow_missing_final=False,
+                    require_file=True,
+                )
+            )
+        except SafePathError:
+            self._cache_failure("configuration", "BCS checkpoint path is invalid")
+            return
         self._device = device
         self._status = BCSRuntimeStatus.NOT_LOADED
 

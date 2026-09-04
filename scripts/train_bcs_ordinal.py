@@ -1,4 +1,4 @@
-"""Train and validate the VACCA ordinal BCS ResNet18 model."""
+"""Train and validate the VACCA BCS category 1..5 CORAL ResNet18 model."""
 from __future__ import annotations
 
 import argparse
@@ -11,10 +11,11 @@ import os
 import platform
 import random
 import sys
+import stat
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -44,11 +45,15 @@ from torch import Tensor  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+CONFIG_ROOT = ROOT / "configs"
+DATA_ROOT = ROOT / "data"
+OUTPUT_ROOT = ROOT / "outputs"
 sys.path.insert(0, str(ROOT / "src"))
 
 from vacca_bcs.constants import (  # noqa: E402
     BCS_CLASS_SCORES,
     BCS_DOMAIN_ID,
+    CHECKPOINT_SCHEMA_VERSION,
     CLASS_NAMES,
     MANIFEST_FILENAME,
     NUM_CLASSES,
@@ -60,33 +65,58 @@ from vacca_bcs.constants import (  # noqa: E402
     SPLITS,
 )
 from vacca_bcs.dataset import BCSFolderDataset  # noqa: E402
-from vacca_bcs.integer_snapshot import load_integer_snapshot_manifest  # noqa: E402
+from vacca_bcs.category_snapshot import load_category_snapshot_manifest  # noqa: E402
+from vacca_bcs.checkpoint_io import (  # noqa: E402
+    CheckpointByteError,
+    CheckpointByteUnavailableError,
+    load_checkpoint_bytes,
+    read_checkpoint_digest,
+    read_checkpoint_set,
+)
+from vacca_bcs.metrics import assert_metrics_match_confusion, derive_category_metrics  # noqa: E402
 from vacca_bcs.model import BCSOrdinalModel, coral_loss, predict  # noqa: E402
+from vacca_bcs.path_safety import SafePathError, safe_path  # noqa: E402
 
-CHECKPOINT_SCHEMA_VERSION = "bcs-ordinal-integer-checkpoint-v1"
 RESULTS_LINEAGE_FILENAME = "results_lineage.json"
-RESULTS_LINEAGE_SCHEMA_VERSION = "bcs-ordinal-integer-results-v1"
+CHECKPOINT_SET_FILENAME = "checkpoint_set.json"
+CHECKPOINT_SET_RECOVERY_FILENAME = "checkpoint_set.recovery.json"
+RESULTS_LINEAGE_SCHEMA_VERSION = "bcs-category-coral-results-v1"
+PROVISIONAL_ACCEPTANCE_GATES = {
+    "macro_f1_min": 0.75,
+    "balanced_accuracy_min": 0.75,
+    "class_f1_min": 0.70,
+    "class_within_one_min": 0.95,
+    "class_error_ge_2_max": 0.05,
+    "ordinal_mae_max": 0.35,
+}
 _DEFAULT_RUN_ID = "0" * 32
 _DEFAULT_SNAPSHOT_ID = "0" * 64
 TORCH_SEED_MAX = 2**64 - 1
 DEFAULT_PROGRESS_EVERY_BATCHES = 50
+_CONFIG_KEYS = frozenset(
+    {
+        "data_root", "output_dir", "epochs", "batch_size", "lr", "weight_decay",
+        "optimizer", "patience", "num_workers", "val_num_workers", "val_seed",
+        "imgsz", "device", "seed", "warmup_epochs", "lr_schedule",
+        "progress_every_batches", "provisional_acceptance_gates",
+        "_config_path",
+    }
+)
 _NON_MODEL_CONFIG_KEYS = frozenset(
     {"val_num_workers", "val_seed", "progress_every_batches"}
 )
 
 RESULTS_FIELDNAMES = [
-    "epoch",
-    "lr",
-    "train_loss",
-    "val_exact_acc",
-    "val_pm1_acc",
-    "val_mae",
-    "val_recall",
+    "epoch", "lr", "train_loss", "val_exact_acc", "val_within_one",
+    "val_ordinal_mae", "val_error_ge_2", "val_macro_f1",
+    "val_balanced_accuracy", "val_support", "val_precision", "val_recall",
+    "val_f1", "val_confusion_matrix",
 ]
 
 RESUMABLE_CHECKPOINT_FIELDS = {
     "checkpoint_schema_version",
     "domain_id",
+    "source_schema",
     "classes",
     "class_mapping",
     "score_min",
@@ -99,26 +129,37 @@ RESUMABLE_CHECKPOINT_FIELDS = {
     "snapshot_identity",
     "dataset_manifest_digest",
     "run_id",
+    "config_sha256",
     "model_state_dict",
     "optimizer_state_dict",
     "epoch",
     "best_mae",
     "epochs_without_improvement",
     "config",
-    "classes",
     "provenance",
     "rng_state",
     "observed_classes",
     "missing_classes",
-    "allow_partial_class_coverage",
     "source_identity_scheme",
     "source_mapping",
+    "best_epoch",
+    "selection_identity",
+    "best_validation",
 }
 
 
-def _resolve_path(raw: str | Path) -> Path:
-    path = Path(raw)
-    return path if path.is_absolute() else (ROOT / path).resolve()
+def _resolve_path(
+    raw: str | Path,
+    *,
+    approved_roots: tuple[Path, ...],
+    allow_missing_final: bool = True,
+) -> Path:
+    return safe_path(
+        raw,
+        base=ROOT,
+        approved_roots=approved_roots,
+        allow_missing_final=allow_missing_final,
+    )
 
 
 def _utc_now() -> str:
@@ -130,17 +171,9 @@ def load_config(config_path: Path) -> dict[str, Any]:
         config = yaml.safe_load(handle)
     if not isinstance(config, dict):
         raise ValueError("Training config must be a YAML dictionary")
-    if "data_root" in config and "data_dir" in config and config["data_root"] != config["data_dir"]:
-        raise ValueError("data_root and data_dir must identify the same snapshot")
-    if "output_dir" in config and "output" in config and config["output_dir"] != config["output"]:
-        raise ValueError("output_dir and output must identify the same run output")
-    if "data_root" not in config and "data_dir" in config:
-        config["data_root"] = config["data_dir"]
-    if "output_dir" not in config and "output" in config:
-        config["output_dir"] = config["output"]
-    config["data_dir"] = config.get("data_root")
-    config["output"] = config.get("output_dir")
-    config.setdefault("allow_partial_class_coverage", False)
+    unexpected = set(config).difference(_CONFIG_KEYS)
+    if unexpected:
+        raise ValueError(f"Unsupported training config keys: {', '.join(sorted(unexpected))}")
     required = {
         "data_root",
         "output_dir",
@@ -172,17 +205,29 @@ def load_config(config_path: Path) -> dict[str, Any]:
 
 def _validate_training_config(config: dict[str, Any]) -> None:
     """Reject invalid training values before any output directory is touched."""
-    if "data_dir" not in config and "data_root" in config:
-        config["data_dir"] = config["data_root"]
-    if "output" not in config and "output_dir" in config:
-        config["output"] = config["output_dir"]
-    config.setdefault("allow_partial_class_coverage", False)
     config.setdefault("val_num_workers", 2)
     config.setdefault("progress_every_batches", DEFAULT_PROGRESS_EVERY_BATCHES)
-    if type(config.get("allow_partial_class_coverage")) is not bool:
-        raise ValueError("allow_partial_class_coverage must be a strict boolean")
+    config.setdefault("provisional_acceptance_gates", dict(PROVISIONAL_ACCEPTANCE_GATES))
+    gates = config.get("provisional_acceptance_gates")
+    if type(gates) is not dict or set(gates) != set(PROVISIONAL_ACCEPTANCE_GATES):
+        raise ValueError("provisional_acceptance_gates must declare the complete category gate set")
+    probability_gates = {
+        "macro_f1_min", "balanced_accuracy_min", "class_f1_min", "class_within_one_min"
+    }
+    for name, value in gates.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError(f"provisional_acceptance_gates.{name} must be finite")
+        numeric = float(value)
+        if name in probability_gates and not 0 < numeric <= 1:
+            raise ValueError(f"provisional_acceptance_gates.{name} must be in (0, 1]")
+        if name == "class_error_ge_2_max" and not 0 <= numeric < 1:
+            raise ValueError(f"provisional_acceptance_gates.{name} must be in [0, 1)")
+        if name == "ordinal_mae_max" and not 0 <= numeric < SCORE_STEP * (NUM_CLASSES - 1):
+            raise ValueError(
+                f"provisional_acceptance_gates.{name} must be in [0, {SCORE_STEP * (NUM_CLASSES - 1)})"
+            )
     warmup_epochs = config.get("warmup_epochs", 2)
-    integer_minimums = {
+    category_minimums = {
         "epochs": 1,
         "batch_size": 1,
         "patience": 1,
@@ -191,7 +236,7 @@ def _validate_training_config(config: dict[str, Any]) -> None:
         "imgsz": 1,
         "seed": 0,
     }
-    for key, minimum in integer_minimums.items():
+    for key, minimum in category_minimums.items():
         value = warmup_epochs if key == "warmup_epochs" else config.get(key)
         if type(value) is not int or value < minimum:
             raise ValueError(f"{key} must be an integer >= {minimum}")
@@ -270,9 +315,23 @@ def _sha256_text(value: str) -> str:
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
+    try:
+        before = os.lstat(path)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ValueError("live snapshot entry is not a regular file")
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise ValueError("live snapshot entry changed during access")
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("live snapshot entry cannot be read") from None
+    if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+        raise ValueError("live snapshot entry changed during access")
     return digest.hexdigest()
 
 
@@ -307,7 +366,7 @@ def _coverage_from_manifest(manifest: dict[str, Any]) -> dict[str, list[int]]:
     observed = [
         score
         for score in BCS_CLASS_SCORES
-        if counts["train"][score - SCORE_MIN] or counts["val"][score - SCORE_MIN]
+        if any(counts[split][score - SCORE_MIN] for split in SPLITS)
     ]
     return {
         "observed_classes": observed,
@@ -315,36 +374,23 @@ def _coverage_from_manifest(manifest: dict[str, Any]) -> dict[str, list[int]]:
     }
 
 
-def _validate_class_coverage(
-    manifest: dict[str, Any], *, allow_partial_class_coverage: bool
-) -> dict[str, list[int]]:
-    if type(allow_partial_class_coverage) is not bool:
-        raise ValueError("allow_partial_class_coverage must be a strict boolean")
+def _validate_class_coverage(manifest: dict[str, Any]) -> dict[str, list[int]]:
     coverage = _coverage_from_manifest(manifest)
-    train = manifest["counts"]["train"]
-    val = manifest["counts"]["val"]
-    train_observed = [score for score in BCS_CLASS_SCORES if train[score - SCORE_MIN]]
-    if not any(train):
-        raise ValueError("snapshot training split is empty")
-    if not any(val):
-        raise ValueError("snapshot validation split is empty")
-    if len(train_observed) < 2:
-        raise ValueError("snapshot needs at least two training classes")
-    if coverage["missing_classes"] and not allow_partial_class_coverage:
-        raise ValueError("partial class coverage is disabled")
+    for split in SPLITS:
+        values = manifest["counts"][split]
+        if len(values) != NUM_CLASSES or not all(values):
+            raise ValueError(f"snapshot {split} split must contain all {NUM_CLASSES} BCS categories")
+    if coverage["missing_classes"]:
+        raise ValueError(f"all {NUM_CLASSES} BCS categories are required")
     return coverage
 
 
-def _dataset_manifest_provenance(
-    data_dir: Path, *, allow_partial_class_coverage: bool = False
-) -> dict[str, Any]:
+def _dataset_manifest_provenance(data_dir: Path) -> dict[str, Any]:
     manifest_path = data_dir / MANIFEST_FILENAME
     if not data_dir.is_dir() or not manifest_path.is_file():
-        raise FileNotFoundError("integer snapshot dataset or manifest is missing")
-    manifest = load_integer_snapshot_manifest(manifest_path)
-    coverage = _validate_class_coverage(
-        manifest, allow_partial_class_coverage=allow_partial_class_coverage
-    )
+        raise FileNotFoundError("BCS category snapshot dataset or manifest is missing")
+    manifest = load_category_snapshot_manifest(manifest_path)
+    coverage = _validate_class_coverage(manifest)
     data_root = data_dir.resolve()
     expected_dirs = set(SPLITS) | {
         f"{split}/{name}" for split in SPLITS for name in CLASS_NAMES
@@ -354,39 +400,38 @@ def _dataset_manifest_provenance(
     for path in data_root.rglob("*"):
         relative = path.relative_to(data_root).as_posix()
         if path.is_symlink():
-            raise ValueError("integer snapshot contains an unsafe filesystem entry")
+            raise ValueError("BCS category snapshot contains an unsafe filesystem entry")
         if path.is_dir():
             actual_dirs.add(relative)
         elif path.is_file() and relative != MANIFEST_FILENAME:
             key = relative.casefold()
             if key in actual_files:
-                raise ValueError("integer snapshot contains duplicate live paths")
+                raise ValueError("BCS category snapshot contains duplicate live paths")
             actual_files[key] = path
     if actual_dirs != expected_dirs:
-        raise ValueError("integer snapshot root structure is inconsistent")
+        raise ValueError("BCS category snapshot root structure is inconsistent")
 
     declared_files = {
         record["relative_path"].casefold(): (record["relative_path"], record["sha256"])
         for record in manifest["records"]
     }
     if set(actual_files) != set(declared_files):
-        raise ValueError("integer snapshot manifest/live dataset membership mismatch")
+        raise ValueError("BCS category snapshot manifest/live dataset membership mismatch")
 
     live_entries: list[dict[str, str]] = []
     for key, path in sorted(actual_files.items()):
         destination, declared_hash = declared_files[key]
         actual_hash = _sha256_file(path)
         if actual_hash != declared_hash:
-            raise ValueError("integer snapshot file digest mismatch")
+            raise ValueError("BCS category snapshot file digest mismatch")
         live_entries.append({"destination": destination, "sha256": actual_hash})
     return {
         "schema_version": manifest["manifest_schema_version"],
         "domain_id": manifest["domain_id"],
         "source_schema": manifest["source_schema"],
-        "identity_scheme": manifest.get("identity_scheme"),
-        "mapping": manifest.get("mapping"),
+        "identity_scheme": manifest["identity_scheme"],
+        "mapping": manifest["mapping"],
         **coverage,
-        "allow_partial_class_coverage": allow_partial_class_coverage,
         "split_identity": manifest["split_plan"]["identity_digest"],
         "sha256": _sha256_text(_canonical_json(manifest)),
         "live_sha256": _sha256_text(_canonical_json(live_entries)),
@@ -397,31 +442,39 @@ def _build_provenance(
     config: dict[str, Any], *, data_dir: Path, output_dir: Path, device: torch.device,
     run_id: str = _DEFAULT_RUN_ID,
 ) -> dict[str, Any]:
-    config_for_hash = {
-        key: value
-        for key, value in config.items()
-        if not key.startswith("_") and key not in _NON_MODEL_CONFIG_KEYS
-    }
-    config_for_hash.setdefault("allow_partial_class_coverage", False)
-    config_for_hash["data_dir"] = str(data_dir.resolve())
-    config_for_hash["output"] = str(output_dir.resolve())
     runtime = _runtime_identity(device)
+    dataset_manifest = _dataset_manifest_provenance(
+        data_dir,
+    )
     return {
-        "config_sha256": _sha256_text(_canonical_json(config_for_hash)),
+        "config_sha256": _config_sha256(config, data_dir=data_dir, output_dir=output_dir),
         "run_id": run_id,
         "domain_id": BCS_DOMAIN_ID,
         "data_dir": str(data_dir.resolve()),
         "output_dir": str(output_dir.resolve()),
-        "dataset_manifest": _dataset_manifest_provenance(
-            data_dir,
-            allow_partial_class_coverage=config.get("allow_partial_class_coverage", False),
-        ),
+        "dataset_manifest": dataset_manifest,
+        "source_schema": dataset_manifest["source_schema"],
+        "identity_scheme": dataset_manifest["identity_scheme"],
+        "mapping": dataset_manifest["mapping"],
         "device": str(device),
         "cuda_device_count": runtime["cuda_device_count"],
         "runtime": runtime,
         "classes": list(CLASS_NAMES),
         "class_values": list(BCS_CLASS_SCORES),
     }
+
+
+def _config_sha256(
+    config: dict[str, Any], *, data_dir: Path, output_dir: Path
+) -> str:
+    config_for_hash = {
+        key: value
+        for key, value in config.items()
+        if not key.startswith("_") and key not in _NON_MODEL_CONFIG_KEYS
+    }
+    config_for_hash["data_root"] = str(data_dir.resolve())
+    config_for_hash["output_dir"] = str(output_dir.resolve())
+    return _sha256_text(_canonical_json(config_for_hash))
 
 
 def _checkpoint_lineage(provenance: dict[str, Any], run_id: str) -> dict[str, Any]:
@@ -431,6 +484,7 @@ def _checkpoint_lineage(provenance: dict[str, Any], run_id: str) -> dict[str, An
     return {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "domain_id": BCS_DOMAIN_ID,
+        "source_schema": manifest.get("source_schema", "bcs-local-category-source-v1"),
         "classes": list(CLASS_NAMES),
         "class_mapping": {name: index for index, name in enumerate(CLASS_NAMES)},
         "score_min": SCORE_MIN,
@@ -439,15 +493,18 @@ def _checkpoint_lineage(provenance: dict[str, Any], run_id: str) -> dict[str, An
         "score_step": SCORE_STEP,
         "num_classes": NUM_CLASSES,
         "num_thresholds": NUM_THRESHOLDS,
-        "snapshot_schema": manifest.get("schema_version", "bcs-integer-snapshot-v2"),
+        "snapshot_schema": manifest.get("schema_version", "bcs-category-snapshot-v1"),
         "snapshot_identity": manifest.get("split_identity", _DEFAULT_SNAPSHOT_ID),
         "dataset_manifest_digest": manifest.get("sha256", _DEFAULT_SNAPSHOT_ID),
         "run_id": run_id,
+        "config_sha256": provenance.get("config_sha256", _DEFAULT_SNAPSHOT_ID),
         "observed_classes": coverage,
         "missing_classes": missing,
-        "allow_partial_class_coverage": manifest.get("allow_partial_class_coverage", False),
-        "source_identity_scheme": manifest.get("identity_scheme"),
-        "source_mapping": manifest.get("mapping"),
+        "source_identity_scheme": manifest.get("identity_scheme", "local-path-sha256-v1"),
+        "source_mapping": manifest.get(
+            "mapping",
+            {"3.25": 1, "3.5": 2, "3.75": 3, "4.0": 4, "4.25": 5},
+        ),
     }
 
 
@@ -457,12 +514,13 @@ def _results_lineage(provenance: dict[str, Any], run_id: str) -> dict[str, Any]:
         "lineage_schema_version": RESULTS_LINEAGE_SCHEMA_VERSION,
         "run_id": checkpoint["run_id"],
         "domain_id": checkpoint["domain_id"],
+        "source_schema": checkpoint["source_schema"],
         "snapshot_schema": checkpoint["snapshot_schema"],
         "snapshot_identity": checkpoint["snapshot_identity"],
         "dataset_manifest_digest": checkpoint["dataset_manifest_digest"],
         "observed_classes": checkpoint["observed_classes"],
         "missing_classes": checkpoint["missing_classes"],
-        "allow_partial_class_coverage": checkpoint["allow_partial_class_coverage"],
+        "config_sha256": checkpoint["config_sha256"],
         "source_identity_scheme": checkpoint["source_identity_scheme"],
         "source_mapping": checkpoint["source_mapping"],
     }
@@ -481,15 +539,17 @@ def _validate_checkpoint_lineage(
     checkpoint: dict[str, Any], *, path: Path, expected: dict[str, Any] | None = None
 ) -> None:
     if checkpoint.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
-        raise ValueError(f"Checkpoint {path} has an unsupported integer schema")
+        raise ValueError(f"Checkpoint {path} has an unsupported category schema")
     if checkpoint.get("domain_id") != BCS_DOMAIN_ID:
-        raise ValueError(f"Checkpoint {path} has an invalid integer domain")
+        raise ValueError(f"Checkpoint {path} has an invalid category domain")
+    if checkpoint.get("source_schema") != "bcs-local-category-source-v1":
+        raise ValueError(f"Checkpoint {path} source schema is invalid")
     if (
         type(checkpoint.get("classes")) is not list
         or any(type(value) is not str for value in checkpoint["classes"])
         or checkpoint["classes"] != list(CLASS_NAMES)
     ):
-        raise ValueError(f"Checkpoint {path} classes must be a list of integer classes")
+        raise ValueError(f"Checkpoint {path} classes must be a list of BCS categories")
     if (
         type(checkpoint.get("class_mapping")) is not dict
         or any(type(value) is not int for value in checkpoint["class_mapping"].values())
@@ -510,9 +570,10 @@ def _validate_checkpoint_lineage(
     ):
         raise ValueError(f"Checkpoint {path} scale is invalid")
     if (
-        checkpoint.get("snapshot_schema") != "bcs-integer-snapshot-v2"
+        checkpoint.get("snapshot_schema") != "bcs-category-snapshot-v1"
         or not _valid_hex(checkpoint.get("snapshot_identity"), 64)
         or not _valid_hex(checkpoint.get("dataset_manifest_digest"), 64)
+        or not _valid_hex(checkpoint.get("config_sha256"), 64)
         or not _valid_hex(checkpoint.get("run_id"), 32)
     ):
         raise ValueError(f"Checkpoint {path} snapshot or run lineage is invalid")
@@ -521,26 +582,200 @@ def _validate_checkpoint_lineage(
     if (
         type(observed) is not list
         or any(type(value) is not int for value in observed)
-        or observed != sorted(set(observed))
-        or any(value not in BCS_CLASS_SCORES for value in observed)
+        or observed != list(BCS_CLASS_SCORES)
         or type(missing) is not list
         or any(type(value) is not int for value in missing)
         or missing != sorted(set(missing))
-        or missing != [score for score in BCS_CLASS_SCORES if score not in observed]
-        or type(checkpoint.get("allow_partial_class_coverage")) is not bool
-        or (
-            bool(missing)
-            and not checkpoint["allow_partial_class_coverage"]
-        )
-        or type(checkpoint.get("source_identity_scheme")) not in (str, type(None))
-        or type(checkpoint.get("source_mapping")) not in (dict, type(None))
+        or missing != []
+        or checkpoint.get("source_identity_scheme") != "local-path-sha256-v1"
+        or checkpoint.get("source_mapping") != {"3.25": 1, "3.5": 2, "3.75": 3, "4.0": 4, "4.25": 5}
     ):
         raise ValueError(f"Checkpoint {path} coverage metadata is invalid")
     if expected is not None:
         expected_lineage = _checkpoint_lineage(expected, expected["run_id"])
         if any(checkpoint.get(field) != value for field, value in expected_lineage.items()):
-            raise ValueError(f"Checkpoint {path} has an invalid integer lineage field")
+            raise ValueError(f"Checkpoint {path} has an invalid category lineage field")
     return
+
+
+def _validate_checkpoint_set(
+    last: dict[str, Any],
+    best: dict[str, Any],
+    *,
+    last_path: Path,
+    best_path: Path,
+) -> None:
+    """Require last.pt and best.pt to describe one coherent training run."""
+    for field in (
+        "run_id",
+        "snapshot_identity",
+        "dataset_manifest_digest",
+        "config_sha256",
+        "best_epoch",
+        "selection_identity",
+        "best_validation",
+    ):
+        if last.get(field) != best.get(field):
+            raise ValueError(
+                f"Checkpoint set metadata mismatch for {field}: {last_path} vs {best_path}"
+            )
+    if type(last.get("epoch")) is not int or type(best.get("best_epoch")) is not int:
+        raise ValueError("Checkpoint set epoch metadata is invalid")
+    if last["epoch"] < best["best_epoch"]:
+        raise ValueError("last.pt predates the selected best checkpoint")
+    if not math.isclose(
+        float(last.get("best_mae")),
+        float(best.get("val_ordinal_mae")),
+        rel_tol=0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("Checkpoint set best metric metadata does not match")
+
+
+def _validate_checkpoint_set_descriptor(
+    checkpoint_set: dict[str, Any],
+    *,
+    best: dict[str, Any],
+    last: dict[str, Any],
+    best_digest: str,
+    last_digest: str,
+    provenance: dict[str, Any],
+) -> None:
+    if checkpoint_set.get("schema") != "vacca-bcs-checkpoint-set-v1":
+        raise ValueError("Checkpoint set descriptor schema is invalid")
+    expected_lineage = _checkpoint_lineage(provenance, provenance["run_id"])
+    shared_fields = (
+        "run_id", "domain_id", "source_schema", "snapshot_schema",
+        "snapshot_identity", "dataset_manifest_digest", "config_sha256",
+        "observed_classes", "missing_classes", "source_identity_scheme",
+        "source_mapping",
+    )
+    if any(checkpoint_set.get(field) != expected_lineage[field] for field in shared_fields):
+        raise ValueError("Checkpoint set descriptor lineage is invalid")
+    if checkpoint_set.get("committed_epoch") != last.get("epoch"):
+        raise ValueError("Checkpoint set committed epoch is invalid")
+    if checkpoint_set.get("best_epoch") != best.get("best_epoch"):
+        raise ValueError("Checkpoint set selected best epoch is invalid")
+    if checkpoint_set.get("selection_identity") != best.get("selection_identity"):
+        raise ValueError("Checkpoint set selection identity is invalid")
+    if checkpoint_set.get("best_validation") != best.get("best_validation"):
+        raise ValueError("Checkpoint set selected validation is invalid")
+    for role, digest in (("best", best_digest), ("last", last_digest)):
+        reference = checkpoint_set.get(role)
+        if (
+            not isinstance(reference, dict)
+            or reference.get("filename") != f"generations/{digest}.pt"
+            or reference.get("sha256") != digest
+        ):
+            raise ValueError(f"Checkpoint set {role} generation reference is invalid")
+    _validate_checkpoint_set(
+        last,
+        best,
+        last_path=Path(checkpoint_set["last"]["filename"]),
+        best_path=Path(checkpoint_set["best"]["filename"]),
+    )
+
+
+def _checkpoint_set_descriptor(
+    *,
+    best: dict[str, Any],
+    last: dict[str, Any],
+    best_digest: str,
+    last_digest: str,
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": "vacca-bcs-checkpoint-set-v1",
+        **_results_lineage(provenance, provenance["run_id"]),
+        "committed_epoch": last["epoch"],
+        "best": {"filename": f"generations/{best_digest}.pt", "sha256": best_digest},
+        "last": {"filename": f"generations/{last_digest}.pt", "sha256": last_digest},
+        "best_epoch": best["best_epoch"],
+        "selection_identity": best["selection_identity"],
+        "best_validation": best["best_validation"],
+    }
+
+
+def _load_authoritative_checkpoint_set(
+    weights_dir: Path, *, approved_output_roots: tuple[Path, ...]
+) -> dict[str, Any]:
+    try:
+        return read_checkpoint_set(
+            weights_dir / CHECKPOINT_SET_FILENAME,
+            approved_roots=approved_output_roots,
+        )
+    except CheckpointByteUnavailableError:
+        try:
+            return read_checkpoint_set(
+                weights_dir / CHECKPOINT_SET_RECOVERY_FILENAME,
+                approved_roots=approved_output_roots,
+            )
+        except CheckpointByteUnavailableError:
+            raise ValueError("Authoritative checkpoint set descriptor is missing") from None
+    except CheckpointByteError as error:
+        try:
+            return read_checkpoint_set(
+                weights_dir / CHECKPOINT_SET_RECOVERY_FILENAME,
+                approved_roots=approved_output_roots,
+            )
+        except (CheckpointByteError, CheckpointByteUnavailableError):
+            raise ValueError(f"Authoritative checkpoint set descriptor is invalid: {error}") from None
+
+
+def _write_checkpoint_set(
+    weights_dir: Path,
+    *,
+    best_digest: str,
+    last_digest: str,
+    provenance: dict[str, Any],
+    approved_output_roots: tuple[Path, ...],
+) -> dict[str, Any]:
+    best_path = weights_dir / "best.pt"
+    last_path = weights_dir / "last.pt"
+    try:
+        best_loaded = load_checkpoint_bytes(
+            weights_dir / "generations" / f"{best_digest}.pt",
+            approved_roots=approved_output_roots,
+            expected_sha256=best_digest,
+        )
+        last_loaded = load_checkpoint_bytes(
+            weights_dir / "generations" / f"{last_digest}.pt",
+            approved_roots=approved_output_roots,
+            expected_sha256=last_digest,
+        )
+    except (CheckpointByteError, CheckpointByteUnavailableError) as error:
+        raise ValueError(f"Checkpoint generations are not safely committed: {error}") from None
+    best = best_loaded.payload
+    last = last_loaded.payload
+    _validate_checkpoint_lineage(best, path=best_path, expected=provenance)
+    _validate_checkpoint_lineage(last, path=last_path, expected=provenance)
+    descriptor = _checkpoint_set_descriptor(
+        best=best,
+        last=last,
+        best_digest=best_digest,
+        last_digest=last_digest,
+        provenance=provenance,
+    )
+    descriptor_path = weights_dir / CHECKPOINT_SET_FILENAME
+    if descriptor_path.is_file():
+        previous = _load_authoritative_checkpoint_set(
+            weights_dir, approved_output_roots=approved_output_roots
+        )
+        _atomic_write_json(previous, weights_dir / CHECKPOINT_SET_RECOVERY_FILENAME)
+    _atomic_write_json(descriptor, descriptor_path)
+    return descriptor
+
+
+def _complete_checkpoint_set_commit(
+    weights_dir: Path, *, approved_output_roots: tuple[Path, ...]
+) -> None:
+    recovery = weights_dir / CHECKPOINT_SET_RECOVERY_FILENAME
+    _reject_symlink_final(recovery)
+    _gc_checkpoint_generations(
+        weights_dir, approved_output_roots=approved_output_roots
+    )
+    if recovery.is_file():
+        recovery.unlink()
 
 
 def _validate_lineage_file(path: Path, expected: dict[str, Any], label: str) -> None:
@@ -657,8 +892,22 @@ def _flush_and_fsync(handle: Any) -> None:
     os.fsync(handle.fileno())
 
 
-def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
-    """Flush a staged checkpoint, then replace the destination atomically."""
+def _reject_symlink_final(path: Path) -> None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ValueError(f"Output artifact cannot be inspected: {path}") from None
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"Output artifact must not be a symlink: {path}")
+
+
+def _atomic_torch_save(payload: dict[str, Any], path: Path) -> str:
+    """Publish an immutable checkpoint generation through one atomic path entry."""
+    _reject_symlink_final(path)
+    if path.parent.is_symlink():
+        raise ValueError(f"Checkpoint parent directory must not be a symlink: {path.parent}")
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, raw_temp_path = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -669,8 +918,42 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
             descriptor = -1
             torch.save(payload, handle)
             _flush_and_fsync(handle)
-        os.replace(temp_path, path)
-        _fsync_directory(path.parent)
+        raw = temp_path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        generations_dir = path.parent / "generations"
+        if generations_dir.is_symlink():
+            raise ValueError(f"Checkpoint generations directory must not be a symlink: {generations_dir}")
+        generations_dir.mkdir(exist_ok=True)
+        generation_path = generations_dir / f"{digest}.pt"
+        _reject_symlink_final(generation_path)
+        if generation_path.exists():
+            if _sha256_file(generation_path) != digest:
+                raise ValueError(f"Checkpoint generation digest collision: {generation_path}")
+            temp_path.unlink()
+        else:
+            os.replace(temp_path, generation_path)
+            _fsync_directory(generations_dir)
+
+        pointer_descriptor, raw_pointer_path = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        pointer_path = Path(raw_pointer_path)
+        try:
+            os.close(pointer_descriptor)
+            pointer_descriptor = -1
+            pointer_path.unlink()
+            os.link(generation_path, pointer_path)
+            os.replace(pointer_path, path)
+            _fsync_directory(path.parent)
+        except BaseException:
+            if pointer_descriptor != -1:
+                os.close(pointer_descriptor)
+            try:
+                pointer_path.unlink()
+            except OSError:
+                pass
+            raise
+        return digest
     except BaseException:
         if descriptor != -1:
             os.close(descriptor)
@@ -683,18 +966,32 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
 
 def _existing_run_artifacts(output_dir: Path) -> list[Path]:
     """List run artifacts whose presence marks the output dir as an existing run."""
+    if output_dir.is_symlink():
+        raise ValueError("Output directory must not be a symlink")
     candidates = [
         output_dir / "results.csv",
         output_dir / "run_info.json",
         output_dir / RESULTS_LINEAGE_FILENAME,
+        output_dir / "weights" / CHECKPOINT_SET_FILENAME,
+        output_dir / "weights" / CHECKPOINT_SET_RECOVERY_FILENAME,
     ]
     weights_dir = output_dir / "weights"
+    if weights_dir.is_symlink():
+        raise ValueError("Output weights directory must not be a symlink")
     if weights_dir.is_dir():
         candidates.extend(sorted(weights_dir.glob("*.pt")))
+        generations_dir = weights_dir / "generations"
+        if generations_dir.is_symlink():
+            raise ValueError("Output checkpoint generations directory must not be a symlink")
+        if generations_dir.is_dir():
+            candidates.extend(sorted(generations_dir.glob("*.pt")))
+    for path in candidates:
+        _reject_symlink_final(path)
     return [path for path in candidates if path.is_file()]
 
 
 def _atomic_write_json(payload: dict[str, Any], path: Path) -> None:
+    _reject_symlink_final(path)
     descriptor, raw_temp_path = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
@@ -702,7 +999,16 @@ def _atomic_write_json(payload: dict[str, Any], path: Path) -> None:
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = -1
-            handle.write(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.write(
+                json.dumps(
+                    payload,
+                    indent=2,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
             _flush_and_fsync(handle)
         os.replace(temp_path, path)
         _fsync_directory(path.parent)
@@ -714,6 +1020,82 @@ def _atomic_write_json(payload: dict[str, Any], path: Path) -> None:
         except OSError:
             pass
         raise
+
+
+def _atomic_write_text(content: str, path: Path) -> None:
+    _reject_symlink_final(path)
+    descriptor, raw_temp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temp_path = Path(raw_temp_path)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii", newline="") as handle:
+            descriptor = -1
+            handle.write(content)
+            _flush_and_fsync(handle)
+        os.replace(temp_path, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        if descriptor != -1:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _read_checkpoint_digest(path: Path, *, approved_output_roots: tuple[Path, ...]) -> str:
+    try:
+        digest = read_checkpoint_digest(
+            path,
+            approved_roots=approved_output_roots,
+            require_checkpoint_set=True,
+        )
+    except (CheckpointByteError, CheckpointByteUnavailableError):
+        raise ValueError(f"Checkpoint digest is unreadable: {path}") from None
+    if not _valid_hex(digest, 64):
+        raise ValueError(f"Checkpoint digest is invalid: {path}")
+    return digest
+
+
+def _gc_checkpoint_generations(
+    weights_dir: Path, *, approved_output_roots: tuple[Path, ...]
+) -> None:
+    """Delete only unreferenced generated checkpoints; never delete current aliases."""
+    try:
+        weights_dir = _resolve_path(
+            weights_dir, approved_roots=approved_output_roots
+        )
+    except SafePathError:
+        raise ValueError("Checkpoint generation cleanup path is unsafe") from None
+    generations_dir = weights_dir / "generations"
+    if not generations_dir.is_dir() or generations_dir.is_symlink():
+        return
+    referenced: set[str] = set()
+    for pointer in (
+        weights_dir / CHECKPOINT_SET_FILENAME,
+        weights_dir / CHECKPOINT_SET_RECOVERY_FILENAME,
+    ):
+        try:
+            payload = json.loads(pointer.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema") == "vacca-bcs-checkpoint-set-v1"
+        ):
+            for role in ("best", "last"):
+                reference = payload.get(role)
+                if isinstance(reference, dict) and _valid_hex(reference.get("sha256"), 64):
+                    referenced.add(reference["sha256"])
+    for alias in (weights_dir / "best.pt", weights_dir / "last.pt"):
+        if alias.is_file() and not alias.is_symlink():
+            referenced.add(_sha256_file(alias))
+    for generation in generations_dir.glob("*.pt"):
+        _reject_symlink_final(generation)
+        if _valid_hex(generation.stem, 64) and generation.stem not in referenced:
+            generation.unlink()
 
 
 @dataclass(frozen=True)
@@ -728,6 +1110,7 @@ class RunInfoContext:
     run_id: str
     train_dataset: BCSFolderDataset
     val_dataset: BCSFolderDataset
+    test_dataset: BCSFolderDataset
     started_at: str
     started_time: float
     resume: Path | None
@@ -748,6 +1131,7 @@ def _build_run_info(context: RunInfoContext) -> dict[str, Any]:
         "class_counts": {
             "train": context.train_dataset.class_counts,
             "val": context.val_dataset.class_counts,
+            "test": context.test_dataset.class_counts,
         },
         "device": str(context.device),
         "output_dir": str(context.output_dir),
@@ -757,7 +1141,6 @@ def _build_run_info(context: RunInfoContext) -> dict[str, Any]:
             for key in (
                 "observed_classes",
                 "missing_classes",
-                "allow_partial_class_coverage",
             )
         },
         "wall_time_seconds": time.perf_counter() - context.started_time,
@@ -789,6 +1172,7 @@ def _open_results_csv(
     results_path: Path, *, append: bool
 ) -> tuple[TextIO, csv.DictWriter[str]]:
     """Open results.csv, appending without a duplicate header when resuming."""
+    _reject_symlink_final(results_path)
     if append and results_path.is_file() and results_path.stat().st_size > 0:
         handle = results_path.open("a", newline="", encoding="utf-8")
         return handle, csv.DictWriter(handle, fieldnames=RESULTS_FIELDNAMES)
@@ -799,6 +1183,7 @@ def _open_results_csv(
 
 
 def _atomic_write_results_prefix(path: Path, rows: list[list[str]]) -> None:
+    _reject_symlink_final(path)
     descriptor, raw_temp_path = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
@@ -829,7 +1214,7 @@ def _validate_result_epoch(
         return
     try:
         epoch_value = int(row[0])
-    except ValueError:
+    except (TypeError, ValueError):
         raise ValueError(
             f"results.csv line {line_number} has a non-integer epoch: {row[0]!r}"
         ) from None
@@ -842,23 +1227,17 @@ def _validate_result_epoch(
 
 
 def _validate_results_row(row: list[str], *, line_number: int, expected_epoch: int) -> None:
-    if len(row) not in (len(RESULTS_FIELDNAMES) - 1, len(RESULTS_FIELDNAMES)):
+    if len(row) != len(RESULTS_FIELDNAMES):
         raise ValueError(
             f"results.csv line {line_number} is malformed: expected"
             f" {len(RESULTS_FIELDNAMES)} columns, got {len(row)}"
         )
     _validate_result_epoch(row, line_number=line_number, expected_epoch=expected_epoch)
-    metric_domains = {
-        "lr": (0.0, None),
-        "train_loss": (0.0, None),
-        "val_exact_acc": (0.0, 1.0),
-        "val_pm1_acc": (0.0, 1.0),
-        "val_mae": (0.0, SCORE_STEP * (len(CLASS_NAMES) - 1)),
-    }
+    metric_domains = {"lr": (0.0, None), "train_loss": (0.0, None), "val_exact_acc": (0.0, 1.0), "val_within_one": (0.0, 1.0), "val_ordinal_mae": (0.0, SCORE_STEP * (len(CLASS_NAMES) - 1)), "val_error_ge_2": (0.0, 1.0), "val_macro_f1": (0.0, 1.0), "val_balanced_accuracy": (0.0, 1.0)}
     for column, (lower, upper) in metric_domains.items():
         try:
             value = float(row[RESULTS_FIELDNAMES.index(column)])
-        except (ValueError, OverflowError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(
                 f"results.csv line {line_number} has a non-numeric {column}:"
                 f" {row[RESULTS_FIELDNAMES.index(column)]!r}"
@@ -871,26 +1250,19 @@ def _validate_results_row(row: list[str], *, line_number: int, expected_epoch: i
                 f"results.csv line {line_number} has an invalid {column} {value!r};"
                 f" expected a finite value {domain}"
             )
-    if len(row) == len(RESULTS_FIELDNAMES):
+    for field in ("val_support", "val_precision", "val_recall", "val_f1", "val_confusion_matrix"):
         try:
-            recalls = json.loads(row[RESULTS_FIELDNAMES.index("val_recall")])
+            parsed = json.loads(row[RESULTS_FIELDNAMES.index(field)])
         except (TypeError, ValueError, json.JSONDecodeError):
-            raise ValueError(f"results.csv line {line_number} has invalid val_recall") from None
-        if (
-            type(recalls) is not dict
-            or set(recalls) != set(CLASS_NAMES)
-            or any(
-                value is not None
-                and (
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(float(value))
-                    or not 0 <= float(value) <= 1
-                )
-                for value in recalls.values()
-            )
-        ):
-            raise ValueError(f"results.csv line {line_number} has invalid val_recall")
+            raise ValueError(f"results.csv line {line_number} has invalid {field}") from None
+        if field == "val_confusion_matrix":
+            valid = type(parsed) is list and len(parsed) == NUM_CLASSES and all(type(item) is list and len(item) == NUM_CLASSES and all(type(cell) is int and cell >= 0 for cell in item) for item in parsed)
+        elif field == "val_support":
+            valid = type(parsed) is list and len(parsed) == NUM_CLASSES and all(type(item) is int and item >= 0 for item in parsed)
+        else:
+            valid = type(parsed) is dict and set(parsed) == set(CLASS_NAMES) and all(value is None or (not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value)) and 0 <= float(value) <= 1) for value in parsed.values())
+        if not valid:
+            raise ValueError(f"results.csv line {line_number} has invalid {field}")
 
 
 def _reconcile_results_csv(results_path: Path, *, checkpoint_epoch: int) -> int:
@@ -902,6 +1274,7 @@ def _reconcile_results_csv(results_path: Path, *, checkpoint_epoch: int) -> int:
     window. Older stale checkpoints and malformed committed rows raise.
     Returns the number of epoch rows kept (always checkpoint_epoch).
     """
+    _reject_symlink_final(results_path)
     if not results_path.is_file():
         raise FileNotFoundError(
             "Cannot resume without the matching results history:"
@@ -984,6 +1357,9 @@ def _build_last_checkpoint(
     epochs_without_improvement: int,
     config: dict[str, Any],
     provenance: dict[str, Any] | None = None,
+    best_epoch: int | None = None,
+    selection_identity: str = "",
+    best_validation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the resumable checkpoint saved as weights/last.pt every epoch."""
     active_provenance = provenance or {}
@@ -1001,6 +1377,9 @@ def _build_last_checkpoint(
         "classes": list(CLASS_NAMES),
         "provenance": active_provenance,
         "rng_state": _capture_rng_state(),
+        "best_epoch": int(best_epoch if best_epoch is not None else epoch),
+        "selection_identity": selection_identity,
+        "best_validation": best_validation or {},
     }
     return payload
 
@@ -1061,17 +1440,27 @@ def _load_resume_checkpoint(
     *,
     expected_classes: list[str],
     total_epochs: int,
+    approved_output_roots: tuple[Path, ...],
+    expected_sha256: str | None = None,
     expected_provenance: dict[str, Any] | None = None,
+    require_checkpoint_set: bool = True,
 ) -> dict[str, Any]:
     """Load and validate a resumable checkpoint (weights/last.pt)."""
-    if not path.is_file():
-        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
     try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception as exc:
-        raise ValueError(f"Resume checkpoint could not be loaded safely: {path}: {exc}") from exc
-    if not isinstance(checkpoint, dict):
-        raise ValueError(f"Resume checkpoint is not a state dictionary: {path}")
+        loaded = load_checkpoint_bytes(
+            path,
+            approved_roots=approved_output_roots,
+            expected_sha256=expected_sha256,
+            require_checkpoint_set=require_checkpoint_set,
+        )
+        path = loaded.path
+        checkpoint = loaded.payload
+    except CheckpointByteUnavailableError:
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}") from None
+    except CheckpointByteError as error:
+        raise ValueError(f"Resume checkpoint could not be loaded safely: {path}: {error}") from None
+    except SafePathError:
+        raise ValueError(f"Resume checkpoint path is unsafe: {path}") from None
     missing = sorted(RESUMABLE_CHECKPOINT_FIELDS.difference(checkpoint))
     if missing:
         hint = ""
@@ -1241,56 +1630,17 @@ def _validate(
     device: torch.device,
 ) -> dict[str, Any]:
     model.eval()
-    exact = torch.zeros((), dtype=torch.int64, device=device)
-    plus_minus_one = torch.zeros((), dtype=torch.int64, device=device)
-    absolute_index_error = torch.zeros((), dtype=torch.int64, device=device)
-    total = torch.zeros((), dtype=torch.int64, device=device)
-    class_total = torch.zeros(len(CLASS_NAMES), dtype=torch.int64, device=device)
-    class_correct = torch.zeros(len(CLASS_NAMES), dtype=torch.int64, device=device)
+    confusion = torch.zeros((len(CLASS_NAMES), len(CLASS_NAMES)), dtype=torch.int64, device=device)
 
     for images, levels in loader:
         images = images.to(device, non_blocking=True)
         levels = levels.to(device, non_blocking=True)
         pred_idx, _ = predict(model(images))
-        errors = (pred_idx - levels).abs()
-        exact += (errors == 0).sum()
-        plus_minus_one += (errors <= 1).sum()
-        absolute_index_error += errors.sum()
-        total += levels.numel()
-        for class_idx in range(len(CLASS_NAMES)):
-            mask = levels == class_idx
-            class_total[class_idx] += mask.sum()
-            class_correct[class_idx] += ((pred_idx == class_idx) & mask).sum()
+        for true_idx, pred_idx_value in zip(levels.cpu().tolist(), pred_idx.cpu().tolist()):
+            confusion[true_idx, pred_idx_value] += 1
 
-    summary = torch.cat(
-        (
-            exact.reshape(1),
-            plus_minus_one.reshape(1),
-            absolute_index_error.reshape(1),
-            total.reshape(1),
-            class_total,
-            class_correct,
-        )
-    ).cpu().tolist()
-    exact_value, pm1_value, absolute_error_value, total_value = summary[:4]
-    class_total_values = summary[4 : 4 + len(CLASS_NAMES)]
-    class_correct_values = summary[4 + len(CLASS_NAMES) :]
-
-    recalls = {
-        class_name: (
-            class_correct_values[index] / class_total_values[index]
-            if class_total_values[index]
-            else None
-        )
-        for index, class_name in enumerate(CLASS_NAMES)
-    }
-    return {
-        "exact_acc": exact_value / max(1, total_value),
-        "pm1_acc": pm1_value / max(1, total_value),
-        "mae": SCORE_STEP * absolute_error_value / max(1, total_value),
-        "recall": recalls,
-        "total": total_value,
-    }
+    matrix = confusion.cpu().tolist()
+    return derive_category_metrics(matrix)
 
 
 @dataclass
@@ -1300,18 +1650,24 @@ class TrainingContext:
     device: torch.device
     data_dir: Path
     output_dir: Path
+    approved_output_roots: tuple[Path, ...]
     resume: Path | None
     checkpoint: dict[str, Any] | None
+    checkpoint_set: dict[str, Any] | None
     run_id: str
     provenance: dict[str, Any]
     start_epoch: int
     best_mae: float
+    best_epoch: int
+    selection_identity: str
+    best_validation: dict[str, Any]
     epochs_without_improvement: int
     weights_dir: Path
     results_path: Path
     run_info_context: RunInfoContext
     train_loader: DataLoader[tuple[Tensor, int]] | None
     val_loader: DataLoader[tuple[Tensor, int]] | None
+    test_loader: DataLoader[tuple[Tensor, int]] | None
     model: torch.nn.Module | None
     optimizer: torch.optim.Optimizer | None
     epoch_range: range
@@ -1320,31 +1676,119 @@ class TrainingContext:
 @dataclass(frozen=True)
 class TrainingResult:
     final_metrics: dict[str, Any]
+    test_metrics: dict[str, Any]
     train_loss: float
     best_mae: float
     epochs_without_improvement: int
+    best_epoch: int
+    selection_identity: str
+    best_validation: dict[str, Any]
+    last_checkpoint_sha256: str
+
+
+def _selection_identity(provenance: dict[str, Any], epoch: int, metrics: dict[str, Any]) -> str:
+    payload = {
+        "run_id": provenance["run_id"],
+        "snapshot_identity": provenance["dataset_manifest"]["split_identity"],
+        "epoch": epoch,
+        "validation": {
+            key: metrics[key]
+            for key in (
+                "exact_acc", "within_one", "ordinal_mae", "error_ge_2",
+                "macro_f1", "balanced_accuracy", "precision", "recall", "f1",
+                "within_one_by_class", "error_ge_2_by_class",
+            )
+        },
+    }
+    return _sha256_text(_canonical_json(payload))
+
+
+def _selection_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: metrics[key]
+        for key in (
+            "exact_acc", "within_one", "ordinal_mae", "error_ge_2",
+            "macro_f1", "balanced_accuracy", "precision", "recall", "f1",
+            "within_one_by_class", "error_ge_2_by_class",
+        )
+    }
+
+
+def _validate_metrics_payload(metrics: object) -> None:
+    """Validate serialized metrics against their canonical confusion derivation."""
+    assert_metrics_match_confusion(metrics)
+
+
+def _evaluate_provisional_gates(
+    metrics: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    gates = config["provisional_acceptance_gates"]
+    checks = {
+        "macro_f1": metrics["macro_f1"] >= gates["macro_f1_min"],
+        "balanced_accuracy": metrics["balanced_accuracy"] >= gates["balanced_accuracy_min"],
+        "every_class_f1": all(
+            value is not None and value >= gates["class_f1_min"]
+            for value in metrics["f1"].values()
+        ),
+        "every_class_within_one": all(
+            value is not None and value >= gates["class_within_one_min"]
+            for value in metrics["within_one_by_class"].values()
+        ),
+        "every_class_error_ge_2": all(
+            value is not None and value <= gates["class_error_ge_2_max"]
+            for value in metrics["error_ge_2_by_class"].values()
+        ),
+        "ordinal_mae": metrics["ordinal_mae"] <= gates["ordinal_mae_max"],
+    }
+    return {
+        "kind": "provisional_engineering_only",
+        "passed": all(checks.values()),
+        "checks": checks,
+        "gates": gates,
+    }
 
 
 def _initialize_training(
-    config: dict[str, Any], *, resume: Path | None, overwrite: bool
+    config: dict[str, Any], *, resume: Path | None, overwrite: bool,
+    approved_data_roots: tuple[Path, ...],
+    approved_output_roots: tuple[Path, ...],
 ) -> TrainingContext:
     """Validate inputs and assemble the resumable training context."""
     _validate_training_config(config)
     total_epochs = int(config["epochs"])
     device = resolve_device(str(config["device"]))
-    data_dir = _resolve_path(config["data_dir"])
-    output_dir = _resolve_path(config["output"])
+    data_dir = _resolve_path(config["data_root"], approved_roots=approved_data_roots)
+    output_dir = _resolve_path(config["output_dir"], approved_roots=approved_output_roots)
+    if resume is not None:
+        resume = _resolve_path(
+            resume,
+            approved_roots=approved_output_roots,
+            allow_missing_final=True,
+        )
     if device.type == "cuda":
         print(f"[DEVICE] {device} {torch.cuda.get_device_name(device)}", flush=True)
     else:
         print(f"[DEVICE] {device}", flush=True)
 
     checkpoint: dict[str, Any] | None = None
+    checkpoint_set: dict[str, Any] | None = None
+    resume_sha256: str | None = None
     if resume is None and _existing_run_artifacts(output_dir) and not overwrite:
         _prepare_output_dir(output_dir, overwrite=False)
     if resume is not None:
+        checkpoint_set = _load_authoritative_checkpoint_set(
+            output_dir / "weights", approved_output_roots=approved_output_roots
+        )
+        resume_sha256 = _read_checkpoint_digest(
+            resume, approved_output_roots=approved_output_roots
+        )
         checkpoint = _load_resume_checkpoint(
-            resume, expected_classes=list(CLASS_NAMES), total_epochs=total_epochs
+            resume,
+            expected_classes=list(CLASS_NAMES),
+            total_epochs=total_epochs,
+            approved_output_roots=approved_output_roots,
+            expected_sha256=resume_sha256,
+            require_checkpoint_set=True,
         )
         run_id = checkpoint["run_id"]
     else:
@@ -1355,23 +1799,77 @@ def _initialize_training(
     if resume is not None:
         _validate_checkpoint_lineage(checkpoint, path=resume, expected=provenance)
         _validate_provenance(checkpoint, provenance, resume)
+        best_path = _resolve_path(
+            output_dir / "weights" / "best.pt",
+            approved_roots=approved_output_roots,
+        )
+        best_sha256 = _read_checkpoint_digest(
+            best_path, approved_output_roots=approved_output_roots
+        )
+        try:
+            best_loaded = load_checkpoint_bytes(
+                best_path,
+                approved_roots=approved_output_roots,
+                expected_sha256=best_sha256,
+            )
+        except (CheckpointByteError, CheckpointByteUnavailableError) as error:
+            raise ValueError(f"Best checkpoint could not be loaded safely: {error}") from None
+        _validate_checkpoint_lineage(
+            best_loaded.payload, path=best_loaded.path, expected=provenance
+        )
+        _validate_provenance(best_loaded.payload, provenance, best_loaded.path)
+        _validate_checkpoint_set_descriptor(
+            checkpoint_set,
+            best=best_loaded.payload,
+            last=checkpoint,
+            best_digest=best_sha256,
+            last_digest=resume_sha256,
+            provenance=provenance,
+        )
+        _validate_checkpoint_set(
+            checkpoint,
+            best_loaded.payload,
+            last_path=resume,
+            best_path=best_loaded.path,
+        )
         _validate_existing_run_lineage(output_dir, _results_lineage(provenance, run_id))
-    if resume is None:
-        if _existing_run_artifacts(output_dir):
-            _prepare_output_dir(output_dir, overwrite=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-    else:
+        run_info_path = output_dir / "run_info.json"
+        if run_info_path.is_file():
+            try:
+                run_info = json.loads(run_info_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                raise ValueError("run checkpoint lineage is unreadable") from None
+            last_record = run_info.get("last_checkpoint")
+            best_record = run_info.get("best_checkpoint")
+            if (
+                not isinstance(last_record, dict)
+                or last_record.get("path") != str(resume)
+                or last_record.get("sha256") != resume_sha256
+                or last_record.get("run_id") != checkpoint["run_id"]
+                or not isinstance(best_record, dict)
+                or best_record.get("path") != str(best_loaded.path)
+                or best_record.get("sha256") != best_sha256
+                or best_record.get("run_id") != best_loaded.payload["run_id"]
+            ):
+                raise ValueError("run checkpoint digest lineage is invalid")
+    if resume is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     set_seed(int(config["seed"]))
     start_epoch = 0
     best_mae = float("inf")
     epochs_without_improvement = 0
+    best_epoch = 0
+    selection_identity = ""
+    best_validation: dict[str, Any] = {}
     if resume is not None:
         _restore_rng_state(checkpoint)
         start_epoch = int(checkpoint["epoch"])
         best_mae = float(checkpoint["best_mae"])
         epochs_without_improvement = int(checkpoint["epochs_without_improvement"])
+        best_epoch = int(checkpoint.get("best_epoch", start_epoch))
+        selection_identity = str(checkpoint.get("selection_identity", ""))
+        best_validation = dict(checkpoint.get("best_validation", {}))
         print(
             f"[INFO] Resuming from {resume}: epoch {start_epoch} completed; "
             f"best MAE={best_mae:.4f}. Target total: {total_epochs} epochs.",
@@ -1385,6 +1883,9 @@ def _initialize_training(
     val_dataset = BCSFolderDataset(
         data_dir / "val", train=False, imgsz=int(config["imgsz"])
     )
+    test_dataset = BCSFolderDataset(
+        data_dir / "test", train=False, imgsz=int(config["imgsz"])
+    )
     started_at = _utc_now()
     started_time = time.perf_counter()
     run_info_context = RunInfoContext(
@@ -1396,21 +1897,18 @@ def _initialize_training(
         run_id=run_id,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        test_dataset=test_dataset,
         started_at=started_at,
         started_time=started_time,
         resume=resume,
         start_epoch=start_epoch,
+        terminal_finalization=(
+            checkpoint is not None
+            and start_epoch == total_epochs
+            and not (output_dir / "run_info.json").is_file()
+        ),
     )
     results_path = output_dir / "results.csv"
-    if checkpoint is not None:
-        _reconcile_results_csv(results_path, checkpoint_epoch=start_epoch)
-    if checkpoint is not None and start_epoch == total_epochs:
-        return TrainingContext(
-            config, total_epochs, device, data_dir, output_dir, resume, checkpoint,
-            run_id, provenance, start_epoch, best_mae, epochs_without_improvement,
-            weights_dir, results_path, run_info_context, None, None, None, None, range(0)
-        )
-
     train_loader = _build_data_loader(
         train_dataset,
         batch_size=int(config["batch_size"]),
@@ -1426,6 +1924,12 @@ def _initialize_training(
         pin_memory=device.type == "cuda",
         generator=_validation_generator(int(config["val_seed"])),
     )
+    test_loader = _build_data_loader(
+        test_dataset,
+        batch_size=int(config["batch_size"]), shuffle=False,
+        num_workers=int(config["val_num_workers"]), pin_memory=device.type == "cuda",
+        generator=_validation_generator(int(config["val_seed"])),
+    )
     model = BCSOrdinalModel(pretrained=checkpoint is None).to(device)
     optimizer_name = str(config["optimizer"]).lower()
     if optimizer_name != "adamw":
@@ -1439,6 +1943,7 @@ def _initialize_training(
         _restore_model_state(model, checkpoint)
         _restore_optimizer_state(optimizer, checkpoint, device=device)
         _restore_rng_state(checkpoint)
+        _reconcile_results_csv(results_path, checkpoint_epoch=start_epoch)
     if resume is None:
         _prepare_output_dir(output_dir, overwrite=overwrite)
         _atomic_write_json(
@@ -1454,21 +1959,45 @@ def _initialize_training(
         )
         epoch_range = range(0)
     return TrainingContext(
-        config, total_epochs, device, data_dir, output_dir, resume, checkpoint,
-        run_id, provenance, start_epoch, best_mae, epochs_without_improvement,
-        weights_dir, results_path, run_info_context, train_loader, val_loader,
-        model, optimizer, epoch_range
+        config=config,
+        total_epochs=total_epochs,
+        device=device,
+        data_dir=data_dir,
+        output_dir=output_dir,
+        approved_output_roots=approved_output_roots,
+        resume=resume,
+        checkpoint=checkpoint,
+        checkpoint_set=checkpoint_set,
+        run_id=run_id,
+        provenance=provenance,
+        start_epoch=start_epoch,
+        best_mae=best_mae,
+        best_epoch=best_epoch,
+        selection_identity=selection_identity,
+        best_validation=best_validation,
+        epochs_without_improvement=epochs_without_improvement,
+        weights_dir=weights_dir,
+        results_path=results_path,
+        run_info_context=run_info_context,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        model=model,
+        optimizer=optimizer,
+        epoch_range=epoch_range,
     )
 
 
 def _save_best_checkpoint(
-    context: TrainingContext, *, epoch: int, best_mae: float
-) -> None:
+    context: TrainingContext, *, epoch: int, best_mae: float, metrics: dict[str, Any],
+    lr: float, train_loss: float,
+) -> str:
     assert context.model is not None
     state_dict = {
         key: value.detach().cpu() for key, value in context.model.state_dict().items()
     }
-    _atomic_torch_save(
+    checkpoint_path = context.weights_dir / "best.pt"
+    return _atomic_torch_save(
         {
             **_checkpoint_lineage(context.provenance, context.run_id),
             "model_state_dict": state_dict,
@@ -1476,10 +2005,80 @@ def _save_best_checkpoint(
             "classes": list(CLASS_NAMES),
             "provenance": context.provenance,
             "epoch": epoch,
-            "val_mae": best_mae,
+            "val_ordinal_mae": best_mae,
+            "best_epoch": epoch,
+            "best_validation": _selection_metrics(metrics),
+            "selection_identity": _selection_identity(context.provenance, epoch, metrics),
+            "best_results_row": _results_row(
+                epoch, lr=lr, train_loss=train_loss, metrics=metrics
+            ),
         },
-        context.weights_dir / "best.pt",
+        checkpoint_path,
     )
+
+
+def _results_row(
+    epoch: int, *, lr: float, train_loss: float, metrics: dict[str, Any]
+) -> dict[str, str | int]:
+    return {
+        "epoch": str(epoch),
+        "lr": f"{lr:.10g}",
+        "train_loss": f"{train_loss:.8f}",
+        "val_exact_acc": f"{metrics['exact_acc']:.8f}",
+        "val_within_one": f"{metrics['within_one']:.8f}",
+        "val_ordinal_mae": f"{metrics['ordinal_mae']:.8f}",
+        "val_error_ge_2": f"{metrics['error_ge_2']:.8f}",
+        "val_macro_f1": f"{metrics['macro_f1']:.8f}",
+        "val_balanced_accuracy": f"{metrics['balanced_accuracy']:.8f}",
+        "val_support": _canonical_json(metrics["support"]),
+        "val_precision": _canonical_json(metrics["precision"]),
+        "val_recall": _canonical_json(metrics["recall"]),
+        "val_f1": _canonical_json(metrics["f1"]),
+        "val_confusion_matrix": _canonical_json(metrics["confusion_matrix"]),
+    }
+
+
+def _load_selected_best_checkpoint(
+    context: TrainingContext, best_path: Path
+) -> tuple[dict[str, Any], str]:
+    """Reload and validate the selected checkpoint before the one-time test pass."""
+    from vacca_bcs.serving import load_bcs_model
+
+    expected_sha256 = _read_checkpoint_digest(
+        best_path, approved_output_roots=context.approved_output_roots
+    )
+    loaded = load_bcs_model(
+        best_path,
+        device=context.device,
+        expected_sha256=expected_sha256,
+        approved_roots=context.approved_output_roots,
+    )
+    selected = loaded.checkpoint
+    if not isinstance(selected, dict):
+        raise ValueError("Selected best checkpoint is malformed")
+    if not isinstance(loaded.checkpoint_sha256, str):
+        raise ValueError("Selected best checkpoint digest is unavailable")
+    best_epoch = selected.get("best_epoch")
+    best_validation = selected.get("best_validation")
+    selection_identity = selected.get("selection_identity")
+    if (
+        type(best_epoch) is not int
+        or best_epoch < 1
+        or type(best_validation) is not dict
+        or type(selection_identity) is not str
+        or selection_identity != _selection_identity(
+            context.provenance, best_epoch, best_validation
+        )
+    ):
+        raise ValueError("Selected best checkpoint selection identity is invalid")
+    if (
+        loaded.lineage.snapshot_identity != context.provenance["dataset_manifest"]["split_identity"]
+        or loaded.lineage.dataset_manifest_digest != context.provenance["dataset_manifest"]["sha256"]
+        or loaded.lineage.run_id != context.run_id
+    ):
+        raise ValueError("Selected best checkpoint does not match the active dataset")
+    context.model = loaded.model
+    return selected, loaded.checkpoint_sha256
 
 
 def _execute_training(context: TrainingContext) -> TrainingResult:
@@ -1492,6 +2091,14 @@ def _execute_training(context: TrainingContext) -> TrainingResult:
     train_loss = 0.0
     best_mae = context.best_mae
     epochs_without_improvement = context.epochs_without_improvement
+    best_epoch = context.best_epoch
+    selection_identity = context.selection_identity
+    best_validation = context.best_validation
+    best_checkpoint_sha256 = (
+        context.checkpoint_set["best"]["sha256"]
+        if context.checkpoint_set is not None
+        else None
+    )
     csv_file, writer = _open_results_csv(
         context.results_path, append=context.checkpoint is not None
     )
@@ -1525,17 +2132,7 @@ def _execute_training(context: TrainingContext) -> TrainingResult:
             )
             metrics = _validate(context.model, context.val_loader, context.device)
             final_metrics = metrics
-            writer.writerow(
-                {
-                    "epoch": epoch_number,
-                    "lr": f"{current_lr:.10g}",
-                    "train_loss": f"{train_loss:.8f}",
-                    "val_exact_acc": f"{metrics['exact_acc']:.8f}",
-                    "val_pm1_acc": f"{metrics['pm1_acc']:.8f}",
-                    "val_mae": f"{metrics['mae']:.8f}",
-                    "val_recall": _canonical_json(metrics["recall"]),
-                }
-            )
+            writer.writerow(_results_row(epoch_number, lr=current_lr, train_loss=train_loss, metrics=metrics))
             _flush_and_fsync(csv_file)
             elapsed = time.perf_counter() - context.run_info_context.started_time
             epochs_done = epoch - context.start_epoch + 1
@@ -1544,7 +2141,7 @@ def _execute_training(context: TrainingContext) -> TrainingResult:
             print(
                 f"[EPOCH {epoch_number}/{context.total_epochs}] complete: "
                 f"loss={train_loss:.8f} exact={metrics['exact_acc']:.8f} "
-                f"pm1={metrics['pm1_acc']:.8f} MAE={metrics['mae']:.8f} "
+                f"within1={metrics['within_one']:.8f} MAE={metrics['ordinal_mae']:.8f} "
                 f"elapsed={_format_duration(elapsed)} eta={_format_duration(eta)}",
                 flush=True,
             )
@@ -1559,10 +2156,17 @@ def _execute_training(context: TrainingContext) -> TrainingResult:
             if metrics["mae"] < best_mae:
                 best_mae = metrics["mae"]
                 epochs_without_improvement = 0
-                _save_best_checkpoint(context, epoch=epoch_number, best_mae=best_mae)
+                best_epoch = epoch_number
+                best_validation = _selection_metrics(metrics)
+                selection_identity = _selection_identity(context.provenance, epoch_number, metrics)
+                best_checkpoint_sha256 = _save_best_checkpoint(
+                    context, epoch=epoch_number, best_mae=best_mae, metrics=metrics,
+                    lr=current_lr, train_loss=train_loss,
+                )
             else:
                 epochs_without_improvement += 1
-            _atomic_torch_save(
+            last_checkpoint_path = context.weights_dir / "last.pt"
+            last_checkpoint_sha256 = _atomic_torch_save(
                 _build_last_checkpoint(
                     context.model,
                     context.optimizer,
@@ -1571,19 +2175,113 @@ def _execute_training(context: TrainingContext) -> TrainingResult:
                     epochs_without_improvement=epochs_without_improvement,
                     config=context.config,
                     provenance=context.provenance,
+                    best_epoch=best_epoch,
+                    selection_identity=selection_identity,
+                    best_validation=best_validation,
                 ),
-                context.weights_dir / "last.pt",
+                last_checkpoint_path,
+            )
+            if best_checkpoint_sha256 is None:
+                raise ValueError("No selected best checkpoint generation is available")
+            _write_checkpoint_set(
+                context.weights_dir,
+                best_digest=best_checkpoint_sha256,
+                last_digest=last_checkpoint_sha256,
+                provenance=context.provenance,
+                approved_output_roots=context.approved_output_roots,
+            )
+            _complete_checkpoint_set_commit(
+                context.weights_dir,
+                approved_output_roots=context.approved_output_roots,
             )
             if epochs_without_improvement >= int(context.config["patience"]):
                 print(f"[INFO] Early stopping at epoch {epoch_number}.", flush=True)
                 break
+    assert context.test_loader is not None
+    best_path = context.weights_dir / "best.pt"
+    selected, best_checkpoint_sha256 = _load_selected_best_checkpoint(context, best_path)
+    best_epoch = int(selected["best_epoch"])
+    selection_identity = selected["selection_identity"]
+    best_validation = dict(selected["best_validation"])
+    last_path = context.weights_dir / "last.pt"
+    last_checkpoint_sha256 = _read_checkpoint_digest(
+        last_path, approved_output_roots=context.approved_output_roots
+    )
+    try:
+        last_loaded = load_checkpoint_bytes(
+            last_path,
+            approved_roots=context.approved_output_roots,
+            expected_sha256=last_checkpoint_sha256,
+        )
+    except (CheckpointByteError, CheckpointByteUnavailableError) as error:
+        raise ValueError(f"Last checkpoint could not be loaded safely: {error}") from None
+    missing_last_fields = sorted(
+        RESUMABLE_CHECKPOINT_FIELDS.difference(last_loaded.payload)
+    )
+    if missing_last_fields:
+        raise ValueError(
+            "Last checkpoint is not resumable; missing fields: "
+            + ", ".join(missing_last_fields)
+        )
+    _validate_checkpoint_metadata(
+        last_loaded.payload,
+        path=last_loaded.path,
+        total_epochs=context.total_epochs,
+    )
+    _validate_checkpoint_lineage(last_loaded.payload, path=last_loaded.path)
+    _validate_checkpoint_set(
+        last_loaded.payload,
+        selected,
+        last_path=last_loaded.path,
+        best_path=best_path,
+    )
+    test_metrics = _validate(context.model, context.test_loader, context.device)
+    test_metrics = {
+        **test_metrics,
+        "evaluated_checkpoint": str(best_path),
+        "checkpoint_sha256": best_checkpoint_sha256,
+        "run_id": context.run_id,
+        "config_sha256": context.provenance["config_sha256"],
+        "snapshot_identity": context.provenance["dataset_manifest"]["split_identity"],
+        "dataset_manifest_digest": context.provenance["dataset_manifest"]["sha256"],
+        "best_epoch": best_epoch,
+        "selection_identity": selection_identity,
+    }
     return TrainingResult(
-        final_metrics, train_loss, best_mae, epochs_without_improvement
+        final_metrics=final_metrics,
+        test_metrics=test_metrics,
+        train_loss=train_loss,
+        best_mae=best_mae,
+        epochs_without_improvement=epochs_without_improvement,
+        best_epoch=best_epoch,
+        selection_identity=selection_identity,
+        best_validation=best_validation,
+        last_checkpoint_sha256=last_loaded.sha256,
     )
 
 
 def _finalize_training(context: TrainingContext, result: TrainingResult) -> dict[str, Any]:
     run_info = _build_run_info(context.run_info_context)
+    best_path = context.weights_dir / "best.pt"
+    last_path = context.weights_dir / "last.pt"
+    run_info["best_checkpoint"] = {
+        "path": str(best_path),
+        "sha256": result.test_metrics["checkpoint_sha256"],
+        "run_id": result.test_metrics["run_id"],
+        "best_epoch": result.best_epoch,
+        "selection_identity": result.selection_identity,
+        "validation": result.best_validation,
+    }
+    run_info["last_checkpoint"] = {
+        "path": str(last_path),
+        "sha256": result.last_checkpoint_sha256,
+        "run_id": context.run_id,
+    }
+    run_info["test_metrics"] = result.test_metrics
+    run_info["provisional_acceptance"] = _evaluate_provisional_gates(
+        result.test_metrics, context.config
+    )
+    run_info["candidate_status"] = "candidate_pending_handoff"
     _atomic_write_json(run_info, context.output_dir / "run_info.json")
     print(
         f"\n[DONE] BCS training completed in {run_info['wall_time_seconds']:.1f}s.",
@@ -1596,13 +2294,14 @@ def _finalize_training(context: TrainingContext, result: TrainingResult) -> dict
         print(
             f"  Final: loss={result.train_loss:.5f}, "
             f"exact={result.final_metrics['exact_acc']:.4f}, "
-            f"pm1={result.final_metrics['pm1_acc']:.4f}, "
+            f"within1={result.final_metrics['within_one']:.4f}, "
             f"MAE={result.final_metrics['mae']:.4f}",
             flush=True,
         )
     return {
         "run_info": run_info,
         "final_metrics": result.final_metrics,
+        "test_metrics": result.test_metrics,
         "best_mae": result.best_mae,
         "output_dir": context.output_dir,
     }
@@ -1613,19 +2312,16 @@ def train(
     *,
     resume: Path | None = None,
     overwrite: bool = False,
+    approved_data_roots: tuple[Path, ...],
+    approved_output_roots: tuple[Path, ...],
 ) -> dict[str, Any]:
-    context = _initialize_training(config, resume=resume, overwrite=overwrite)
-    if context.checkpoint is not None and context.start_epoch == context.total_epochs:
-        run_info = _build_run_info(
-            replace(context.run_info_context, terminal_finalization=True)
-        )
-        _atomic_write_json(run_info, context.output_dir / "run_info.json")
-        return {
-            "run_info": run_info,
-            "final_metrics": {},
-            "best_mae": context.best_mae,
-            "output_dir": context.output_dir,
-        }
+    context = _initialize_training(
+        config,
+        resume=resume,
+        overwrite=overwrite,
+        approved_data_roots=approved_data_roots,
+        approved_output_roots=approved_output_roots,
+    )
     result = _execute_training(context)
     return _finalize_training(context, result)
 
@@ -1640,8 +2336,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Training device: auto, cpu, or cuda[:index] (config default)",
     )
-    parser.add_argument("--data-dir", default=None, help="Override the snapshot directory")
-    parser.add_argument("--output", default=None, help="Override the run output directory")
+    parser.add_argument("--data-root", default=None, help="Override the category snapshot directory")
+    parser.add_argument("--output-dir", default=None, help="Override the category run output directory")
     parser.add_argument(
         "--progress-every-batches",
         type=int,
@@ -1662,9 +2358,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, root: Path = ROOT) -> int:
     args = build_parser().parse_args(argv)
-    config_path = _resolve_path(args.config)
+    config_root = CONFIG_ROOT if root == ROOT else root / "configs"
+    data_root = DATA_ROOT if root == ROOT else root / "data"
+    output_root = OUTPUT_ROOT if root == ROOT else root / "outputs"
+    try:
+        config_path = _resolve_path(args.config, approved_roots=(config_root,))
+    except SafePathError as error:
+        print(f"[ERROR] Training failed: unsafe config path: {error}", file=sys.stderr, flush=True)
+        return 1
     if not config_path.is_file():
         print(f"[ERROR] Config file not found: {config_path}", file=sys.stderr, flush=True)
         return 1
@@ -1674,15 +2377,29 @@ def main(argv: list[str] | None = None) -> int:
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "device": args.device,
-            "data_dir": args.data_dir,
-            "output": args.output,
+            "data_root": args.data_root,
+            "output_dir": args.output_dir,
             "progress_every_batches": args.progress_every_batches,
         }
         for key, value in overrides.items():
             if value is not None:
                 config[key] = value
-        resume_path = _resolve_path(args.resume) if args.resume else None
-        train(config, resume=resume_path, overwrite=args.overwrite)
+        resume_path = (
+            _resolve_path(
+                args.resume,
+                approved_roots=(output_root,),
+                allow_missing_final=True,
+            )
+            if args.resume
+            else None
+        )
+        train(
+            config,
+            resume=resume_path,
+            overwrite=args.overwrite,
+            approved_data_roots=(data_root,),
+            approved_output_roots=(output_root,),
+        )
     except (FileExistsError, FileNotFoundError, RuntimeError, ValueError, yaml.YAMLError) as exc:
         print(f"[ERROR] Training failed: {exc}", file=sys.stderr, flush=True)
         return 1

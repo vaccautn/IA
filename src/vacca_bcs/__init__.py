@@ -1,4 +1,4 @@
-"""Ordinal Body Condition Score components for VACCA.
+"""BCS category components for VACCA.
 
 The training dataset and model exports are loaded lazily so lightweight
 constants and builder imports do not import Torch or Torchvision.
@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     from .dataset import BCSFolderDataset, Letterbox
     from .model import (
         BCSOrdinalModel,
-        CORALModel,
         coral_loss,
         encode_levels,
         predict,
@@ -36,7 +35,6 @@ __all__ = [
     "BCSFolderDataset",
     "BCSOrdinalModel",
     "CLASS_NAMES",
-    "CORALModel",
     "Letterbox",
     "coral_loss",
     "encode_levels",
@@ -56,7 +54,6 @@ _LAZY_EXPORTS = {
     "BCSFolderDataset": (".dataset", "BCSFolderDataset"),
     "Letterbox": (".dataset", "Letterbox"),
     "BCSOrdinalModel": (".model", "BCSOrdinalModel"),
-    "CORALModel": (".model", "CORALModel"),
     "coral_loss": (".model", "coral_loss"),
     "encode_levels": (".model", "encode_levels"),
     "predict": (".model", "predict"),

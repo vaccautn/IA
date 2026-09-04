@@ -9,10 +9,13 @@
 
 ---
 
-> **Nota de estado:** Este PRD conserva los requisitos y la historia de alcance
-> de la Fase 1. Para la implementación vigente de la rama, incluido el pipeline
-> ordinal BCS entero, su serving y las tareas operativas pendientes (export real,
-> entrenamiento, pesos y despliegue), consultar `docs/estado-del-repositorio.md`.
+> **Estado actual:** Este PRD conserva la intención de producto y el alcance de la
+> Fase 1. La implementación vigente usa únicamente la fuente local para una
+> categoría BCS pública `1..5`, con el snapshot construido en
+> `data/bcs-category-v1`. Los ocho duplicados idénticos entre categorías fueron
+> puestos en cuarentena sin relabeling. El camino backend/exportado anterior está
+> retirado y todavía no existe un checkpoint BCS nuevo; consultar
+> `docs/estado-del-repositorio.md` para el estado operativo.
 
 ## 1. Resumen ejecutivo
 

@@ -6,8 +6,10 @@ from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from vacca_bcs.constants import SCORE_MAX, SCORE_MIN
 
-BCSScore = Annotated[int, Field(strict=True, ge=1, le=5)]
+
+BCSCategory = Annotated[int, Field(strict=True, ge=SCORE_MIN, le=SCORE_MAX)]
 
 
 class BoundingBox(BaseModel):
@@ -45,15 +47,15 @@ class DetectResponse(BaseModel):
 
 
 class BCSResponse(BaseModel):
-    """Response from POST /bcs."""
+    """Response from POST /bcs with a discrete BCS category."""
 
     status: str = Field(default="ok")
     message: str = Field(
-        default="BCS score computed successfully."
+        default="BCS category computed successfully."
     )
     cow_detected: Optional[bool] = None
-    # Retained for response compatibility; failed requests use HTTP errors.
-    bcs_score: Optional[BCSScore] = None
+    # Failed requests use HTTP errors; successful responses contain category 1..5.
+    bcs_category: BCSCategory
 
 
 class BCSReadinessResponse(BaseModel):

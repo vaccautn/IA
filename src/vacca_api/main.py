@@ -3,7 +3,7 @@
 Endpoints:
     GET  /health          — service health + model info
     POST /detect          — cow detection with bounding boxes
-    POST /bcs             — integer BCS scoring
+    POST /bcs             — discrete BCS category 1..5
 
 The test UI at /ui is for PROTOTYPE VALIDATION ONLY.
 Remove the /ui route and static/ directory before connecting to production backend.
@@ -19,7 +19,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .detection import get_detector
-from .bcs import round_bcs_score_for_backend
 from .schemas import BCSReadinessResponse, BCSResponse, DetectResponse, HealthResponse
 from .upload_validation import read_uploaded_image
 
@@ -87,7 +86,7 @@ async def detect(file: UploadFile = File(...)) -> DetectResponse:
 # --- BCS ---
 @app.post("/bcs", response_model=BCSResponse)
 async def bcs(file: UploadFile = File(...)) -> BCSResponse:
-    """Estimate and expose the integer BCS score for one full image."""
+    """Estimate and expose one discrete BCS category from 1 through 5."""
     image_bytes = await read_uploaded_image(file)
     try:
         service = get_bcs_runtime().get_service()
@@ -101,16 +100,11 @@ async def bcs(file: UploadFile = File(...)) -> BCSResponse:
             raise HTTPException(status_code=400, detail="BCS image input is invalid") from None
         raise HTTPException(status_code=500, detail="BCS inference failed") from None
 
-    try:
-        score = round_bcs_score_for_backend(result.continuous_score)
-    except Exception:
-        raise HTTPException(status_code=500, detail="BCS score could not be produced") from None
-
     return BCSResponse(
         status="ok",
-        message="BCS score computed successfully.",
+        message="BCS category 1..5 computed successfully.",
         cow_detected=None,
-        bcs_score=score,
+        bcs_category=result.bcs_category,
     )
 
 

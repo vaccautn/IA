@@ -30,12 +30,12 @@ def coral_loss(logits: Tensor, levels: Tensor) -> Tensor:
 
 
 def predict(logits: Tensor) -> tuple[Tensor, Tensor]:
-    """Convert CORAL logits to class indices and BCS scores."""
+    """Convert CORAL logits to class indices and BCS categories."""
     if logits.ndim != 2 or logits.shape[1] != NUM_THRESHOLDS:
         raise ValueError(f"logits must have shape (batch, {NUM_THRESHOLDS})")
     class_idx = (torch.sigmoid(logits) > 0.5).sum(dim=1).to(torch.long)
-    scores = SCORE_MIN + SCORE_STEP * class_idx.to(dtype=logits.dtype)
-    return class_idx, scores
+    categories = SCORE_MIN + SCORE_STEP * class_idx.to(dtype=logits.dtype)
+    return class_idx, categories
 
 
 class CORALHead(nn.Module):
@@ -86,6 +86,3 @@ class BCSOrdinalModel(nn.Module):
         """Predict from images, or directly from logits shaped (B, 4)."""
         logits = x if x.ndim == 2 and x.shape[1] == NUM_THRESHOLDS else self(x)
         return predict(logits)
-
-
-CORALModel = BCSOrdinalModel

@@ -33,7 +33,7 @@ from scripts.train_bcs_ordinal import (  # noqa: E402
     _capture_rng_state,
     _atomic_write_json,
     _atomic_torch_save,
-    _load_resume_checkpoint,
+    _load_resume_checkpoint as _load_resume_checkpoint_impl,
     _open_results_csv,
     _prepare_output_dir,
     _reconcile_results_csv,
@@ -46,7 +46,7 @@ from scripts.train_bcs_ordinal import (  # noqa: E402
 )
 from scripts.train_bcs_ordinal import main as train_main  # noqa: E402
 import scripts.train_bcs_ordinal as trainer  # noqa: E402
-from scripts.run_bcs_overnight import _validate_best_checkpoint  # noqa: E402
+from scripts.run_bcs_overnight import _validate_best_checkpoint as _validate_best_checkpoint_impl  # noqa: E402
 from vacca_bcs.constants import (  # noqa: E402
     BCS_CLASS_SCORES,
     BCS_DOMAIN_ID,
@@ -68,6 +68,80 @@ from vacca_bcs.model import (  # noqa: E402
 )
 
 
+def _load_resume_checkpoint(path, **kwargs):
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    generations = path.parent / "generations"
+    generations.mkdir(exist_ok=True)
+    (generations / f"{digest}.pt").write_bytes(raw)
+    for alias in (path.parent / "best.pt", path.parent / "last.pt"):
+        if not alias.exists():
+            alias.write_bytes(raw)
+    descriptor_path = path.parent / "checkpoint_set.json"
+    if not descriptor_path.exists():
+        descriptor_path.write_text(
+            json.dumps(
+                {
+                    "schema": "vacca-bcs-checkpoint-set-v1",
+                    "lineage_schema_version": "bcs-category-coral-results-v1",
+                    "committed_epoch": 1,
+                    "best": {"filename": f"generations/{digest}.pt", "sha256": digest},
+                    "last": {"filename": f"generations/{digest}.pt", "sha256": digest},
+                    "run_id": "0" * 32,
+                    "domain_id": BCS_DOMAIN_ID,
+                    "source_schema": "bcs-local-category-source-v1",
+                    "snapshot_schema": "bcs-category-snapshot-v1",
+                    "snapshot_identity": "0" * 64,
+                    "dataset_manifest_digest": "0" * 64,
+                    "config_sha256": "0" * 64,
+                    "observed_classes": [1, 2, 3, 4, 5],
+                    "missing_classes": [],
+                    "source_identity_scheme": "local-path-sha256-v1",
+                    "source_mapping": {"3.25": 1, "3.5": 2, "3.75": 3, "4.0": 4, "4.25": 5},
+                    "best_epoch": 1,
+                    "selection_identity": "0" * 64,
+                    "best_validation": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+    kwargs.setdefault("require_checkpoint_set", True)
+    return _load_resume_checkpoint_impl(path, approved_output_roots=(path.parent,), **kwargs)
+
+
+_train_impl = trainer.train
+
+
+def _train_for_test(config, *args, **kwargs):
+    kwargs.setdefault(
+        "approved_data_roots",
+        (Path(config["data_root"]).parent,),
+    )
+    kwargs.setdefault("approved_output_roots", (Path(config["output_dir"]).parent,))
+    return _train_impl(config, *args, **kwargs)
+
+
+trainer.train = _train_for_test
+
+
+def _validate_best_checkpoint(best_path, output_dir, snapshot, config_path):
+    return _validate_best_checkpoint_impl(
+        best_path,
+        output_dir,
+        snapshot,
+        config_path,
+        (snapshot.parent,),
+        (config_path.parent,),
+        (output_dir.parent,),
+    )
+from vacca_bcs.category_split_plan import split_identity_digest  # noqa: E402
+from vacca_bcs.metrics import (  # noqa: E402
+    METRICS_TOLERANCE,
+    assert_metrics_match_confusion,
+    derive_category_metrics,
+)
+
+
 def test_coral_level_encoding_for_all_classes() -> None:
     levels = torch.arange(5)
     expected = torch.tensor(
@@ -83,8 +157,8 @@ def test_coral_level_encoding_for_all_classes() -> None:
     assert torch.equal(encode_levels(levels), expected)
 
 
-def test_integer_domain_constants_reject_fractional_class_names() -> None:
-    assert BCS_DOMAIN_ID == "bcs-integer-1-5"
+def test_category_domain_constants_reject_fractional_class_names() -> None:
+    assert BCS_DOMAIN_ID == "bcs-category-1-5-v1"
     assert BCS_CLASS_SCORES == (1, 2, 3, 4, 5)
     assert CLASS_NAMES == ("1", "2", "3", "4", "5")
     assert (SCORE_MIN, SCORE_MAX, SCORE_BASE, SCORE_STEP) == (1, 5, 1, 1)
@@ -99,7 +173,7 @@ def test_dataset_rejects_fractional_class_folders(tmp_path: Path) -> None:
         BCSFolderDataset(tmp_path)
 
 
-def test_predict_maps_passed_thresholds_to_class_and_score() -> None:
+def test_predict_maps_passed_thresholds_to_class_and_category() -> None:
     logits = torch.tensor(
         [
             [-10.0, -10.0, -10.0, -10.0],
@@ -109,9 +183,9 @@ def test_predict_maps_passed_thresholds_to_class_and_score() -> None:
             [10.0, 10.0, 10.0, 10.0],
         ]
     )
-    class_idx, scores = predict(logits)
+    class_idx, categories = predict(logits)
     assert torch.equal(class_idx, torch.arange(5))
-    assert torch.equal(scores, torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]))
+    assert torch.equal(categories, torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]))
 
 
 def test_coral_loss_is_finite_and_lower_for_correct_levels() -> None:
@@ -144,9 +218,9 @@ def test_coral_head_produces_ordered_logits() -> None:
     # Increasing thresholds must yield strictly decreasing logits per row.
     assert torch.all(logits[:, 1:] < logits[:, :-1])
 
-    class_idx, scores = predict(logits)
+    class_idx, categories = predict(logits)
     assert torch.all((class_idx >= 0) & (class_idx < len(CLASS_NAMES)))
-    assert torch.all((scores >= 1.0) & (scores <= 5.0))
+    assert torch.all((categories >= 1.0) & (categories <= 5.0))
 
 
 def test_real_dataset_transforms_and_model_training_step(tmp_path: Path) -> None:
@@ -187,13 +261,13 @@ def test_real_dataset_transforms_and_model_training_step(tmp_path: Path) -> None
         model.head.weight.zero_()
     model.eval()
     logits = model(images)
-    predicted_levels, scores = model.predict(images)
+    predicted_levels, categories = model.predict(images)
     assert logits.shape == (2, len(CLASS_NAMES) - 1)
     assert predicted_levels.shape == (2,)
-    assert scores.shape == (2,)
+    assert categories.shape == (2,)
     assert torch.isfinite(logits).all()
-    assert torch.is_floating_point(scores)
-    assert torch.equal(scores, torch.full((2,), 1.0))
+    assert torch.is_floating_point(categories)
+    assert torch.equal(categories, torch.full((2,), 1.0))
 
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
@@ -221,8 +295,8 @@ def test_real_dataset_transforms_and_model_training_step(tmp_path: Path) -> None
 
 def _write_config(tmp_path: Path, name: str = "config.yaml", **overrides: object) -> Path:
     config = {
-        "data_dir": "data/bcs-integer-v1",
-        "output": str(tmp_path / "out"),
+        "data_root": "data/bcs-category-v1",
+        "output_dir": str(tmp_path / "out"),
         "epochs": 2,
         "batch_size": 2,
         "lr": 0.001,
@@ -238,10 +312,6 @@ def _write_config(tmp_path: Path, name: str = "config.yaml", **overrides: object
         "seed": 0,
     }
     config.update(overrides)
-    if "data_root" in overrides:
-        config.pop("data_dir", None)
-    if "output_dir" in overrides:
-        config.pop("output", None)
     path = tmp_path / name
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
     return path
@@ -257,6 +327,50 @@ def test_load_config_accepts_cosine_or_default_schedule(tmp_path: Path) -> None:
 def test_load_config_rejects_unsupported_schedule(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="lr_schedule"):
         load_config(_write_config(tmp_path, lr_schedule="step"))
+
+
+def test_trainer_entry_rejects_symlinked_config_path(tmp_path: Path, capsys) -> None:
+    config = _write_config(tmp_path)
+    link = tmp_path / "config-link.yaml"
+    try:
+        link.symlink_to(config)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    assert train_main(["--config", str(link)]) == 1
+    assert "unsafe config path" in capsys.readouterr().err
+
+
+def test_trainer_entry_rejects_symlinked_output_ancestor(tmp_path: Path) -> None:
+    config = _write_config(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "output-link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    config_values = yaml.safe_load(config.read_text(encoding="utf-8"))
+    config_values["output_dir"] = str(link / "run")
+    with pytest.raises(ValueError, match="symlink"):
+        trainer.train(config_values)
+
+
+@pytest.mark.parametrize("bad_output", ["data/bcs-category-v1", "data/bcs/dataset"])
+def test_trainer_cli_rejects_data_paths_for_output_before_creation(
+    tmp_path: Path, bad_output: str
+) -> None:
+    (tmp_path / "configs").mkdir()
+    config_path = _write_config(
+        tmp_path / "configs",
+        data_root=str(tmp_path / "data"),
+        output_dir=str(tmp_path / "outputs" / "run"),
+    )
+    bad_path = tmp_path / bad_output
+    assert train_main(
+        ["--config", str(config_path), "--output-dir", str(bad_path)],
+        root=tmp_path,
+    ) == 1
+    assert not bad_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -407,41 +521,52 @@ def test_validation_workers_preserve_order_and_parent_training_rng() -> None:
     ]
 
 
-def test_coverage_policy_is_strict_and_canonical_local_roots_are_supported(tmp_path: Path) -> None:
-    config = load_config(
-        _write_config(
-            tmp_path,
-            data_root="data/bcs-local-integer-v1",
-            output_dir="outputs/bcs-ordinal-local-integer-v1",
-            allow_partial_class_coverage=True,
-        )
-    )
-    assert config["data_dir"] == "data/bcs-local-integer-v1"
-    assert config["output"] == "outputs/bcs-ordinal-local-integer-v1"
-    assert config["allow_partial_class_coverage"] is True
-    with pytest.raises(ValueError, match="allow_partial_class_coverage"):
-        load_config(_write_config(tmp_path, allow_partial_class_coverage="true"))
+def test_coverage_policy_is_unconditional_and_unknown_legacy_keys_are_rejected(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path))
+    assert config["data_root"] == "data/bcs-category-v1"
+    assert config["output_dir"] == str(tmp_path / "out")
+    with pytest.raises(ValueError, match="Unsupported training config keys"):
+        load_config(_write_config(tmp_path, legacy_coverage_switch=False))
 
 
-def test_partial_coverage_is_explicit_and_derived_from_manifest_counts() -> None:
-    manifest = {"counts": {"train": [0, 0, 2, 3, 0], "val": [0, 0, 1, 1, 0]}}
+def test_class_coverage_is_derived_from_manifest_counts_and_requires_every_class() -> None:
+    manifest = {
+        "counts": {
+            "train": [0, 0, 2, 3, 0],
+            "val": [0, 0, 1, 1, 0],
+            "test": [0, 0, 0, 0, 0],
+        }
+    }
     coverage = _coverage_from_manifest(manifest)
     assert coverage == {
         "observed_classes": [3, 4],
         "missing_classes": [1, 2, 5],
     }
-    _validate_class_coverage(manifest, allow_partial_class_coverage=True)
-    with pytest.raises(ValueError, match="partial class coverage"):
-        _validate_class_coverage(manifest, allow_partial_class_coverage=False)
+    with pytest.raises(ValueError, match="snapshot train split"):
+        _validate_class_coverage(manifest)
 
 
-def test_partial_coverage_requires_non_empty_splits_and_two_training_classes() -> None:
+def test_class_coverage_rejects_empty_category_cells() -> None:
     for counts, message in (
-        ({"train": [0, 0, 2, 0, 0], "val": [0, 0, 1, 0, 0]}, "two training"),
-        ({"train": [0, 0, 2, 2, 0], "val": [0, 0, 0, 0, 0]}, "validation"),
+        (
+            {
+                "train": [0, 0, 2, 0, 0],
+                "val": [0, 0, 1, 0, 0],
+                "test": [0, 0, 1, 0, 0],
+            },
+            "snapshot train split",
+        ),
+        (
+            {
+                "train": [0, 0, 2, 2, 0],
+                "val": [0, 0, 1, 1, 0],
+                "test": [0, 0, 1, 1, 0],
+            },
+            "snapshot train split",
+        ),
     ):
         with pytest.raises(ValueError, match=message):
-            _validate_class_coverage({"counts": counts}, allow_partial_class_coverage=True)
+            _validate_class_coverage({"counts": counts})
 
 
 def _seed_run_artifacts(output_dir: Path) -> None:
@@ -468,6 +593,28 @@ def test_overwrite_removes_existing_artifacts(tmp_path: Path) -> None:
     assert not (output_dir / "weights" / "best.pt").exists()
 
 
+@pytest.mark.parametrize("target", ["output", "weights"])
+def test_overwrite_rejects_symlinked_output_paths(tmp_path: Path, target: str) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    try:
+        if target == "output":
+            output_dir.rmdir()
+            output_dir.symlink_to(outside, target_is_directory=True)
+        else:
+            weights = output_dir / "weights"
+            weights.symlink_to(outside, target_is_directory=True)
+            (outside / "best.pt").write_bytes(b"must survive")
+        with pytest.raises(ValueError, match="symlink"):
+            _prepare_output_dir(output_dir, overwrite=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    if target == "weights":
+        assert (outside / "best.pt").read_bytes() == b"must survive"
+
+
 def test_prepare_output_dir_allows_empty_fresh_dir(tmp_path: Path) -> None:
     output_dir = tmp_path / "new-run"
     _prepare_output_dir(output_dir, overwrite=False)
@@ -475,10 +622,15 @@ def test_prepare_output_dir_allows_empty_fresh_dir(tmp_path: Path) -> None:
 
 
 def test_main_fails_clearly_when_output_exists(tmp_path: Path, capsys) -> None:
-    output_dir = tmp_path / "run"
+    (tmp_path / "configs").mkdir()
+    output_dir = tmp_path / "outputs" / "run"
     _seed_run_artifacts(output_dir)
-    config_path = _write_config(tmp_path, output=str(output_dir))
-    exit_code = train_main(["--config", str(config_path)])
+    config_path = _write_config(
+        tmp_path / "configs",
+        data_root=str(tmp_path / "data"),
+        output_dir=str(output_dir),
+    )
+    exit_code = train_main(["--config", str(config_path)], root=tmp_path)
     assert exit_code == 1
     captured = capsys.readouterr()
     assert "--overwrite" in captured.err
@@ -549,6 +701,21 @@ def test_atomic_checkpoint_replace_failure_preserves_prior_checkpoint(
         _atomic_torch_save({"epoch": 2}, path)
     assert path.read_bytes() == b"prior-valid-checkpoint"
     assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_atomic_checkpoint_symlink_is_rejected_without_touching_external_target(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external.pt"
+    external.write_bytes(b"external-checkpoint")
+    path = tmp_path / "last.pt"
+    try:
+        path.symlink_to(external)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    with pytest.raises(ValueError, match="symlink"):
+        _atomic_torch_save({"epoch": 2}, path)
+    assert external.read_bytes() == b"external-checkpoint"
 
 
 def test_atomic_checkpoint_fsync_failure_preserves_prior_checkpoint(
@@ -815,9 +982,16 @@ def _results_row(epoch: int) -> dict[str, str]:
         "lr": "0.001",
         "train_loss": "1.0",
         "val_exact_acc": "0.5",
-        "val_pm1_acc": "0.9",
-        "val_mae": "0.25",
+        "val_within_one": "0.9",
+        "val_ordinal_mae": "0.25",
+        "val_error_ge_2": "0.1",
+        "val_macro_f1": "0.5",
+        "val_balanced_accuracy": "0.5",
+        "val_support": json.dumps([1, 1, 1, 1, 1]),
+        "val_precision": json.dumps({name: 0.5 for name in CLASS_NAMES}, sort_keys=True),
         "val_recall": json.dumps({name: 0.5 for name in CLASS_NAMES}, sort_keys=True),
+        "val_f1": json.dumps({name: 0.5 for name in CLASS_NAMES}, sort_keys=True),
+        "val_confusion_matrix": json.dumps([[0] * NUM_CLASSES for _ in range(NUM_CLASSES)]),
     }
 
 
@@ -849,12 +1023,32 @@ def test_results_csv_append_on_missing_file_writes_header(tmp_path: Path) -> Non
     assert rows[1][0] == "1"
 
 
+def test_results_csv_symlink_is_rejected_without_touching_external_target(tmp_path: Path) -> None:
+    external = tmp_path / "external.csv"
+    external.write_text("external-content\n", encoding="utf-8")
+    linked = tmp_path / "results.csv"
+    try:
+        linked.symlink_to(external)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    with pytest.raises(ValueError, match="symlink"):
+        _open_results_csv(linked, append=True)
+    assert external.read_text(encoding="utf-8") == "external-content\n"
+
+
 def _write_results_history(path: Path, epochs: list[int]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(RESULTS_FIELDNAMES)
         for epoch in epochs:
-            writer.writerow([epoch, "0.001", "1.0", "0.5", "0.9", "0.25"])
+            writer.writerow([_results_row(epoch)[field] for field in RESULTS_FIELDNAMES])
+
+
+def _results_line(epoch: int) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([_results_row(epoch)[field] for field in RESULTS_FIELDNAMES])
+    return output.getvalue().rstrip("\r\n")
 
 
 def _read_epoch_sequence(path: Path) -> list[str]:
@@ -878,7 +1072,9 @@ def test_reconcile_discards_partial_one_row_crash_suffix(tmp_path: Path) -> None
     results_path = tmp_path / "results.csv"
     results_path.write_text(
         ",".join(RESULTS_FIELDNAMES)
-        + "\n1,0.001,1.0,0.5,0.9,0.25\n2,0.001,",
+        + "\n"
+        + _results_line(1)
+        + "\n2,0.001,",
         encoding="utf-8",
     )
     assert _reconcile_results_csv(results_path, checkpoint_epoch=1) == 1
@@ -892,8 +1088,8 @@ def test_reconcile_discards_partial_one_row_crash_suffix(tmp_path: Path) -> None
         ("lr", "-0.001"),
         ("train_loss", "nan"),
         ("val_exact_acc", "1.1"),
-        ("val_pm1_acc", "-0.1"),
-        ("val_mae", "4.1"),
+        ("val_within_one", "-0.1"),
+        ("val_ordinal_mae", "4.1"),
     ],
 )
 def test_reconcile_rejects_invalid_complete_expected_suffix(
@@ -918,7 +1114,9 @@ def test_reconcile_discards_torn_suffix_without_complete_epoch(
     results_path = tmp_path / "results.csv"
     results_path.write_text(
         ",".join(RESULTS_FIELDNAMES)
-        + "\n1,0.001,1.0,0.5,0.9,0.25\n"
+        + "\n"
+        + _results_line(1)
+        + "\n"
         + torn_suffix,
         encoding="utf-8",
     )
@@ -937,7 +1135,11 @@ def test_reconcile_rejects_complete_non_integer_epoch_suffix(tmp_path: Path) -> 
     results_path = tmp_path / "results.csv"
     results_path.write_text(
         ",".join(RESULTS_FIELDNAMES)
-        + "\n1,0.001,1.0,0.5,0.9,0.25\nabc,0.001,1.0,0.5,0.9,0.25\n",
+        + "\n"
+        + _results_line(1)
+        + "\n"
+        + _results_line(1).replace("1,", "abc,", 1)
+        + "\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="unrecoverable complete suffix"):
@@ -1083,7 +1285,7 @@ def test_reconcile_rejects_history_ending_before_checkpoint(tmp_path: Path) -> N
 
 @pytest.mark.parametrize(
     ("column", "value"),
-    [("train_loss", "nan"), ("val_exact_acc", "1.1"), ("val_mae", "-0.01")],
+    [("train_loss", "nan"), ("val_exact_acc", "1.1"), ("val_ordinal_mae", "-0.01")],
 )
 def test_reconcile_rejects_invalid_or_impossible_metrics(
     tmp_path: Path, column: str, value: str
@@ -1127,6 +1329,118 @@ def test_validate_reports_null_recall_for_unobserved_validation_classes() -> Non
     assert metrics["recall"]["5"] is None
 
 
+def test_provisional_test_gates_are_explicit_engineering_only() -> None:
+    metrics = {
+        "macro_f1": 0.75,
+        "balanced_accuracy": 0.75,
+        "ordinal_mae": 0.35,
+        "f1": {name: 0.70 for name in CLASS_NAMES},
+        "within_one_by_class": {name: 0.95 for name in CLASS_NAMES},
+        "error_ge_2_by_class": {name: 0.05 for name in CLASS_NAMES},
+    }
+    config = {"provisional_acceptance_gates": dict(trainer.PROVISIONAL_ACCEPTANCE_GATES)}
+    result = trainer._evaluate_provisional_gates(metrics, config)
+    assert result["kind"] == "provisional_engineering_only"
+    assert result["passed"] is True
+    metrics["ordinal_mae"] = 0.350001
+    assert trainer._evaluate_provisional_gates(metrics, config)["passed"] is False
+
+
+def test_metrics_are_derived_from_a_cyclic_all_wrong_confusion_matrix() -> None:
+    matrix = [
+        [0, 1, 0, 0, 0],
+        [0, 0, 1, 0, 0],
+        [0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 1],
+        [1, 0, 0, 0, 0],
+    ]
+    metrics = derive_category_metrics(matrix)
+    assert metrics["support"] == [1] * NUM_CLASSES
+    assert metrics["total"] == NUM_CLASSES
+    assert metrics["exact_acc"] == 0.0
+    assert metrics["macro_f1"] == 0.0
+    assert metrics["f1"] == {name: None for name in CLASS_NAMES}
+    assert_metrics_match_confusion(metrics)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda metrics: metrics.update(support=[2, 1, 1, 1, 1]),
+    lambda metrics: metrics.update(total=6),
+    lambda metrics: metrics.update(macro_f1=1.0),
+    lambda metrics: metrics["f1"].update({CLASS_NAMES[0]: 1.0}),
+    lambda metrics: metrics["within_one_by_class"].update({CLASS_NAMES[0]: 0.0}),
+])
+def test_metrics_evidence_rejects_support_aggregate_and_per_class_tampering(mutation) -> None:
+    matrix = [[0, 1, 0, 0, 0], [0, 0, 1, 0, 0], [0, 0, 0, 1, 0], [0, 0, 0, 0, 1], [1, 0, 0, 0, 0]]
+    metrics = derive_category_metrics(matrix)
+    mutation(metrics)
+    with pytest.raises(ValueError, match="does not match"):
+        assert_metrics_match_confusion(metrics)
+
+
+def test_metrics_evidence_uses_documented_tight_float_tolerance() -> None:
+    metrics = derive_category_metrics([[1, 0, 0, 0, 0]] * NUM_CLASSES)
+    metrics["macro_f1"] += METRICS_TOLERANCE
+    assert_metrics_match_confusion(metrics)
+    metrics["macro_f1"] += METRICS_TOLERANCE
+    with pytest.raises(ValueError, match="macro_f1"):
+        assert_metrics_match_confusion(metrics)
+
+
+@pytest.mark.parametrize(
+    ("gate", "value"),
+    [
+        ("macro_f1_min", 0),
+        ("balanced_accuracy_min", 1.000001),
+        ("class_f1_min", float("nan")),
+        ("class_within_one_min", -0.001),
+        ("class_error_ge_2_max", -0.001),
+        ("class_error_ge_2_max", 1),
+        ("ordinal_mae_max", -0.001),
+        ("ordinal_mae_max", SCORE_STEP * (NUM_CLASSES - 1)),
+        ("ordinal_mae_max", float("inf")),
+    ],
+)
+def test_provisional_gate_domains_reject_invalid_or_vacuous_boundaries(
+    tmp_path: Path, gate: str, value: object
+) -> None:
+    gates = dict(trainer.PROVISIONAL_ACCEPTANCE_GATES)
+    gates[gate] = value
+    with pytest.raises(ValueError, match="provisional_acceptance_gates"):
+        load_config(_write_config(tmp_path, provisional_acceptance_gates=gates))
+
+
+@pytest.mark.parametrize("failed_check", [
+    "macro_f1", "balanced_accuracy", "every_class_f1", "every_class_within_one",
+    "every_class_error_ge_2", "ordinal_mae",
+])
+def test_each_provisional_gate_failure_direction_is_reported(failed_check: str) -> None:
+    metrics = {
+        "macro_f1": 0.75,
+        "balanced_accuracy": 0.75,
+        "ordinal_mae": 0.35,
+        "f1": {name: 0.70 for name in CLASS_NAMES},
+        "within_one_by_class": {name: 0.95 for name in CLASS_NAMES},
+        "error_ge_2_by_class": {name: 0.05 for name in CLASS_NAMES},
+    }
+    if failed_check == "macro_f1":
+        metrics["macro_f1"] = 0.749
+    elif failed_check == "balanced_accuracy":
+        metrics["balanced_accuracy"] = 0.749
+    elif failed_check == "every_class_f1":
+        metrics["f1"][CLASS_NAMES[0]] = 0.699
+    elif failed_check == "every_class_within_one":
+        metrics["within_one_by_class"][CLASS_NAMES[0]] = 0.949
+    elif failed_check == "every_class_error_ge_2":
+        metrics["error_ge_2_by_class"][CLASS_NAMES[0]] = 0.051
+    else:
+        metrics["ordinal_mae"] = 0.351
+    config = {"provisional_acceptance_gates": dict(trainer.PROVISIONAL_ACCEPTANCE_GATES)}
+    result = trainer._evaluate_provisional_gates(metrics, config)
+    assert result["passed"] is False
+    assert result["checks"][failed_check] is False
+
+
 def test_optimized_validation_matches_reference_with_partial_final_batch() -> None:
     class _FixedLogitsModel(torch.nn.Module):
         def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -1166,8 +1480,16 @@ def test_optimized_validation_matches_reference_with_partial_final_batch() -> No
                 class_correct[class_idx] += int(((pred_idx == class_idx) & mask).sum().item())
     reference = {
         "exact_acc": exact / total,
-        "pm1_acc": pm1 / total,
         "mae": absolute_error / total,
+        "within_one": pm1 / total,
+        "ordinal_mae": absolute_error / total,
+        "error_ge_2": 0.0,
+        "macro_f1": 1.0,
+        "balanced_accuracy": 2 / 3,
+        "within_one_by_class": {"1": 1.0, "2": None, "3": 1.0, "4": 1.0, "5": None},
+        "error_ge_2_by_class": {"1": 0.0, "2": None, "3": 0.0, "4": 0.0, "5": None},
+        "support": [1, 0, 1, 1, 0],
+        "precision": {"1": 1.0, "2": None, "3": 1.0, "4": None, "5": 0.0},
         "recall": {
             name: (
                 class_correct[index] / class_total[index]
@@ -1176,6 +1498,14 @@ def test_optimized_validation_matches_reference_with_partial_final_batch() -> No
             )
             for index, name in enumerate(CLASS_NAMES)
         },
+        "f1": {"1": 1.0, "2": None, "3": 1.0, "4": None, "5": None},
+        "confusion_matrix": [
+            [1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1],
+            [0, 0, 0, 0, 0],
+        ],
         "total": total,
     }
     assert optimized == reference
@@ -1279,42 +1609,67 @@ def test_training_progress_prints_are_flushed(monkeypatch) -> None:
 
 
 def test_results_csv_validates_deterministic_partial_recall_json() -> None:
-    row = [
-        "1", "0.001", "1.0", "0.5", "0.9", "0.25",
-        json.dumps({"1": 1.0, "2": None, "3": 0.5, "4": None, "5": None}, sort_keys=True),
-    ]
-    trainer._validate_results_row(row, line_number=2, expected_epoch=1)
+    row = _results_row(1)
+    row["val_recall"] = json.dumps(
+        {"1": 1.0, "2": None, "3": 0.5, "4": None, "5": None}, sort_keys=True
+    )
+    trainer._validate_results_row(
+        [row[field] for field in RESULTS_FIELDNAMES], line_number=2, expected_epoch=1
+    )
 
 
 def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -> dict[str, object]:
     data_dir = tmp_path / "dataset"
     records = []
-    for split in ("train", "val"):
+    source_labels = ("3.25", "3.5", "3.75", "4.0", "4.25")
+    split_order = {"train": 0, "val": 1, "test": 2}
+    for split in ("train", "val", "test"):
         for class_index, class_name in enumerate(CLASS_NAMES):
             class_dir = data_dir / split / class_name
             class_dir.mkdir(parents=True, exist_ok=True)
-            evidence_id = (0 if split == "train" else NUM_CLASSES) + class_index + 1
-            path = class_dir / f"{evidence_id}.jpg"
-            content = f"{split}/{class_name}".encode("utf-8")
+            source_path = f"{source_labels[class_index]}/GS_{split_order[split] + 1}_{class_index + 1}.jpg"
+            record_id = hashlib.sha256(
+                f"bcs-local-category-source-v1\0{source_path}".encode()
+            ).hexdigest()
+            path = class_dir / f"{record_id}.jpg"
+            buffer = io.BytesIO()
+            Image.new("RGB", (8, 8), (class_index * 30 + 10, split_order[split] * 50 + 20, 80)).save(
+                buffer, format="JPEG"
+            )
+            content = buffer.getvalue()
             path.write_bytes(content)
             records.append(
                 {
                     "split": split,
-                    "bcs_score": class_index + 1,
-                    "evidence_id": evidence_id,
-                    "relative_path": f"{split}/{class_name}/{evidence_id}.jpg",
+                    "bcs_category": class_index + 1,
+                    "record_id": record_id,
+                    "relative_path": f"{split}/{class_name}/{record_id}.jpg",
                     "sha256": hashlib.sha256(content).hexdigest(),
-                    "provenance": [
-                        {"evidence_id": evidence_id, "evaluation_id": evidence_id + 100}
-                    ],
+                    "capture_group": f"{split}|{class_index + 1}",
+                    "provenance": [{"relative_path": source_path, "source_label": source_labels[class_index]}],
                 }
             )
-    records.sort(key=lambda item: (item["bcs_score"], item["split"] == "val", item["evidence_id"]))
-    counts = {split: [1] * NUM_CLASSES for split in ("train", "val")}
+    records.sort(key=lambda item: (item["bcs_category"], split_order[item["split"]], item["record_id"]))
+    counts = {split: [1] * NUM_CLASSES for split in ("train", "val", "test")}
+    identity_digest = split_identity_digest(
+        source_schema="bcs-local-category-source-v1",
+        identity_scheme="local-path-sha256-v1",
+        mapping_lineage=tuple(zip(source_labels, BCS_CLASS_SCORES)),
+        observed_classes=BCS_CLASS_SCORES,
+        seed=7,
+        canonical_val_ratio="0",
+        canonical_test_ratio="0",
+        assignments=[
+            (item["split"], item["bcs_category"], item["record_id"], item["capture_group"], item["sha256"])
+            for item in sorted(records, key=lambda item: item["record_id"])
+        ],
+        counts={split: tuple(counts[split]) for split in ("train", "val", "test")},
+        exclusions=[],
+    )
     (data_dir / "manifest.json").write_text(
         json.dumps(
             {
-                "manifest_schema_version": "bcs-integer-snapshot-v2",
+                "manifest_schema_version": "bcs-category-snapshot-v1",
                 "domain_id": BCS_DOMAIN_ID,
                 "class_values": list(BCS_CLASS_SCORES),
                 "class_mapping": {name: index for index, name in enumerate(CLASS_NAMES)},
@@ -1324,16 +1679,23 @@ def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -
                 "score_step": SCORE_STEP,
                 "num_classes": NUM_CLASSES,
                 "num_thresholds": NUM_THRESHOLDS,
-                "source_schema": "bcs-source-v1",
+                "source_schema": "bcs-local-category-source-v1",
+                "identity_scheme": "local-path-sha256-v1",
+                "mapping": dict(zip(source_labels, BCS_CLASS_SCORES)),
+                "observed_classes": list(BCS_CLASS_SCORES),
                 "counts": counts,
                 "split_plan": {
-                    "identity_digest": "0" * 64,
+                    "identity_digest": identity_digest,
                     "seed": 7,
                     "canonical_val_ratio": "0",
-                    "candidate_evidence_ids": list(range(1, 11)),
-                    "excluded_evidence_ids": [],
+                    "canonical_test_ratio": "0",
+                    "candidate_record_ids": sorted(record["record_id"] for record in records),
+                    "excluded_record_ids": [],
                     "counts": counts,
+                    "capture_group_count": len(records),
+                    "digest_count": len(records),
                 },
+                "isolation": {"capture_group_count": len(records), "digest_count": len(records), "overlap": []},
                 "records": records,
                 "exclusions": [],
             },
@@ -1342,8 +1704,8 @@ def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -
         encoding="utf-8",
     )
     return {
-        "data_dir": str(data_dir),
-        "output": str(output),
+        "data_root": str(data_dir),
+        "output_dir": str(output),
         "epochs": 3,
         "batch_size": 1,
         "lr": 0.01,
@@ -1353,9 +1715,13 @@ def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -
         "warmup_epochs": 0,
         "patience": patience,
         "num_workers": 0,
+        "val_num_workers": 2,
+        "val_seed": 8,
+        "progress_every_batches": 50,
         "imgsz": 8,
         "device": "cpu",
         "seed": 7,
+        "provisional_acceptance_gates": dict(trainer.PROVISIONAL_ACCEPTANCE_GATES),
         "_config_path": str(tmp_path / "config.yaml"),
     }
 
@@ -1363,23 +1729,9 @@ def _tiny_training_config(tmp_path: Path, output: Path, *, patience: int = 10) -
 def _valid_best_artifacts(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     output = tmp_path / "run"
     config = _tiny_training_config(tmp_path, output)
-    config["allow_partial_class_coverage"] = False
-    config["data_root"] = config["data_dir"]
-    config["output_dir"] = config["output"]
     config_path = Path(config["_config_path"])
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-    data_dir = Path(config["data_dir"])
-    manifest_path = data_dir / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    for record in manifest["records"]:
-        image_path = data_dir / record["relative_path"]
-        image = Image.new("RGB", (8, 8), (record["bcs_score"] * 20, 40, 80))
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG")
-        content = buffer.getvalue()
-        image_path.write_bytes(content)
-        record["sha256"] = hashlib.sha256(content).hexdigest()
-    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    data_dir = Path(config["data_root"])
     provenance = _build_provenance(
         config,
         data_dir=data_dir,
@@ -1389,6 +1741,27 @@ def _valid_best_artifacts(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     )
     model = BCSOrdinalModel(pretrained=False)
     best_path = output / "weights" / "best.pt"
+    best_validation = {
+        "exact_acc": 1.0,
+        "within_one": 1.0,
+        "ordinal_mae": 0.0,
+        "error_ge_2": 0.0,
+        "macro_f1": 1.0,
+        "balanced_accuracy": 1.0,
+        "f1": {name: 1.0 for name in CLASS_NAMES},
+        "within_one_by_class": {name: 1.0 for name in CLASS_NAMES},
+        "error_ge_2_by_class": {name: 0.0 for name in CLASS_NAMES},
+        "precision": {name: 1.0 for name in CLASS_NAMES},
+        "recall": {name: 1.0 for name in CLASS_NAMES},
+    }
+    validation_metrics = {
+        **best_validation,
+        "mae": best_validation["ordinal_mae"],
+        "support": [1] * NUM_CLASSES,
+        "confusion_matrix": [[1 if row == col else 0 for col in range(NUM_CLASSES)] for row in range(NUM_CLASSES)],
+        "total": NUM_CLASSES,
+    }
+    selection_identity = trainer._selection_identity(provenance, 1, best_validation)
     _atomic_torch_save(
         {
             **_checkpoint_lineage(provenance, provenance["run_id"]),
@@ -1397,9 +1770,37 @@ def _valid_best_artifacts(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             "classes": list(CLASS_NAMES),
             "provenance": provenance,
             "epoch": 1,
-            "val_mae": 0.0356609410,
+            "val_ordinal_mae": 0.0,
+            "best_epoch": 1,
+            "best_validation": best_validation,
+            "selection_identity": selection_identity,
+            "best_results_row": trainer._results_row(1, lr=0.01, train_loss=1.0, metrics=validation_metrics),
         },
         best_path,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    last_path = output / "weights" / "last.pt"
+    _atomic_torch_save(
+        _build_last_checkpoint(
+            model,
+            optimizer,
+            epoch=1,
+            best_mae=0.0,
+            epochs_without_improvement=0,
+            config=config,
+            provenance=provenance,
+            best_epoch=1,
+            selection_identity=selection_identity,
+            best_validation=best_validation,
+        ),
+        last_path,
+    )
+    trainer._write_checkpoint_set(
+        output / "weights",
+        best_digest=hashlib.sha256(best_path.read_bytes()).hexdigest(),
+        last_digest=hashlib.sha256(last_path.read_bytes()).hexdigest(),
+        provenance=provenance,
+        approved_output_roots=(tmp_path,),
     )
     _atomic_write_json(
         trainer._results_lineage(provenance, provenance["run_id"]),
@@ -1409,16 +1810,45 @@ def _valid_best_artifacts(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         writer = csv.writer(handle)
         writer.writerow(RESULTS_FIELDNAMES)
         writer.writerow(
-            [
-                1,
-                "0.01",
-                "1.0",
-                "0.96433906",
-                "1.0",
-                "0.03566094",
-                json.dumps({name: 1.0 for name in CLASS_NAMES}, sort_keys=True),
-            ]
+            [trainer._results_row(1, lr=0.01, train_loss=1.0, metrics=validation_metrics)[field] for field in RESULTS_FIELDNAMES]
         )
+    best_checkpoint = {
+        "path": str(best_path.resolve()),
+        "sha256": hashlib.sha256(best_path.read_bytes()).hexdigest(),
+        "run_id": provenance["run_id"],
+        "best_epoch": 1,
+        "selection_identity": selection_identity,
+        "validation": best_validation,
+    }
+    last_checkpoint = {
+        "path": str(last_path.resolve()),
+        "sha256": hashlib.sha256(last_path.read_bytes()).hexdigest(),
+        "run_id": provenance["run_id"],
+    }
+    test_metrics = {
+        "evaluated_checkpoint": str(best_path.resolve()),
+        "checkpoint_sha256": best_checkpoint["sha256"],
+        "run_id": provenance["run_id"],
+        "best_epoch": 1,
+        "selection_identity": selection_identity,
+        "config_sha256": provenance["config_sha256"],
+        "snapshot_identity": provenance["dataset_manifest"]["split_identity"],
+        "dataset_manifest_digest": provenance["dataset_manifest"]["sha256"],
+        **validation_metrics,
+    }
+    run_info = {
+        "run_id": provenance["run_id"],
+        "config_sha256": provenance["config_sha256"],
+        "snapshot_identity": provenance["dataset_manifest"]["split_identity"],
+        "dataset_manifest_digest": provenance["dataset_manifest"]["sha256"],
+        "provenance": provenance,
+        "candidate_status": "candidate_pending_handoff",
+        "best_checkpoint": best_checkpoint,
+        "last_checkpoint": last_checkpoint,
+        "test_metrics": test_metrics,
+        "provisional_acceptance": trainer._evaluate_provisional_gates(test_metrics, config),
+    }
+    _atomic_write_json(run_info, output / "run_info.json")
     return best_path, output, data_dir, config_path
 
 
@@ -1431,17 +1861,74 @@ def test_overnight_validates_best_checkpoint_and_regression_direction(
         "_validate",
         lambda *args: {
             "exact_acc": 0.96433906,
-            "pm1_acc": 1.0,
             "mae": 0.03566094,
         },
     )
     result = _validate_best_checkpoint(best, output, data_dir, config_path)
-    assert result["best"] == {
-        "epoch": 1,
-        "mae": 0.03566094,
-        "exact_acc": 0.96433906,
-        "pm1_acc": 1.0,
-    }
+    assert result["checkpoint"] == str(best)
+    assert result["category_contract"] == "1..5"
+
+
+def test_overnight_rejects_substituted_or_unbound_last_checkpoint(
+    tmp_path: Path,
+) -> None:
+    best, output, data_dir, config_path = _valid_best_artifacts(tmp_path)
+    last_path = output / "weights" / "last.pt"
+    last_path.write_bytes(best.read_bytes())
+    with pytest.raises(RuntimeError, match="last|checkpoint|digest"):
+        _validate_best_checkpoint(best, output, data_dir, config_path)
+
+    best, output, data_dir, config_path = _valid_best_artifacts(tmp_path / "missing")
+    run_info_path = output / "run_info.json"
+    run_info = json.loads(run_info_path.read_text(encoding="utf-8"))
+    del run_info["last_checkpoint"]
+    run_info_path.write_text(json.dumps(run_info), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="last|checkpoint"):
+        _validate_best_checkpoint(best, output, data_dir, config_path)
+
+
+def test_overnight_rejects_alias_only_checkpoint_set(tmp_path: Path) -> None:
+    best, output, data_dir, config_path = _valid_best_artifacts(tmp_path)
+    (output / "weights" / trainer.CHECKPOINT_SET_FILENAME).unlink()
+
+    with pytest.raises(RuntimeError, match="authoritative|checkpoint set"):
+        _validate_best_checkpoint(best, output, data_dir, config_path)
+
+
+def test_overnight_rejects_foreign_same_schema_or_stale_results(tmp_path: Path) -> None:
+    best, output, data_dir, config_path = _valid_best_artifacts(tmp_path)
+    checkpoint = torch.load(best, map_location="cpu", weights_only=True)
+    checkpoint["snapshot_identity"] = "d" * 64
+    checkpoint["provenance"]["dataset_manifest"]["split_identity"] = "d" * 64
+    torch.save(checkpoint, best)
+    with pytest.raises(RuntimeError, match="handoff|checkpoint|lineage"):
+        _validate_best_checkpoint(best, output, data_dir, config_path)
+
+    best, output, data_dir, config_path = _valid_best_artifacts(tmp_path / "results")
+    lineage_path = output / RESULTS_LINEAGE_FILENAME
+    lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+    lineage["run_id"] = "d" * 32
+    lineage_path.write_text(json.dumps(lineage), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="handoff|lineage"):
+        _validate_best_checkpoint(best, output, data_dir, config_path)
+
+    best, output, data_dir, config_path = _valid_best_artifacts(tmp_path / "live")
+    live_image = next((data_dir / "train" / CLASS_NAMES[0]).glob("*.jpg"))
+    live_image.write_bytes(live_image.read_bytes() + b"tampered")
+    with pytest.raises(RuntimeError, match="live snapshot|digest"):
+        _validate_best_checkpoint(best, output, data_dir, config_path)
+
+    best, output, data_dir, config_path = _valid_best_artifacts(tmp_path / "metric")
+    results_path = output / "results.csv"
+    with results_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    rows[0]["val_macro_f1"] = "0.99"
+    with results_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULTS_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(RuntimeError, match="selected row|validation row"):
+        _validate_best_checkpoint(best, output, data_dir, config_path)
 
 
 @pytest.mark.parametrize("mutation", ["corrupt", "foreign"])
@@ -1496,8 +1983,8 @@ def test_resume_roundtrip_rejects_runtime_identity_drift(tmp_path: Path) -> None
     config = _tiny_training_config(tmp_path, tmp_path / "run")
     provenance = _build_provenance(
         config,
-        data_dir=Path(config["data_dir"]),
-        output_dir=Path(config["output"]),
+        data_dir=Path(config["data_root"]),
+        output_dir=Path(config["output_dir"]),
         device=torch.device("cpu"),
     )
     model = torch.nn.Linear(3, 2)
@@ -1538,30 +2025,30 @@ def test_dataset_provenance_rejects_inconsistent_live_membership(
     tmp_path: Path, mutation: str
 ) -> None:
     config = _tiny_training_config(tmp_path, tmp_path / "out")
-    data_dir = Path(config["data_dir"])
+    data_dir = Path(config["data_root"])
     manifest_path = data_dir / "manifest.json"
     if mutation == "added":
         (data_dir / "train" / CLASS_NAMES[0] / "added.jpg").write_bytes(b"added")
     elif mutation == "missing":
-        (data_dir / "train" / CLASS_NAMES[0] / "1.jpg").unlink()
+        next((data_dir / "train" / CLASS_NAMES[0]).iterdir()).unlink()
     else:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["records"][0]["relative_path"] = "../escape.jpg"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="manifest|membership|unsafe path"):
+    with pytest.raises(ValueError, match="manifest|membership|unsafe path|record is invalid"):
         _build_provenance(
             config,
             data_dir=data_dir,
-            output_dir=Path(config["output"]),
+            output_dir=Path(config["output_dir"]),
             device=torch.device("cpu"),
         )
 
 
-def test_integer_v2_manifest_is_accepted_and_old_lineages_are_rejected(tmp_path: Path) -> None:
+def test_category_manifest_is_accepted_and_old_lineages_are_rejected(tmp_path: Path) -> None:
     config = _tiny_training_config(tmp_path, tmp_path / "out")
-    manifest_path = Path(config["data_dir"]) / "manifest.json"
+    manifest_path = Path(config["data_root"]) / "manifest.json"
     assert _build_provenance(
-        config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]), device=torch.device("cpu")
+        config, data_dir=Path(config["data_root"]), output_dir=Path(config["output_dir"]), device=torch.device("cpu")
     )["classes"] == list(CLASS_NAMES)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["manifest_schema_version"] = "bcs-integer-snapshot-v1"
@@ -1569,58 +2056,55 @@ def test_integer_v2_manifest_is_accepted_and_old_lineages_are_rejected(tmp_path:
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="legacy|schema") as failure:
         _build_provenance(
-            config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]), device=torch.device("cpu")
+            config, data_dir=Path(config["data_root"]), output_dir=Path(config["output_dir"]), device=torch.device("cpu")
         )
     assert "private-storage-key" not in str(failure.value)
-    manifest["manifest_schema_version"] = "bcs-integer-snapshot-v2"
-    manifest["class_values"] = [3.25, 3.5, 3.75, 4.0, 4.25]
-    manifest["records"][0].pop("storage_key")
+    manifest["manifest_schema_version"] = "bcs-category-snapshot-v1"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="legacy|schema"):
+    with pytest.raises(ValueError, match="fields|legacy|schema"):
         _build_provenance(
-            config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]), device=torch.device("cpu")
+            config, data_dir=Path(config["data_root"]), output_dir=Path(config["output_dir"]), device=torch.device("cpu")
         )
 
 
 @pytest.mark.parametrize("mutation", [
     lambda manifest: manifest["records"][0].update(relative_path="val/1/1.jpg"),
-    lambda manifest: manifest["records"][0].update(bcs_score=5),
+    lambda manifest: manifest["records"][0].update(bcs_category=5),
     lambda manifest: manifest.update(class_mapping={name: 0 for name in CLASS_NAMES}),
 ])
-def test_integer_v2_manifest_rejects_record_and_class_tampering(tmp_path: Path, mutation) -> None:
+def test_category_manifest_rejects_record_and_class_tampering(tmp_path: Path, mutation) -> None:
     config = _tiny_training_config(tmp_path, tmp_path / "out")
-    path = Path(config["data_dir"]) / "manifest.json"
+    path = Path(config["data_root"]) / "manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
     mutation(manifest)
     path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError):
-        _build_provenance(config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]), device=torch.device("cpu"))
+        _build_provenance(config, data_dir=Path(config["data_root"]), output_dir=Path(config["output_dir"]), device=torch.device("cpu"))
 
 
-def test_default_integer_training_roots_are_canonical(tmp_path: Path) -> None:
-    config = yaml.safe_load((REPO_ROOT / "configs" / "training_bcs_ordinal.yaml").read_text())
-    assert config["data_root"] == "data/bcs-local-integer-v1"
-    assert config["output_dir"] == "outputs/bcs-ordinal-local-integer-v1"
-    assert config["allow_partial_class_coverage"] is True
+def test_default_category_training_roots_are_canonical(tmp_path: Path) -> None:
+    config = yaml.safe_load((REPO_ROOT / "configs" / "training_bcs_category.yaml").read_text())
+    assert config["data_root"] == "data/bcs-category-v1"
+    assert config["output_dir"] == "outputs/bcs-category-coral-v1"
 
 
 @pytest.mark.parametrize("mutation", ["missing", "unexpected"])
-def test_integer_snapshot_rejects_root_structure_tampering(tmp_path: Path, mutation: str) -> None:
+def test_category_snapshot_rejects_root_structure_tampering(tmp_path: Path, mutation: str) -> None:
     config = _tiny_training_config(tmp_path, tmp_path / "out")
-    root = Path(config["data_dir"])
+    root = Path(config["data_root"])
     if mutation == "missing":
-        (root / "val" / CLASS_NAMES[-1] / "10.jpg").unlink()
+        next((root / "val" / CLASS_NAMES[-1]).iterdir()).unlink()
         (root / "val" / CLASS_NAMES[-1]).rmdir()
     else:
         (root / "unexpected").mkdir()
     with pytest.raises(ValueError, match="structure|membership"):
-        _build_provenance(config, data_dir=root, output_dir=Path(config["output"]), device=torch.device("cpu"))
+        _build_provenance(config, data_dir=root, output_dir=Path(config["output_dir"]), device=torch.device("cpu"))
 
 
 def _lineage_checkpoint(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     config = _tiny_training_config(tmp_path, tmp_path / "out")
     provenance = _build_provenance(
-        config, data_dir=Path(config["data_dir"]), output_dir=Path(config["output"]),
+        config, data_dir=Path(config["data_root"]), output_dir=Path(config["output_dir"]),
         device=torch.device("cpu"), run_id="a" * 32,
     )
     model = torch.nn.Linear(3, 2)
@@ -1636,8 +2120,8 @@ def _lineage_checkpoint(tmp_path: Path) -> tuple[Path, dict[str, object]]:
 
 @pytest.mark.parametrize("field,value", [
     ("checkpoint_schema_version", "old-checkpoint"), ("domain_id", "fractional"),
-    ("classes", ["3.25", "3.5", "3.75", "4.0", "4.25"]),
-    ("score_step", True), ("snapshot_schema", "bcs-integer-snapshot-v1"),
+    ("classes", ["fractional"]),
+    ("score_step", True), ("snapshot_schema", "bcs-category-snapshot-v0"),
     ("snapshot_identity", "b" * 64), ("dataset_manifest_digest", "c" * 64),
     ("run_id", "d" * 32),
 ])
@@ -1676,12 +2160,12 @@ def test_overwrite_invalid_manifest_preserves_prior_artifacts(tmp_path: Path) ->
     output = tmp_path / "run"
     config = _tiny_training_config(tmp_path, output)
     artifacts = _seed_prior_training_artifacts(output)
-    manifest_path = Path(config["data_dir"]) / "manifest.json"
+    manifest_path = Path(config["data_root"]) / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["records"] = []
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="manifest|membership"):
+    with pytest.raises(ValueError, match="manifest|membership|counts"):
         trainer.train(config, overwrite=True)
     _assert_artifacts_unchanged(artifacts)
 
@@ -1698,6 +2182,349 @@ def test_overwrite_unsupported_optimizer_preserves_prior_artifacts(
     with pytest.raises(ValueError, match="Unsupported optimizer"):
         trainer.train(config, overwrite=True)
     _assert_artifacts_unchanged(artifacts)
+
+
+def test_overwrite_model_initialization_failure_preserves_prior_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output)
+    artifacts = _seed_prior_training_artifacts(output)
+
+    def fail_model(*args, **kwargs):
+        raise RuntimeError("simulated model initialization failure")
+
+    monkeypatch.setattr(trainer, "BCSOrdinalModel", fail_model)
+    with pytest.raises(RuntimeError, match="simulated model initialization failure"):
+        trainer.train(config, overwrite=True)
+    _assert_artifacts_unchanged(artifacts)
+
+
+def test_overwrite_optimizer_initialization_failure_preserves_prior_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output)
+    artifacts = _seed_prior_training_artifacts(output)
+    monkeypatch.setattr(trainer, "BCSOrdinalModel", _TinyModel)
+
+    def fail_optimizer(*args, **kwargs):
+        raise RuntimeError("simulated optimizer initialization failure")
+
+    monkeypatch.setattr(trainer.torch.optim, "AdamW", fail_optimizer)
+    with pytest.raises(RuntimeError, match="simulated optimizer initialization failure"):
+        trainer.train(config, overwrite=True)
+    _assert_artifacts_unchanged(artifacts)
+
+
+def test_atomic_checkpoint_uses_content_addressed_generation_without_sidecar(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "weights" / "last.pt"
+    _atomic_torch_save({"epoch": 2}, path)
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    generation = path.parent / "generations" / f"{digest}.pt"
+
+    assert generation.read_bytes() == raw
+    assert path.stat().st_ino == generation.stat().st_ino
+    assert not path.with_name(path.name + ".sha256").exists()
+
+
+def test_atomic_checkpoint_set_replacement_failure_preserves_prior_descriptor_and_generation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "weights" / "last.pt"
+    _atomic_torch_save({"epoch": 1}, path)
+    descriptor = path.parent / "checkpoint_set.json"
+    prior_descriptor = b'{"committed_epoch":1}\n'
+    descriptor.write_bytes(prior_descriptor)
+    prior_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    prior_generation = path.parent / "generations" / f"{prior_digest}.pt"
+    prior_generation_bytes = prior_generation.read_bytes()
+    real_replace = trainer.os.replace
+
+    def fail_descriptor_replace(source, destination):
+        if Path(destination) == descriptor:
+            raise OSError("simulated checkpoint-set replace failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(trainer.os, "replace", fail_descriptor_replace)
+    with pytest.raises(OSError, match="checkpoint-set replace"):
+        trainer._atomic_write_json({"committed_epoch": 2}, descriptor)
+
+    assert descriptor.read_bytes() == prior_descriptor
+    assert prior_generation.read_bytes() == prior_generation_bytes
+    assert not list(path.parent.glob(f".{descriptor.name}.*.tmp"))
+
+
+def test_checkpoint_generation_cleanup_keeps_referenced_and_removes_orphans(
+    tmp_path: Path,
+) -> None:
+    weights = tmp_path / "weights"
+    best = weights / "best.pt"
+    last = weights / "last.pt"
+    _atomic_torch_save({"role": "best"}, best)
+    _atomic_torch_save({"role": "last"}, last)
+    referenced = {
+        hashlib.sha256(best.read_bytes()).hexdigest(),
+        hashlib.sha256(last.read_bytes()).hexdigest(),
+    }
+    orphan_raw = b"orphan-generation"
+    orphan_digest = hashlib.sha256(orphan_raw).hexdigest()
+    orphan = weights / "generations" / f"{orphan_digest}.pt"
+    orphan.write_bytes(orphan_raw)
+
+    trainer._gc_checkpoint_generations(weights, approved_output_roots=(tmp_path,))
+
+    assert orphan.exists() is False
+    assert all(
+        (weights / "generations" / f"{digest}.pt").exists() for digest in referenced
+    )
+
+
+@pytest.mark.parametrize("role", ["best", "last"])
+def test_new_checkpoint_generation_failure_preserves_authoritative_set(
+    tmp_path: Path, monkeypatch, role: str
+) -> None:
+    _best, output, _data_dir, _config_path = _valid_best_artifacts(tmp_path)
+    weights = output / "weights"
+    descriptor = weights / trainer.CHECKPOINT_SET_FILENAME
+    prior_descriptor = descriptor.read_bytes()
+    prior_set = json.loads(prior_descriptor)
+    prior_generations = {
+        weights / reference["filename"]
+        for reference in (prior_set["best"], prior_set["last"])
+    }
+    payload = torch.load(
+        weights / f"{role}.pt", map_location="cpu", weights_only=True
+    )
+    payload["epoch"] = int(payload.get("epoch", 1)) + 1
+
+    def fail_save(*args, **kwargs):
+        raise OSError(f"simulated {role} generation failure")
+
+    monkeypatch.setattr(trainer.torch, "save", fail_save)
+    with pytest.raises(OSError, match=f"{role} generation failure"):
+        _atomic_torch_save(payload, weights / f"{role}.pt")
+
+    assert descriptor.read_bytes() == prior_descriptor
+    assert all(path.exists() for path in prior_generations)
+
+
+def test_checkpoint_set_transaction_failures_preserve_or_commit_coherent_sets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    best, output, _data_dir, _config_path = _valid_best_artifacts(tmp_path)
+    weights = output / "weights"
+    descriptor_path = weights / trainer.CHECKPOINT_SET_FILENAME
+    prior_descriptor = descriptor_path.read_bytes()
+    prior_set = json.loads(prior_descriptor)
+    prior_generations = {
+        weights / reference["filename"]
+        for reference in (prior_set["best"], prior_set["last"])
+    }
+    run_info = json.loads((output / "run_info.json").read_text(encoding="utf-8"))
+    provenance = run_info["provenance"]
+    last_path = weights / "last.pt"
+    last = torch.load(last_path, map_location="cpu", weights_only=True)
+    last["epoch"] = 2
+    new_last_digest = _atomic_torch_save(last, last_path)
+
+    real_write_json = trainer._atomic_write_json
+
+    def fail_set_descriptor(payload, path):
+        if path == descriptor_path:
+            raise OSError("simulated checkpoint-set descriptor failure")
+        return real_write_json(payload, path)
+
+    monkeypatch.setattr(trainer, "_atomic_write_json", fail_set_descriptor)
+    with pytest.raises(OSError, match="checkpoint-set descriptor"):
+        trainer._write_checkpoint_set(
+            weights,
+            best_digest=prior_set["best"]["sha256"],
+            last_digest=new_last_digest,
+            provenance=provenance,
+            approved_output_roots=(tmp_path,),
+        )
+    assert descriptor_path.read_bytes() == prior_descriptor
+    assert all(path.exists() for path in prior_generations)
+    assert (weights / trainer.CHECKPOINT_SET_RECOVERY_FILENAME).is_file()
+
+    monkeypatch.setattr(trainer, "_atomic_write_json", real_write_json)
+    committed = trainer._write_checkpoint_set(
+        weights,
+        best_digest=prior_set["best"]["sha256"],
+        last_digest=new_last_digest,
+        provenance=provenance,
+        approved_output_roots=(tmp_path,),
+    )
+    assert committed["committed_epoch"] == 2
+    assert committed["last"]["sha256"] == new_last_digest
+
+    real_gc = trainer._gc_checkpoint_generations
+
+    def fail_gc(*args, **kwargs):
+        raise OSError("simulated checkpoint generation cleanup failure")
+
+    monkeypatch.setattr(trainer, "_gc_checkpoint_generations", fail_gc)
+    with pytest.raises(OSError, match="cleanup failure"):
+        trainer._complete_checkpoint_set_commit(
+            weights, approved_output_roots=(tmp_path,)
+        )
+    assert descriptor_path.read_bytes() != prior_descriptor
+    assert (weights / trainer.CHECKPOINT_SET_RECOVERY_FILENAME).is_file()
+    assert all(path.exists() for path in prior_generations)
+    monkeypatch.setattr(trainer, "_gc_checkpoint_generations", real_gc)
+
+
+def test_checkpoint_alias_update_failure_after_generation_rename_preserves_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _best, output, _data_dir, _config_path = _valid_best_artifacts(tmp_path)
+    weights = output / "weights"
+    descriptor = weights / trainer.CHECKPOINT_SET_FILENAME
+    prior_descriptor = descriptor.read_bytes()
+    prior_set = json.loads(prior_descriptor)
+    payload = torch.load(weights / "last.pt", map_location="cpu", weights_only=True)
+    payload["epoch"] = 2
+    real_replace = trainer.os.replace
+    generation_replaced = False
+
+    def fail_alias_update(source, destination):
+        nonlocal generation_replaced
+        destination = Path(destination)
+        if destination.parent.name == "generations":
+            generation_replaced = True
+            return real_replace(source, destination)
+        if generation_replaced and destination.name == "last.pt":
+            raise OSError("simulated alias update failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(trainer.os, "replace", fail_alias_update)
+    with pytest.raises(OSError, match="alias update"):
+        _atomic_torch_save(payload, weights / "last.pt")
+
+    assert descriptor.read_bytes() == prior_descriptor
+    assert prior_set["last"]["sha256"] in {
+        path.stem for path in (weights / "generations").glob("*.pt")
+    }
+
+
+def test_checkpoint_set_recovery_publish_failure_preserves_current_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _best, output, _data_dir, _config_path = _valid_best_artifacts(tmp_path)
+    weights = output / "weights"
+    descriptor = weights / trainer.CHECKPOINT_SET_FILENAME
+    prior_descriptor = descriptor.read_bytes()
+    prior_set = json.loads(prior_descriptor)
+    payload = torch.load(weights / "last.pt", map_location="cpu", weights_only=True)
+    payload["epoch"] = 2
+    last_digest = _atomic_torch_save(payload, weights / "last.pt")
+    provenance = json.loads((output / "run_info.json").read_text())["provenance"]
+    real_write_json = trainer._atomic_write_json
+
+    def fail_recovery(payload, path):
+        if path.name == trainer.CHECKPOINT_SET_RECOVERY_FILENAME:
+            raise OSError("simulated recovery descriptor failure")
+        return real_write_json(payload, path)
+
+    monkeypatch.setattr(trainer, "_atomic_write_json", fail_recovery)
+    with pytest.raises(OSError, match="recovery descriptor"):
+        trainer._write_checkpoint_set(
+            weights,
+            best_digest=prior_set["best"]["sha256"],
+            last_digest=last_digest,
+            provenance=provenance,
+            approved_output_roots=(tmp_path,),
+        )
+    assert descriptor.read_bytes() == prior_descriptor
+    assert not (weights / trainer.CHECKPOINT_SET_RECOVERY_FILENAME).exists()
+
+
+def test_checkpoint_set_recovery_removal_failure_keeps_both_descriptors_and_generations(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _best, output, _data_dir, _config_path = _valid_best_artifacts(tmp_path)
+    weights = output / "weights"
+    descriptor = weights / trainer.CHECKPOINT_SET_FILENAME
+    prior_set = json.loads(descriptor.read_text())
+    payload = torch.load(weights / "last.pt", map_location="cpu", weights_only=True)
+    payload["epoch"] = 2
+    last_digest = _atomic_torch_save(payload, weights / "last.pt")
+    provenance = json.loads((output / "run_info.json").read_text())["provenance"]
+    trainer._write_checkpoint_set(
+        weights,
+        best_digest=prior_set["best"]["sha256"],
+        last_digest=last_digest,
+        provenance=provenance,
+        approved_output_roots=(tmp_path,),
+    )
+    recovery = weights / trainer.CHECKPOINT_SET_RECOVERY_FILENAME
+    real_unlink = Path.unlink
+
+    def fail_recovery_removal(self, *args, **kwargs):
+        if self == recovery:
+            raise OSError("simulated recovery descriptor removal failure")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_recovery_removal)
+    with pytest.raises(OSError, match="recovery descriptor removal"):
+        trainer._complete_checkpoint_set_commit(
+            weights, approved_output_roots=(tmp_path,)
+        )
+    assert descriptor.is_file()
+    assert recovery.is_file()
+    current = json.loads(descriptor.read_text())
+    backup = json.loads(recovery.read_text())
+    for value in (current, backup):
+        for role in ("best", "last"):
+            assert (weights / value[role]["filename"]).is_file()
+
+
+def test_checkpoint_gc_deletion_failure_keeps_recovery_and_referenced_generations(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _best, output, _data_dir, _config_path = _valid_best_artifacts(tmp_path)
+    weights = output / "weights"
+    descriptor = weights / trainer.CHECKPOINT_SET_FILENAME
+    prior_set = json.loads(descriptor.read_text())
+    payload = torch.load(weights / "last.pt", map_location="cpu", weights_only=True)
+    payload["epoch"] = 2
+    last_digest = _atomic_torch_save(payload, weights / "last.pt")
+    provenance = json.loads((output / "run_info.json").read_text())["provenance"]
+    trainer._write_checkpoint_set(
+        weights,
+        best_digest=prior_set["best"]["sha256"],
+        last_digest=last_digest,
+        provenance=provenance,
+        approved_output_roots=(tmp_path,),
+    )
+    orphan_raw = b"gc-failure-orphan"
+    orphan = weights / "generations" / f"{hashlib.sha256(orphan_raw).hexdigest()}.pt"
+    orphan.write_bytes(orphan_raw)
+    recovery = weights / trainer.CHECKPOINT_SET_RECOVERY_FILENAME
+    real_unlink = Path.unlink
+
+    def fail_orphan_deletion(self, *args, **kwargs):
+        if self == orphan:
+            raise OSError("simulated generation deletion failure")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_orphan_deletion)
+    with pytest.raises(OSError, match="generation deletion"):
+        trainer._complete_checkpoint_set_commit(
+            weights, approved_output_roots=(tmp_path,)
+        )
+    assert descriptor.is_file()
+    assert recovery.is_file()
+    current = json.loads(descriptor.read_text())
+    backup = json.loads(recovery.read_text())
+    for value in (current, backup):
+        for role in ("best", "last"):
+            assert (weights / value[role]["filename"]).is_file()
+    assert orphan.is_file()
 
 
 class _TinyDataset:
@@ -1720,8 +2547,43 @@ class _TinyModel(torch.nn.Module):
 
 
 def _install_tiny_training_fakes(monkeypatch, calls: list[float], interrupt_at: int | None = None) -> None:
+    import vacca_bcs.serving as serving
+
     monkeypatch.setattr(trainer, "BCSFolderDataset", _TinyDataset)
     monkeypatch.setattr(trainer, "BCSOrdinalModel", _TinyModel)
+
+    def fake_load_bcs_model(path, device="cpu", **kwargs):
+        loaded_bytes = trainer.load_checkpoint_bytes(
+            path,
+            approved_roots=(Path(path).parent,),
+            expected_sha256=kwargs.get("expected_sha256"),
+        )
+        checkpoint = loaded_bytes.payload
+        lineage = serving.BCSLineageMetadata(
+            checkpoint_schema_version=checkpoint["checkpoint_schema_version"],
+            domain_id=checkpoint["domain_id"],
+            snapshot_schema=checkpoint["snapshot_schema"],
+            snapshot_identity=checkpoint["snapshot_identity"],
+            dataset_manifest_digest=checkpoint["dataset_manifest_digest"],
+            run_id=checkpoint["run_id"],
+            source_schema=checkpoint["source_schema"],
+            source_identity_scheme=checkpoint["source_identity_scheme"],
+            source_mapping=tuple(sorted(checkpoint["source_mapping"].items())),
+            observed_classes=tuple(checkpoint["observed_classes"]),
+            missing_classes=tuple(checkpoint["missing_classes"]),
+        )
+        restored = _TinyModel()
+        restored.load_state_dict(checkpoint["model_state_dict"])
+        return serving.LoadedBCSModel(
+            restored,
+            8,
+            torch.device(device),
+            lineage,
+            loaded_bytes.sha256,
+            checkpoint,
+        )
+
+    monkeypatch.setattr(serving, "load_bcs_model", fake_load_bcs_model)
     call_count = 0
 
     def fake_train(model, loader, optimizer, device, **kwargs) -> float:
@@ -1740,14 +2602,67 @@ def _install_tiny_training_fakes(monkeypatch, calls: list[float], interrupt_at: 
     def fake_validate(model, loader, device) -> dict[str, object]:
         return {
             "exact_acc": 0.5,
-            "pm1_acc": 1.0,
+            "within_one": 1.0,
+            "ordinal_mae": 0.25,
+            "error_ge_2": 0.0,
+            "macro_f1": 0.5,
+            "balanced_accuracy": 0.5,
             "mae": 0.25,
+            "support": [1] * NUM_CLASSES,
+            "precision": {name: 0.5 for name in CLASS_NAMES},
             "recall": {name: 0.0 for name in CLASS_NAMES},
+            "within_one_by_class": {name: 1.0 for name in CLASS_NAMES},
+            "error_ge_2_by_class": {name: 0.0 for name in CLASS_NAMES},
+            "f1": {name: 0.0 for name in CLASS_NAMES},
+            "confusion_matrix": [[0] * NUM_CLASSES for _ in range(NUM_CLASSES)],
             "total": 1,
         }
 
     monkeypatch.setattr(trainer, "_train_epoch", fake_train)
     monkeypatch.setattr(trainer, "_validate", fake_validate)
+
+
+def test_test_evaluates_the_reloaded_selected_best_checkpoint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run"
+    config = _tiny_training_config(tmp_path, output)
+    _install_tiny_training_fakes(monkeypatch, [])
+
+    def distinguishable_train(model, loader, optimizer, device, *, epoch=None, **kwargs):
+        with torch.no_grad():
+            model.weight.fill_(1.0 if epoch == 1 else -1.0)
+        return 0.1
+
+    def model_dependent_validate(model, loader, device):
+        good = model.weight.item() > 0
+        value = 0.0 if good else 1.0
+        return {
+            "exact_acc": 1.0 if good else 0.0,
+            "within_one": 1.0,
+            "mae": value,
+            "ordinal_mae": value,
+            "error_ge_2": 0.0 if good else 1.0,
+            "macro_f1": 1.0 if good else 0.0,
+            "balanced_accuracy": 1.0 if good else 0.0,
+            "within_one_by_class": {name: 1.0 for name in CLASS_NAMES},
+            "error_ge_2_by_class": {name: 0.0 for name in CLASS_NAMES},
+            "support": [1] * NUM_CLASSES,
+            "precision": {name: 1.0 if good else 0.0 for name in CLASS_NAMES},
+            "recall": {name: 1.0 if good else 0.0 for name in CLASS_NAMES},
+            "f1": {name: 1.0 if good else 0.0 for name in CLASS_NAMES},
+            "confusion_matrix": [[1 if row == col else 0 for col in range(NUM_CLASSES)] for row in range(NUM_CLASSES)],
+            "total": NUM_CLASSES,
+            "model_weight": model.weight.item(),
+        }
+
+    monkeypatch.setattr(trainer, "_train_epoch", distinguishable_train)
+    monkeypatch.setattr(trainer, "_validate", model_dependent_validate)
+    result = trainer.train(config, overwrite=True)
+
+    assert result["test_metrics"]["model_weight"] == pytest.approx(1.0)
+    selected = torch.load(output / "weights" / "best.pt", map_location="cpu", weights_only=True)
+    assert selected["model_state_dict"]["weight"].item() == pytest.approx(1.0)
 
 
 def test_public_resume_rejects_changed_dataset_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -1757,12 +2672,21 @@ def test_public_resume_rejects_changed_dataset_manifest(tmp_path: Path, monkeypa
     with pytest.raises(KeyboardInterrupt):
         trainer.train(config, overwrite=True)
     config["lr"] = 0.02
-    with pytest.raises(ValueError, match="provenance mismatch"):
+    with pytest.raises(ValueError, match="category lineage|provenance mismatch"):
         trainer.train(config, resume=output / "weights" / "last.pt")
     config["lr"] = 0.01
-    live_file = Path(config["data_dir"]) / "train" / CLASS_NAMES[0] / "1.jpg"
+    live_file = next((Path(config["data_root"]) / "train" / CLASS_NAMES[0]).iterdir())
     live_file.write_bytes(b"changed")
     with pytest.raises(ValueError, match="digest|hash mismatch"):
+        trainer.train(config, resume=output / "weights" / "last.pt")
+
+
+def test_public_resume_rejects_alias_only_checkpoint(tmp_path: Path) -> None:
+    _best, output, _data_dir, config_path = _valid_best_artifacts(tmp_path)
+    config = load_config(config_path)
+    (output / "weights" / trainer.CHECKPOINT_SET_FILENAME).unlink()
+
+    with pytest.raises(ValueError, match="[Aa]uthoritative checkpoint set"):
         trainer.train(config, resume=output / "weights" / "last.pt")
 
 
@@ -1900,14 +2824,13 @@ def test_terminal_checkpoint_resume_finalizes_run_info_without_overwrite(
     config = _tiny_training_config(tmp_path, output)
     config["epochs"] = 1
     _install_tiny_training_fakes(monkeypatch, [])
-    real_atomic_save = trainer._atomic_torch_save
 
-    def interrupt_after_terminal_save(payload, path):
-        real_atomic_save(payload, path)
-        if path.name == "last.pt":
-            raise KeyboardInterrupt()
+    def interrupt_before_checkpoint_gc(*args, **kwargs):
+        raise KeyboardInterrupt()
 
-    monkeypatch.setattr(trainer, "_atomic_torch_save", interrupt_after_terminal_save)
+    monkeypatch.setattr(
+        trainer, "_complete_checkpoint_set_commit", interrupt_before_checkpoint_gc
+    )
     with pytest.raises(KeyboardInterrupt):
         trainer.train(config, overwrite=True)
     assert not (output / "run_info.json").exists()
@@ -1923,7 +2846,7 @@ def test_resume_stops_at_restored_patience_boundary(tmp_path: Path, monkeypatch)
     config = _tiny_training_config(tmp_path, output, patience=1)
     calls: list[float] = []
     _install_tiny_training_fakes(monkeypatch, calls)
-    data_dir = Path(config["data_dir"])
+    data_dir = Path(config["data_root"])
     device = torch.device("cpu")
     provenance = _build_provenance(config, data_dir=data_dir, output_dir=output, device=device)
     model = _TinyModel()
@@ -1938,6 +2861,35 @@ def test_resume_stops_at_restored_patience_boundary(tmp_path: Path, monkeypatch)
         provenance=provenance,
     )
     _atomic_torch_save(checkpoint, output / "weights" / "last.pt")
+    best_validation = {
+        "exact_acc": 0.5,
+        "within_one": 1.0,
+        "ordinal_mae": 0.25,
+        "error_ge_2": 0.0,
+        "macro_f1": 0.5,
+        "balanced_accuracy": 0.5,
+        "precision": {name: 0.0 for name in CLASS_NAMES},
+        "recall": {name: 0.0 for name in CLASS_NAMES},
+        "f1": {name: 0.0 for name in CLASS_NAMES},
+        "within_one_by_class": {name: 1.0 for name in CLASS_NAMES},
+        "error_ge_2_by_class": {name: 0.0 for name in CLASS_NAMES},
+    }
+    checkpoint["best_epoch"] = 1
+    checkpoint["best_validation"] = best_validation
+    checkpoint["selection_identity"] = trainer._selection_identity(
+        provenance, 1, best_validation
+    )
+    _atomic_torch_save(checkpoint, output / "weights" / "last.pt")
+    best_checkpoint = dict(checkpoint)
+    best_checkpoint["val_ordinal_mae"] = 0.25
+    _atomic_torch_save(best_checkpoint, output / "weights" / "best.pt")
+    trainer._write_checkpoint_set(
+        output / "weights",
+        best_digest=hashlib.sha256((output / "weights" / "best.pt").read_bytes()).hexdigest(),
+        last_digest=hashlib.sha256((output / "weights" / "last.pt").read_bytes()).hexdigest(),
+        provenance=provenance,
+        approved_output_roots=(tmp_path,),
+    )
     _write_results_history(output / "results.csv", [1])
     _atomic_write_json(
         trainer._results_lineage(provenance, provenance["run_id"]),

@@ -6,19 +6,19 @@ Microservicio de detección de bovinos con YOLO26n fine-tuneado sobre Navid HSM 
 ## Documentación
 
 - [Estado del repositorio](docs/estado-del-repositorio.md): estado operativo, gates, riesgos y próximos pasos.
-- [Arquitectura](docs/arquitectura.md): responsabilidades, flujos y límites entre detección, builder BCS y backend.
+- [Arquitectura](docs/arquitectura.md): responsabilidades, flujos y límites entre detección, builder BCS y serving.
 - [API](docs/api.md): serving, contratos actuales y troubleshooting.
 - [Runbook de entrenamiento BCS](docs/bcs-training-runbook.md): ejecución fresca,
   resume, progreso, logs y handoff al API.
 
 ## Estado actual
 
-La detección de Fase 1 mantiene un camino local de prototipo. El pipeline entero
-de fuente a snapshot, el núcleo ordinal BCS, el trainer y el serving BCS están
-implementados y cubiertos por pruebas deterministas. El run local BCS se completó
-en CUDA hasta la época 30; la API no fue iniciada y el checkpoint permanece como
-artefacto local ignorado. Ver el [estado detallado](docs/estado-del-repositorio.md)
-y el [baseline de entrenamiento](reports/bcs-training-baseline-2026-09-02.md).
+La detección de Fase 1 mantiene un camino local de prototipo. El pipeline de fuente
+a snapshot, el núcleo ordinal BCS, el trainer y el serving BCS están implementados
+y cubiertos por pruebas deterministas. No existe un run ni checkpoint NUEVO
+entrenado para la categoría; BCS permanece deshabilitado hasta que un candidato
+pase los gates de ingeniería provisionales. El reporte anterior está archivado en
+`reports/historical/obsolete-bcs-integer-baseline-2026-09-02.md`.
 
 ## Requisitos
 
@@ -82,7 +82,7 @@ El servidor levanta en `http://127.0.0.1:8000` con estos endpoints:
 |--------|------|-------------|
 | `GET` | `/health` | Estado del servicio, GPU, modelo cargado |
 | `POST` | `/detect` | Recibe imagen → vacas detectadas con bounding boxes |
-| `POST` | `/bcs` | Score BCS entero `1..5` sobre la imagen completa; `503` si no está disponible |
+| `POST` | `/bcs` | Categoría BCS entera `1..5` sobre la imagen completa; `503` si no está disponible |
 | `GET` | `/ready/bcs` | Estado de capacidad BCS sin cargar el checkpoint |
 | `GET` | `/ui` | UI de prueba drag-and-drop (prototipo) |
 | `GET` | `/docs` | Swagger interactivo |
@@ -94,19 +94,19 @@ El servidor levanta en `http://127.0.0.1:8000` con estos endpoints:
 Arrancá la API y abrí `http://127.0.0.1:8000/ui` en el navegador:
 
 ```powershell
-# BCS es opcional; sin esta variable la pestaña BCS muestra "unconfigured".
-# Sólo configurala cuando exista un checkpoint real compatible.
-$env:VACCA_BCS_CHECKPOINT = "C:\secure\models\bcs-ordinal-integer-checkpoint-v1.pt"
+# BCS es opcional; sin estas variables la pestaña BCS muestra "unconfigured".
+# No existe todavía un checkpoint BCS nuevo; mantener la capacidad deshabilitada.
+Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
+Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 .venv\Scripts\python scripts/run_api.py
 ```
 
 Después arrastrá una imagen o seleccioná un archivo. La pestaña `Detect` conserva
 el envío automático y dibuja bounding boxes; la pestaña `BCS` consulta
 `/ready/bcs` al abrirse y sólo envía la imagen a `/bcs` al pulsar `Calculate BCS`.
-El checkpoint BCS real del run local existe sólo como artefacto ignorado: sin
-configuración la UI muestra honestamente `unconfigured` y mantiene el cálculo
-deshabilitado. Las pruebas de API usan un runtime falso controlado; no sustituyen
-la validación operativa del checkpoint local.
+No existe un checkpoint BCS nuevo: sin configuración la UI muestra honestamente
+`unconfigured` y mantiene el cálculo deshabilitado. Las pruebas de API usan un
+runtime falso controlado; no sustituyen la validación operativa de un candidato.
 
 > ⚠ La UI es un prototipo para validación. Para producción, borrá `src/vacca_api/static/index.html` y la ruta `/ui` de `main.py`.
 
@@ -184,32 +184,36 @@ Este helper no inicia FastAPI, no hace HTTP y no verifica `/bcs` ni
 ```
 
 Adjust `MAX_PER_CLASS` in `build_combined_v2.py` when the Phase 1 dataset size must
-change. This path remains separate from the integer BCS pipeline below.
+change. This path remains separate from the BCS category pipeline below.
 
-## Phase 2 — Integer ordinal BCS pipeline
+## Phase 2 — BCS category 1..5 pipeline
 
-The supported workflow has source, deterministic integer snapshot, and ordinal
+The supported workflow has source, deterministic category snapshot, and CORAL
 training stages. The complete command set, preflight, resume rules, live progress,
 and log handling are in the [canonical BCS training runbook](docs/bcs-training-runbook.md).
 
-The local mapping is `3.25/3.5 -> 3` and `3.75/4.0/4.25 -> 4`. Current coverage
-is only `[3,4]`; classes `1`, `2`, and `5` are absent and are not validated. The
-model domain remains integer `1..5`. The optional backend path keeps its separate
-roots and credentials boundary. Unsupported schema or stale lineage is rejected.
+The local mapping is `3.25 -> 1`, `3.5 -> 2`, `3.75 -> 3`, `4.0 -> 4` and
+`4.25 -> 5`. Every train, validation and test partition must contain all five
+categories. Capture groups and digests never cross partitions; unsupported or
+stale lineage is rejected. The retired backend source mode is not available.
 
 ### Serving BCS
 
-Configure the completed local checkpoint only after validating its lineage:
+No configure BCS todavía: no existe un checkpoint nuevo entrenado. La detección
+permanece operativa de forma independiente.
 
 ```powershell
-$env:VACCA_BCS_CHECKPOINT = (Resolve-Path "outputs\bcs-ordinal-local-integer-v1\weights\best.pt").Path
-$env:VACCA_BCS_DEVICE = "cpu" # optional; cpu is the default
+# Fallback seguro mientras BCS siga deshabilitado:
+Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
+Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 .venv\Scripts\python scripts/run_api.py
 ```
 
-The BCS loader is lazy and isolated from `/health` and `/detect`. `/ready/bcs`
-reports readiness without loading; start the API manually only for the serving
-handoff described in [API](docs/api.md).
+El loader BCS es lazy y está aislado de `/health` y `/detect`. `/ready/bcs` informa
+disponibilidad sin cargar el modelo. Sólo configure `VACCA_BCS_CHECKPOINT` y
+`VACCA_BCS_CHECKPOINT_SHA256` después de que un candidato finalizado pase los
+gates y el handoff estricto del runbook. Use el digest exacto reportado por la
+validación; no hay un digest BCS válido hardcodeado en este repositorio.
 
 ## Resultados de entrenamiento
 
@@ -225,39 +229,35 @@ IA/
 ├── src/vacca_api/           ← Microservicio FastAPI
 │   ├── main.py              ← Rutas: /detect, /bcs, /ready/bcs, /health, /ui
 │   ├── detection.py         ← Wrapper YOLO (singleton)
-│   ├── bcs.py               ← Adaptación del score al contrato HTTP
 │   ├── schemas.py           ← Modelos Pydantic
 │   ├── bcs_runtime.py       ← Runtime BCS lazy y estados de readiness
 │   ├── upload_validation.py ← Validación compartida de uploads
 │   └── static/index.html    ← UI de prototipo (descartable)
-├── src/vacca_bcs/           ← Integer ordinal BCS package
-│   ├── constants.py         ← Integer domain and shared constants
-│   ├── dataset.py           ← Integer folder dataset
-│   ├── integer_snapshot.py  ← Snapshot v2 materialization and validation
+├── src/vacca_bcs/           ← BCS category 1..5 package
+│   ├── constants.py         ← Category domain and shared constants
+│   ├── dataset.py           ← Category folder dataset
+│   ├── category_snapshot.py ← Snapshot materialization and validation
 │   ├── model.py             ← ResNet18 + CORAL ordinal model
-│   ├── source_client.py     ← Authenticated source export client
-│   ├── source_plan.py       ← Export normalization
-│   ├── source_split_plan.py ← Deterministic train/validation split
+│   ├── source_plan.py       ← Local source normalization
+│   ├── category_split_plan.py ← Deterministic group-aware split
 │   └── serving.py           ← Validated checkpoint loader and full-image inference
 ├── scripts/
 │   ├── train.py             ← Phase 1 YOLO training
 │   ├── build_combined_v2.py ← Separate Phase 1 combined dataset
-│   ├── build_bcs_integer.py ← Source export to integer snapshot v2
-│   ├── train_bcs_ordinal.py ← Integer ordinal trainer
-│   ├── run_bcs_overnight.py ← Local/backend overnight operator
+│   ├── build_bcs_category.py ← Local source to category snapshot
+│   ├── train_bcs_ordinal.py ← CORAL category trainer
+│   ├── run_bcs_overnight.py ← Local overnight operator
 │   ├── run_baseline.py       ← Reproducible Phase 1 baseline
 │   ├── run_api.py           ← API server launcher
 │   └── smoke_test_api.py    ← Comprobación directa de detector/esquemas
 ├── configs/                 ← YAMLs de entrenamiento
 ├── data/                    ← (gitignored)
 │   ├── bcs/dataset/         ← Local fractional source folders
-│   ├── bcs-local-integer-v1/ ← Local integer snapshot root
-│   ├── bcs-integer-v1/      ← Canonical integer snapshot root
+│   ├── bcs-category-v1/     ← Canonical category snapshot root
 │   ├── combined/            ← Phase 1 dataset v1
 │   └── combined-v2/         ← Phase 1 dataset v2
 ├── outputs/
-│   ├── bcs-ordinal-local-integer-v1/ ← Local trainer root
-│   ├── bcs-ordinal-integer-v1/ ← Canonical integer trainer root
+│   ├── bcs-category-coral-v1/ ← CORAL category trainer root
 │   └── training/             ← Phase 1 training outputs
 ├── models/deploy/           ← Versioned Phase 1 deployment model
 └── PRD.md                   ← Product Requirements Doc

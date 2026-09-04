@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vacca-vision"
 version = "0.1.0"
-description = "Bovine detection API and integer ordinal BCS training and serving"
+description = "Bovine detection API and BCS category 1..5 CORAL training and serving"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
@@ -17,7 +17,6 @@ api = ["fastapi", "python-multipart", "uvicorn"]
 yolo = ["ultralytics==8.4.115"]
 bcs = [
   "PyYAML>=6.0",
-  "requests>=2.34.2,<3",
   "torch>=2.6",
   "torchvision>=0.21",
 ]

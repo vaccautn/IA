@@ -61,7 +61,7 @@ test('valid selection detects automatically and BCS submits the same file as mul
     if (url === '/detect') return response(200, { cow_detected: false, detections: [] });
     if (url === '/ready/bcs') return response(503, readinessCalls++ === 0
       ? { status: 'not_loaded', message: 'configured' } : { status: 'ready', message: 'ready' });
-    return response(200, { status: 'ok', message: 'computed', bcs_score: 4, cow_detected: null });
+    return response(200, { status: 'ok', message: 'computed', bcs_category: 4, cow_detected: null });
   });
   const file = image('new-cow.jpg');
   assert.equal(h.controller.selectFile(file), true);
@@ -74,7 +74,7 @@ test('valid selection detects automatically and BCS submits the same file as mul
   assert.equal(requests.filter(request => request.url === '/bcs').length, 1);
   assert.deepEqual(h.forms.at(-1).entries, [['file', file]]);
   const result = h.events.find(event => event.type === 'bcs-result');
-  assert.equal(result.data.bcs_score, 4);
+  assert.equal(result.data.bcs_category, 4);
   assert.equal(result.data.cow_detected, null);
   assert.equal(h.controller.getState().bcsStatus, 'ready');
 });
@@ -105,7 +105,7 @@ test('invalid reselection invalidates and aborts all old work before showing an 
   assert.equal(await h.controller.calculateBcs(), false);
   oldDetection.resolve(response(200, { cow_detected: false, detections: [] }));
   oldReadiness.resolve(response(200, { status: 'ready', message: 'stale' }));
-  oldBcs.resolve(response(200, { status: 'ok', bcs_score: 5, cow_detected: null }));
+  oldBcs.resolve(response(200, { status: 'ok', bcs_category: 5, cow_detected: null }));
   await flush();
   assert.equal(h.events.some(event => event.type === 'bcs-result'), false);
 });
