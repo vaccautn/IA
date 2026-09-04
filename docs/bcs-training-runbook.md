@@ -1,69 +1,69 @@
-# Runbook BCS category 1..5
+# Guía operativa BCS: categorías 1..5
 
 ## Camino rápido
 
 Desde `IA`, sin iniciar la API:
 
 ```powershell
-# Preflight; no inicia subprocess ni lee imágenes
+# Verificación previa; no inicia subprocesos ni lee imágenes
 .venv\Scripts\python.exe scripts/run_bcs_overnight.py --preflight-only
 
-# Construir el snapshot real y entrenar (requiere autorización explícita)
+# Construir la instantánea real y entrenar (requiere autorización explícita)
 .venv\Scripts\python.exe scripts/run_bcs_overnight.py
 
 # Reanudar una ejecución compatible
 .venv\Scripts\python.exe scripts/run_bcs_overnight.py --skip-build --resume
 ```
 
-El origen inmutable es `data/bcs/dataset`; la migración publica en
+El origen inmutable es `data/bcs/dataset`; la migración publica la instantánea en
 `data/bcs-category-v1` y entrena en `outputs/bcs-category-coral-v1`.
 
 ## Contrato de datos
 
 | Elemento | Contrato |
 |---|---|
-| Mapping | `3.25→1`, `3.5→2`, `3.75→3`, `4.0→4`, `4.25→5` |
+| Mapeo | `3.25→1`, `3.5→2`, `3.75→3`, `4.0→4`, `4.25→5` |
 | Grupos | `GS/YM` por prefijo+serie; `L/R` por índice compartido |
-| Split | Determinístico, group-aware, 80%/10%/10% train/val/test |
-| Integridad | Cinco categorías en cada partición; ningún grupo o digest cruza particiones |
+| División | Determinística, consciente de grupos, 80 %/10 %/10 % entrenamiento/validación/prueba |
+| Integridad | Cinco categorías en cada partición; ningún grupo o hash cruza particiones |
 | Modelo | ResNet18 + CORAL; no se agregan implementaciones CE/regresión |
 
-El trainer exige cobertura completa en train, validation y test. Selecciona `best.pt`
-con validation, lo recarga y valida estrictamente antes de evaluar el test intacto
-una sola vez. Los resultados quedan ligados al checkpoint servido, su época y su
+El entrenador exige cobertura completa en entrenamiento, validación y prueba. Selecciona `best.pt`
+con validación, lo recarga y valida estrictamente antes de evaluar la prueba intacta
+una sola vez. Los resultados quedan ligados al punto de control servido, su época y su
 identidad de selección.
 
-Todavía no existe un run/checkpoint NUEVO: BCS sigue deshabilitado. Un entrenamiento
-exitoso sólo produce un CANDIDATO, nunca aceptación clínica ni de producción. El
-handoff exige estos gates de ingeniería provisionales sobre TEST:
+Todavía no existe una ejecución ni un punto de control NUEVO: BCS sigue deshabilitado. Un entrenamiento
+exitoso sólo produce un CANDIDATO, nunca aceptación clínica ni de producción.
+La entrega exige estos controles de aceptación de ingeniería provisionales sobre PRUEBA (TEST):
 
-| Gate | Umbral |
+| Criterio de aceptación | Umbral |
 |---|---:|
 | Macro-F1 | ≥ 0.75 |
-| Balanced accuracy | ≥ 0.75 |
+| Exactitud balanceada | ≥ 0.75 |
 | F1 de cada categoría | ≥ 0.70 |
-| Within-one de cada categoría | ≥ 0.95 |
+| Tolerancia de una categoría | ≥ 0.95 |
 | Error≥2 de cada categoría | ≤ 0.05 |
 | MAE ordinal global | ≤ 0.35 |
 
-El snapshot contiene 53,558 incluidos y 8 excluidos por
-`cross_category_identical_digest`. El resumen del builder expone conteos por razón;
-inspeccioná `manifest.json` y verificá cada path, categoría y digest antes del handoff.
-La validación integral recorre y hashea todos los archivos del snapshot, por lo que
+La instantánea contiene 53,558 incluidos y 8 puestos en cuarentena por
+`cross_category_identical_digest`. El resumen del constructor expone conteos por razón;
+inspeccione `manifest.json` y verifique cada ruta, categoría y hash antes de la entrega.
+La validación integral recorre y verifica el hash de todos los archivos de la instantánea, por lo que
 debe medirse como una operación completa de aproximadamente 4.4 GB, no omitirse.
 
-## Resume y durabilidad
+## Reanudación y durabilidad
 
-`weights/last.pt` contiene optimizer, RNG y lineage. `best.pt` sólo es una salida
-seleccionada por validation y no se sirve sin el handoff estricto. Resume rechaza
-schema, snapshot, config, runtime, output o lineage incompatibles; conserva
-`results.csv` y sólo admite la ventana final recuperable. Los checkpoints, JSON y
+`weights/last.pt` contiene el optimizador, RNG y trazabilidad. `best.pt` sólo es una salida
+seleccionada por validación y no se sirve sin la entrega estricta. La reanudación rechaza
+esquema, instantánea, configuración, entorno de ejecución, salida o trazabilidad incompatibles; conserva
+`results.csv` y sólo admite la ventana final recuperable. Los puntos de control, JSON y
 CSV se escriben de forma atómica y con flush/fsync.
 
 ### Interrupción y recuperación en Windows
 
 La terminación automática sólo contiene el hijo inmediato; no implementa
-contención del árbol de descendientes. Para recuperar manualmente, inspeccioná
+contención del árbol de descendientes. Para recuperar manualmente, inspeccione
 primero los procesos y sus líneas de comando:
 
 ```powershell
@@ -71,46 +71,47 @@ $processes = @(Get-CimInstance Win32_Process |
   Where-Object { $_.CommandLine -match 'run_bcs_overnight|train_bcs_ordinal|build_bcs_category' })
 $processes | Select-Object ProcessId, ParentProcessId, CommandLine
 
-# Verificá cada línea de comando y anotá los hijos directos del launcher/trainer.
+# Verifique cada línea de comando y anote los hijos directos del script de arranque/entrenador.
 $children = @($processes | Where-Object { $_.ParentProcessId -in @($processes.ProcessId) })
 $children | Select-Object ProcessId, ParentProcessId, CommandLine
 
-# Detené explícitamente hijos primero y luego los procesos principales.
+# Detenga explícitamente los hijos primero y luego los procesos principales.
 $children | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 $processes | Where-Object { $_.ProcessId -notin @($children.ProcessId) } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-# Confirmá que no quedan procesos BCS activos.
+# Confirme que no quedan procesos BCS activos.
 Get-CimInstance Win32_Process |
   Where-Object { $_.CommandLine -match 'run_bcs_overnight|train_bcs_ordinal|build_bcs_category' } |
   Select-Object ProcessId, ParentProcessId, CommandLine
 
-# Preservá y revisá los artefactos antes de reanudar.
+# Preserve y revise los artefactos antes de reanudar.
 Get-ChildItem outputs\bcs-category-coral-v1, logs\bcs-overnight -Recurse -ErrorAction SilentlyContinue
 .venv\Scripts\python.exe scripts/run_bcs_overnight.py --skip-build --resume
 ```
 
-No borres `last.pt`, `results.csv`, `run_info.json` ni `results_lineage.json` antes
-de inspeccionarlos. Si el proceso listado no es parte de esta ejecución, no lo
-detengas.
+No elimine `last.pt`, `results.csv`, `run_info.json` ni `results_lineage.json` antes
+de inspeccionarlos. Si el proceso listado no forma parte de esta ejecución, no lo
+detenga.
 
-La salida conserva progreso `[TRAIN epoch/total batch/total]`, logs en
-`logs/bcs-overnight/<UUID>/` y no inicia el API. La interrupción sólo garantiza
-terminar y reaprovechar el hijo inmediato; no contiene árboles descendientes. El
-runbook exige inspección de procesos en modo lectura, recuperación child-first,
-ningún writer duplicado y reanudación con `--skip-build --resume`.
+La salida conserva progreso `[TRAIN epoch/total batch/total]`, registros en
+`logs/bcs-overnight/<UUID>/` y no inicia la API. La interrupción sólo garantiza
+esperar y recolectar/confirmar la finalización del proceso hijo inmediato; los
+procesos descendientes pueden sobrevivir.
+La guía operativa exige inspección de procesos en modo lectura, recuperación primero de
+los hijos, ningún proceso de escritura duplicado y reanudación con `--skip-build --resume`.
 
-## Handoff al API
+## Entrega a la API
 
 BCS permanece deshabilitado hasta que exista un candidato finalizado que pase los
-gates y el handoff. El checkpoint de rollback anterior fue eliminado por autorización
-del usuario; el fallback seguro es quitar `VACCA_BCS_CHECKPOINT` y
+controles de aceptación y la entrega. El punto de control de reversión anterior fue eliminado por autorización
+del usuario; la alternativa segura es quitar `VACCA_BCS_CHECKPOINT` y
 `VACCA_BCS_CHECKPOINT_SHA256` y dejar BCS no disponible mientras la detección
 continúa operativa.
 
-El overnight imprime y registra el digest SHA-256 exacto del `best.pt` validado.
-Después del handoff, configurá ambas variables con ese valor (el placeholder no
-es un digest válido):
+La ejecución nocturna imprime y registra el hash SHA-256 exacto del `best.pt` validado.
+Después de la entrega, configure ambas variables con ese valor (el valor de reemplazo no
+es un hash válido):
 
 ```powershell
 $env:VACCA_BCS_CHECKPOINT = "outputs\bcs-category-coral-v1\weights\best.pt"

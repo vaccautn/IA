@@ -1,4 +1,4 @@
-# Local BCS category 1..5 CORAL training configuration.
+# Configuración local de entrenamiento CORAL para categorías BCS 1..5.
 data_root: data/bcs-category-v1
 output_dir: outputs/bcs-category-coral-v1
 epochs: 30
@@ -16,7 +16,7 @@ progress_every_batches: 50
 imgsz: 224
 device: auto
 seed: 42
-# Provisional engineering gates only; these are not clinical validation.
+# Sólo controles de aceptación de ingeniería provisionales; no constituyen validación clínica.
 provisional_acceptance_gates:
   macro_f1_min: 0.75
   balanced_accuracy_min: 0.75

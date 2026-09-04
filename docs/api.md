@@ -1,16 +1,16 @@
 # API de detección y BCS
 
 Esta es la guía operativa del servicio FastAPI actual. La detección de Fase 1 y
-el endpoint BCS están implementados, pero son capacidades independientes:
-`/detect` usa el detector YOLO local; `/bcs` usa, bajo demanda, un checkpoint
-ordinal BCS configurado por entorno. No existe un checkpoint NUEVO entrenado para
+el punto de acceso BCS están implementados, pero son capacidades independientes:
+`/detect` usa el detector YOLO local; `/bcs` usa, bajo demanda, un punto de control
+ordinal BCS configurado por entorno. No existe un punto de control NUEVO entrenado para
 la categoría, por lo que BCS permanece deshabilitado y responde `503` sin la
-configuración conjunta del checkpoint y su digest confiable.
+configuración conjunta del punto de control y su hash confiable.
 
 ## Camino rápido
 
 Los siguientes comandos preparan y arrancan el prototipo local. No descargan
-datos BCS ni crean un checkpoint BCS.
+datos BCS ni crean un punto de control BCS.
 
 ```powershell
 python -m venv .venv
@@ -19,16 +19,16 @@ dir outputs\training\combined-v2-finetune\weights\best.pt
 .venv\Scripts\python scripts/run_api.py
 ```
 
-El detector de Fase 1 necesita el output local
-`outputs/training/combined-v2-finetune/weights/best.pt`. Ese archivo no está en
-este checkout; `models/deploy/vacca-yolo26n-v1.pt` es un artefacto versionado,
-pero la API no lo usa como fallback ni lo selecciona por configuración. El
-checkpoint BCS es independiente: la API puede arrancar en modo detección sin
+El detector de Fase 1 necesita la salida local
+`outputs/training/combined-v2-finetune/weights/best.pt`. Ese archivo existe localmente,
+pero Git lo ignora; no está versionado y no se garantiza que exista en otro clon. `models/deploy/vacca-yolo26n-v1.pt` es un artefacto versionado,
+pero la API no lo usa como alternativa ni lo selecciona por configuración.
+El punto de control BCS es independiente: la API puede arrancar en modo detección sin
 `VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256`; BCS permanece
-`unconfigured` hasta configurar explícitamente un checkpoint compatible y aceptado
-junto con su digest exacto.
+`unconfigured` hasta configurar explícitamente un punto de control compatible y aceptado
+junto con su hash exacto.
 
-El launcher acepta:
+El script de arranque acepta:
 
 ```powershell
 .venv\Scripts\python scripts/run_api.py --port 3000
@@ -36,19 +36,19 @@ El launcher acepta:
 .venv\Scripts\python scripts/run_api.py --reload
 ```
 
-El puerto predeterminado es `8000` y el host predeterminado es `127.0.0.1`.
+El puerto predeterminado es `8000` y el equipo anfitrión predeterminado es `127.0.0.1`.
 `--reload` es sólo para desarrollo. La aplicación no implementa autenticación y
 mantiene CORS abierto para el prototipo; revisar ambos límites antes de exponerla.
 
 ## Configuración BCS
 
-El runtime BCS es opcional, aislado y lazy. Sólo se configura cuando existen
+El entorno de ejecución BCS es opcional, aislado y de carga diferida. Sólo se configura cuando existen
 `VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256`; no carga el modelo durante
 la importación ni al consultar `/ready/bcs`. `VACCA_BCS_DEVICE` es opcional y por
 defecto vale `cpu`.
 
-No configure `VACCA_BCS_CHECKPOINT` ni `VACCA_BCS_CHECKPOINT_SHA256` todavía. El
-fallback seguro es:
+No configure `VACCA_BCS_CHECKPOINT` ni `VACCA_BCS_CHECKPOINT_SHA256` todavía. La
+alternativa segura es:
 
 ```powershell
 Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
@@ -56,19 +56,19 @@ Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 .venv\Scripts\python scripts/run_api.py
 ```
 
-Sólo un candidato finalizado que pase los gates provisionales y el handoff estricto
-del runbook puede habilitarse posteriormente.
+Sólo un candidato finalizado que pase los controles de aceptación provisionales y la entrega estricta
+de la guía operativa puede habilitarse posteriormente.
 
-El checkpoint debe tener schema `bcs-category-coral-checkpoint-v1`, dominio
-`bcs-category-1-5-v1`, escala/clases `1..5` y lineage compatible con
-`bcs-category-snapshot-v1`, incluyendo identidad del snapshot, digest del
-manifiesto y `run_id`. Los checkpoints viejos o de otra escala se rechazan.
+El punto de control debe tener el esquema `bcs-category-coral-checkpoint-v1`, dominio
+`bcs-category-1-5-v1`, escala/clases `1..5` y trazabilidad compatible con
+`bcs-category-snapshot-v1`, incluyendo la identidad de la instantánea, el hash del
+manifiesto y `run_id`. Los puntos de control viejos o de otra escala se rechazan.
 La configuración requiere además `VACCA_BCS_CHECKPOINT_SHA256`, que debe ser el
 SHA-256 hexadecimal exacto de 64 caracteres del archivo `best.pt` validado; no se
-acepta sólo la metadata declarada por el checkpoint.
+aceptan únicamente los metadatos declarados por el punto de control.
 
-Después del handoff estricto, configurá ambas variables con el valor exacto
-reportado por el overnight (el placeholder no es un digest válido):
+Después de la entrega estricta, configure ambas variables con el valor exacto
+reportado por la ejecución nocturna (el valor de reemplazo no es un hash válido):
 
 ```powershell
 $env:VACCA_BCS_CHECKPOINT = "outputs\bcs-category-coral-v1\weights\best.pt"
@@ -85,9 +85,9 @@ $env:VACCA_BCS_CHECKPOINT_SHA256 = "<EXACT_SHA256_FROM_OVERNIGHT_VALIDATION>"
 | `GET` | `/ready/bcs` | Ninguna | `BCSReadinessResponse`: 200 sólo en estado `ready`, 503 en otro estado. |
 | `GET` | `/ui` | Ninguna | UI HTML de prototipo; 404 si falta el archivo. |
 
-FastAPI agrega `/docs`, `/redoc` y `/openapi.json`. El OpenAPI declara el body
-exitoso de cada ruta y el body de readiness `503`; los errores de operación
-`/bcs` usan el body estándar de FastAPI `{"detail":"..."}`.
+FastAPI agrega `/docs`, `/redoc` y `/openapi.json`. El OpenAPI declara el cuerpo
+exitoso de cada ruta y el cuerpo de disponibilidad `503`; los errores de operación
+`/bcs` usan el cuerpo estándar de FastAPI `{"detail":"..."}`.
 
 ## UI de prototipo (`GET /ui`)
 
@@ -99,10 +99,10 @@ requiere pulsar `Calculate BCS`. Al seleccionar la pestaña se consulta
 rutas se muestran con mensajes sanitizados y la categoría exitosa se presenta como un
 entero `1..5`, sin confianza; `cow_detected: null` se muestra como `Not reported`.
 
-No existe un checkpoint BCS nuevo del run local. Una ejecución sin
-`VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256` ausentes deben mostrar
-`unconfigured` y no debe interpretarse como una categoría. Configurá ambos sólo
-después del handoff de un candidato que pase los gates; mientras tanto no arranques BCS:
+No existe un punto de control BCS nuevo de la ejecución local. Una ejecución en la que no estén definidas
+`VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256` debe mostrar
+`unconfigured` y no debe interpretarse como una categoría. Configure ambas sólo
+después de la entrega de un candidato que pase los controles de aceptación; mientras tanto no inicie BCS:
 
 ```powershell
 Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
@@ -110,10 +110,10 @@ Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 .venv\Scripts\python scripts/run_api.py
 ```
 
-Abrí luego `http://127.0.0.1:8000/ui`. El runtime falso se usa sólo en las pruebas
+Abra luego `http://127.0.0.1:8000/ui`. El entorno de ejecución falso se usa sólo en las pruebas
 deterministas; no se incluye ni se afirma un modelo BCS real.
 
-`/health` y `/detect` no consultan el runtime BCS. `/bcs` no ejecuta YOLO ni
+`/health` y `/detect` no consultan el entorno de ejecución BCS. `/bcs` no ejecuta YOLO ni
 recorta la imagen: recibe la imagen completa y usa el servicio ordinal.
 
 ## `GET /health`
@@ -148,7 +148,7 @@ archivo no vacío. Los errores son:
 - `400` para MIME no soportado, lectura fallida o archivo vacío.
 - `500` con `{"detail":"Detection failed — check server logs"}` si falla el
   detector o Pillow durante la detección.
-- Un request sin `file` conserva la validación estándar de FastAPI.
+- Una solicitud sin `file` conserva la validación estándar de FastAPI.
 
 Una respuesta exitosa contiene `cow_detected`, `detection_count`, `detections`,
 `image_width`, `image_height` e `inference_time_ms`. Cada detección contiene
@@ -168,21 +168,21 @@ La ruta estima la categoría desde la imagen completa. `BCSResponse` tiene esta 
 ```
 
 Una respuesta HTTP 200 exitosa contiene un entero estricto de
-`1` a `5`; `bcs_category` es obligatorio y no-null. `cow_detected` es siempre `null` en el éxito BCS porque esta ruta no
+`1` a `5`; `bcs_category` es obligatorio y no nulo. `cow_detected` es siempre `null` en el éxito BCS porque esta ruta no
 ejecuta detección. No se expone confianza.
 
-El servicio toma la clase CORAL dura (`1 + cantidad de umbrales superados`) y
+El servicio toma la clase discreta de CORAL (`1 + cantidad de umbrales superados`) y
 publica directamente la categoría discreta. No hay expectativa fraccional ni
-redondeo half-down. Categorías fuera de `1..5` nunca se publican.
+redondeo hacia abajo en empates. Las categorías fuera de `1..5` nunca se publican.
 
-Errores de operación, todos con body estándar `{"detail": "..."}`:
+Errores de operación, todos con cuerpo estándar `{"detail": "..."}`:
 
 | HTTP | `detail` | Causa |
 |---:|---|---|
-| 400 | `File must be an image (JPEG, PNG, etc.)` / `Empty file` / `Failed to read uploaded file` | Validación común del upload. |
+| 400 | `File must be an image (JPEG, PNG, etc.)` / `Empty file` / `Failed to read uploaded file` | Validación común de la carga. |
 | 400 | `BCS image input is invalid` | La carga no es un JPEG/PNG decodificable o viola límites de imagen. |
 | 500 | `BCS inference failed` | El modelo no pudo producir inferencia. |
-| 503 | `BCS capability is unavailable` | Falta el checkpoint, no se pudo cargar o el dispositivo no está disponible. |
+| 503 | `BCS capability is unavailable` | Falta el punto de control, no se pudo cargar o el dispositivo no está disponible. |
 
 Ejemplo de capacidad no configurada: `POST /bcs` devuelve HTTP `503` y
 `{"detail":"BCS capability is unavailable"}`; no devuelve un `BCSResponse`
@@ -190,14 +190,14 @@ exitoso ni una categoría nula como sustituto.
 
 ## `GET /ready/bcs`
 
-Esta ruta inspecciona el estado sin disparar la carga lazy. El body exacto es
+Esta ruta inspecciona el estado sin disparar la carga diferida. El cuerpo exacto es
 `BCSReadinessResponse`:
 
 ```json
 {"status":"unconfigured","message":"BCS capability is not configured."}
 ```
 
-Estados y status HTTP:
+Estados y códigos HTTP:
 
 | Estado | HTTP | Mensaje |
 |---|---:|---|
@@ -206,23 +206,23 @@ Estados y status HTTP:
 | `ready` | 200 | `BCS capability is ready.` |
 | `unavailable` | 503 | `BCS capability is unavailable.` |
 
-## Handoff desde entrenamiento
+## Entrega desde el entrenamiento
 
-La construcción del snapshot, el entrenamiento fresco o reanudado, la validación
-de checkpoints y los logs están documentados únicamente en el [runbook canónico
+La construcción de la instantánea, el entrenamiento fresco o reanudado, la validación
+de puntos de control y los registros están documentados únicamente en la [guía operativa canónica
 de entrenamiento BCS](bcs-training-runbook.md). Esta página se limita a configurar
-el checkpoint y comprobar el serving.
+el punto de control y comprobar el servicio.
 
-## Troubleshooting y verificación
+## Resolución de problemas y verificación
 
-- Confirmá que el output YOLO de Fase 1 existe antes de arrancar la API; el
-  checkpoint BCS sólo es necesario para habilitar esa capacidad opcional.
-- Consultá `/ready/bcs` para distinguir `unconfigured`, `not_loaded`, `ready` y
+- Confirme que la salida YOLO de Fase 1 existe antes de iniciar la API; el
+  punto de control BCS sólo es necesario para habilitar esa capacidad opcional.
+- Consulte `/ready/bcs` para distinguir `unconfigured`, `not_loaded`, `ready` y
   `unavailable` sin forzar la carga.
-- Si `/bcs` devuelve `503`, no lo interpretes como categoría: falta una capacidad
+- Si `/bcs` devuelve `503`, no lo interprete como categoría: falta una capacidad
   BCS operable.
-- Usá `file` como nombre exacto del campo multipart.
-- Ejecutá la suite con `.venv\Scripts\python.exe -m pytest -q`.
+- Use `file` como nombre exacto del campo multipart.
+- Ejecute la suite con `.venv\Scripts\python.exe -m pytest -q`.
 
-La verificación de entrenamiento y del proyecto se mantiene en el runbook y en el
+La verificación de entrenamiento y del proyecto se mantiene en la guía operativa y en el
 estado del repositorio; esta página no duplica esos comandos.

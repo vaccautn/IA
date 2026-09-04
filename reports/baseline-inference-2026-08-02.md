@@ -1,66 +1,66 @@
-# Real CPU baseline inference
+# Línea base real de inferencia en CPU
 
-The verified `yolo26n` release asset completed two real inference runs after the baseline integrity hardening. Both runs passed through the manifest gates, immutable `ValidatedImage` snapshot, `UltralyticsDetector`, and `AptitudePipeline`. They produced the same semantic result: one `cow`, accepted by the aptitude rules.
+El artefacto de lanzamiento verificado `yolo26n` completó dos ejecuciones reales de inferencia después del refuerzo de integridad de la línea base. Ambas ejecuciones atravesaron los controles de aceptación del manifiesto, la instantánea inmutable `ValidatedImage`, `UltralyticsDetector` y `AptitudePipeline`. Produjeron el mismo resultado semántico: una `cow`, aceptada por las reglas de aptitud.
 
-## Environment
+## Entorno
 
-| Item | Verified value |
+| Elemento | Valor verificado |
 |---|---|
-| Platform | Windows x64 |
+| Plataforma | Windows x64 |
 | Python | 3.13.5 |
 | PyTorch | 2.13.0+cpu |
 | TorchVision | 0.28.0+cpu |
 | Ultralytics | 8.4.115 |
 | Setuptools | 80.9.0 |
-| Device | CPU |
-| CUDA available | `false` |
-| Administrator process | `false` |
-| Initial available memory | 2.25 GiB |
-| Initial free disk | 114.13 GiB |
+| Dispositivo | CPU |
+| CUDA disponible | `false` |
+| Proceso administrador | `false` |
+| Memoria disponible inicial | 2.25 GiB |
+| Espacio libre inicial en disco | 114.13 GiB |
 
-Installation used the official PyTorch CPU index for the `+cpu` wheels and PyPI for the remaining packages. `pip check` reported no broken requirements. `requirements-cpu.txt` pins every dependency with the SHA-256 of its Windows x64 / CPython 3.13 wheel and contains no local paths.
+La instalación utilizó el índice oficial de CPU de PyTorch para los paquetes binarios `+cpu` y PyPI para los paquetes restantes. `pip check` no informó requisitos rotos. `requirements-cpu.txt` fija cada dependencia con el SHA-256 de su paquete binario para Windows x64 / CPython 3.13 y no contiene rutas locales.
 
-## Provenance and licensing
+## Procedencia y licencias
 
-| Artifact | Source and evidence |
+| Artefacto | Fuente y evidencia |
 |---|---|
-| Model | Ultralytics `v8.4.0` release asset, `yolo26n.pt`, 5,544,453 bytes, SHA-256 `9b09cc8bf347f0fc8a5f7657480587f25db09b34bf33b0652110fb03a8ad4fef` |
-| Model license | AGPL-3.0 baseline; repository `LICENSE` and public-repository constraint apply |
-| Fixture | Wikimedia Commons revision `1202221419`, USDA ARS image by Keith Weller, `PD-USGov-USDA-ARS` |
-| Fixture evidence | 908,691 bytes, SHA-256 `e0972384d3151174d1450cff81bb19d1fc89519a5d1f6fc7ade5d710a89e56d8` |
+| Modelo | Artefacto de lanzamiento de Ultralytics `v8.4.0`, `yolo26n.pt`, 5,544,453 bytes, SHA-256 `9b09cc8bf347f0fc8a5f7657480587f25db09b34bf33b0652110fb03a8ad4fef` |
+| Licencia del modelo | AGPL-3.0 para la línea base; aplican `LICENSE` y la restricción de repositorio público |
+| Archivo de prueba | Revisión `1202221419` de Wikimedia Commons, imagen de USDA ARS por Keith Weller, `PD-USGov-USDA-ARS` |
+| Evidencia del archivo de prueba | 908,691 bytes, SHA-256 `e0972384d3151174d1450cff81bb19d1fc89519a5d1f6fc7ade5d710a89e56d8` |
 
-The `.pt` file was loaded only after exact size and digest verification. The fixture digest and size were checked against the same immutable byte snapshot used for inference, before detector construction. The release provides no independent signature, and a matching digest does not make an unknown source trustworthy. The deploy model, fixture, baseline manifest, and this report are intentionally versioned reproducibility/deployment artifacts. Generated reports, checkpoints, datasets, runs, outputs, and local weights remain Git-ignored.
+El archivo `.pt` se cargó únicamente después de verificar su tamaño y hash exactos. El hash y el tamaño del archivo de prueba se comprobaron contra la misma instantánea inmutable de bytes utilizada para la inferencia, antes de construir el detector. El lanzamiento no proporciona una firma independiente, y un hash coincidente no convierte en confiable una fuente desconocida. El modelo de despliegue, el archivo de prueba, el manifiesto de la línea base y este reporte son artefactos versionados de reproducibilidad y despliegue. Los reportes generados, puntos de control, conjuntos de datos, ejecuciones, salidas y pesos locales permanecen ignorados por Git.
 
-## Command
+## Comandos
 
 ```bash
 .venv/Scripts/python scripts/run_baseline.py --output outputs/baseline/hardened-run-1.json
 .venv/Scripts/python scripts/run_baseline.py --output outputs/baseline/hardened-run-2.json
 ```
 
-Default thresholds came from `configs/baseline_manifest.json`: model and pipeline confidence `0.25`, minimum relative area `0.10`, border margin `0.02`, framing enabled, and input size `640`. They were selected before observing the result and were not altered to force acceptance.
+Los umbrales predeterminados provinieron de `configs/baseline_manifest.json`: confianza del modelo y del flujo `0.25`, área relativa mínima `0.10`, margen del borde `0.02`, encuadre habilitado y tamaño de entrada `640`. Se seleccionaron antes de observar el resultado y no se modificaron para forzar la aceptación.
 
-## Real result
+## Resultado real
 
-| Field | Run 1 | Run 2 |
+| Campo | Ejecución 1 | Ejecución 2 |
 |---|---:|---:|
-| Status | `ACCEPTED` | `ACCEPTED` |
-| Reason | `null` | `null` |
-| Animal count | 1 | 1 |
-| Class | `cow` (`class_id=19`) | `cow` (`class_id=19`) |
-| Confidence | 0.9302085042 | 0.9302085042 |
-| Relative area | 0.4235123662 | 0.4235123662 |
-| Bounding box | `[514.3575, 208.7596, 2278.6560, 1377.3263]` | same |
-| Inference time | 104.4384 ms | 104.5472 ms |
-| Adapter total time | 240.7501 ms | 284.1143 ms |
+| Estado | `ACCEPTED` | `ACCEPTED` |
+| Motivo | `null` | `null` |
+| Cantidad de animales | 1 | 1 |
+| Clase | `cow` (`class_id=19`) | `cow` (`class_id=19`) |
+| Confianza | 0.9302085042 | 0.9302085042 |
+| Área relativa | 0.4235123662 | 0.4235123662 |
+| Caja delimitadora | `[514.3575, 208.7596, 2278.6560, 1377.3263]` | igual |
+| Tiempo de inferencia | 104.4384 ms | 104.5472 ms |
+| Tiempo total del adaptador | 240.7501 ms | 284.1143 ms |
 
-Semantic payloads were exactly equal after removing only the timing object.
+Las cargas semánticas fueron exactamente iguales después de quitar únicamente el objeto de tiempos.
 
-## Limitations and next step
+## Limitaciones y próximo paso
 
-- This is one public fixture, not a model-quality evaluation.
-- `yolo26n` is a generic pretrained COCO detector, not a VACCA-trained model.
-- CPU timing is exploratory and has no production SLA.
-- Dataset provenance, splits, annotation policy, and model evaluation remain pending.
+- Este es un único archivo de prueba público, no una evaluación de calidad del modelo.
+- `yolo26n` es un detector COCO genérico preentrenado, no un modelo entrenado por VACCA.
+- Los tiempos en CPU son exploratorios y no tienen un SLA de producción.
+- La procedencia del conjunto de datos, las divisiones, la política de anotación y la evaluación del modelo siguen pendientes.
 
-Next, assemble a small licensed evaluation set containing zero, one, and multiple bovines and run the unchanged manifest-driven pipeline over it before any training decision.
+Como próximo paso, se debe reunir un conjunto de evaluación pequeño y licenciado que contenga cero, uno y múltiples bovinos, y ejecutar sobre él el flujo sin cambios dirigido por el manifiesto antes de tomar cualquier decisión de entrenamiento.
