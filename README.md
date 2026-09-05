@@ -10,15 +10,18 @@ Microservicio de detección de bovinos con YOLO26n ajustado finamente sobre Navi
 - [API](docs/api.md): servicio, contratos actuales y resolución de problemas.
 - [Guía operativa de entrenamiento BCS](docs/bcs-training-runbook.md): ejecución nueva,
   reanudación, progreso, registros y entrega a la API.
+- [Reporte de línea base BCS del 4 de septiembre de 2026](reports/bcs-category-baseline-2026-09-04.md):
+  candidato rechazado y métricas de aceptación.
 
 ## Estado actual
 
 La detección de Fase 1 mantiene un camino local de prototipo. El flujo de fuente a
 instantánea, el núcleo ordinal BCS, el entrenador y el servicio BCS están implementados
-y cubiertos por pruebas deterministas. No existe una ejecución ni un punto de control NUEVO
-entrenado para la categoría; BCS permanece deshabilitado hasta que un candidato
-pase los controles de aceptación de ingeniería provisionales. El reporte anterior está archivado en
-`reports/historical/obsolete-bcs-integer-baseline-2026-09-02.md`.
+y cubiertos por pruebas deterministas. La ejecución del 4 de septiembre produjo un
+candidato, pero falló los seis controles de aceptación de ingeniería provisionales;
+BCS permanece deshabilitado y el candidato no está aprobado para serving. Consulte el
+[reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md). El reporte anterior
+está archivado en `reports/historical/obsolete-bcs-integer-baseline-2026-09-02.md`.
 
 ## Requisitos
 
@@ -97,7 +100,7 @@ Inicie la API y abra `http://127.0.0.1:8000/ui` en el navegador:
 
 ```powershell
 # BCS es opcional; sin estas variables la pestaña BCS muestra "unconfigured".
-# No existe todavía un punto de control BCS nuevo; mantener la capacidad deshabilitada.
+# El candidato local falló los controles de aceptación; mantener la capacidad deshabilitada.
 Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
 Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 .venv\Scripts\python scripts/run_api.py
@@ -106,9 +109,11 @@ Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 Después, arrastre una imagen o seleccione un archivo. La pestaña `Detect` conserva
 el envío automático y dibuja cajas delimitadoras; la pestaña `BCS` consulta
 `/ready/bcs` al abrirse y sólo envía la imagen a `/bcs` al pulsar `Calculate BCS`.
-No existe un punto de control BCS nuevo: sin configuración la UI muestra honestamente
-`unconfigured` y mantiene el cálculo deshabilitado. Las pruebas de API usan un
-entorno de ejecución falso controlado; no sustituyen la validación operativa de un candidato.
+La ejecución local produjo un candidato, pero falló los controles de aceptación: sin
+configuración la UI muestra honestamente `unconfigured` y mantiene el cálculo
+deshabilitado. Consulte el [reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md).
+Las pruebas de API usan un entorno de ejecución falso controlado; no sustituyen la
+validación operativa de un candidato.
 
 > ⚠ La UI es un prototipo para validación. Para producción, elimine `src/vacca_api/static/index.html` y la ruta `/ui` de `main.py`.
 
@@ -204,8 +209,9 @@ no está disponible.
 
 ### Servicio de BCS
 
-No configure BCS todavía: no existe un punto de control nuevo entrenado. La detección
-permanece operativa de forma independiente.
+No configure BCS: existe un candidato nuevo, pero fue rechazado al fallar los controles
+de aceptación. La detección permanece operativa de forma independiente. Consulte el
+[reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md).
 
 ```powershell
 # Alternativa segura mientras BCS siga deshabilitado:

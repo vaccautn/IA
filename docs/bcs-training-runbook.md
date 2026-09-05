@@ -33,8 +33,10 @@ con validación, lo recarga y valida estrictamente antes de evaluar la prueba in
 una sola vez. Los resultados quedan ligados al punto de control servido, su época y su
 identidad de selección.
 
-Todavía no existe una ejecución ni un punto de control NUEVO: BCS sigue deshabilitado. Un entrenamiento
-exitoso sólo produce un CANDIDATO, nunca aceptación clínica ni de producción.
+La ejecución local del 4 de septiembre produjo un punto de control candidato, pero falló
+los seis controles de aceptación provisionales; BCS sigue deshabilitado. Un entrenamiento
+exitoso sólo produce un CANDIDATO, nunca aceptación clínica ni de producción. Consulte el
+[reporte de la ejecución](../reports/bcs-category-baseline-2026-09-04.md).
 La entrega exige estos controles de aceptación de ingeniería provisionales sobre PRUEBA (TEST):
 
 | Criterio de aceptación | Umbral |
@@ -103,8 +105,9 @@ los hijos, ningún proceso de escritura duplicado y reanudación con `--skip-bui
 
 ## Entrega a la API
 
-BCS permanece deshabilitado hasta que exista un candidato finalizado que pase los
-controles de aceptación y la entrega. El punto de control de reversión anterior fue eliminado por autorización
+BCS permanece deshabilitado porque el candidato finalizado no pasó los controles de
+aceptación; sólo un candidato que los supere y complete la entrega puede habilitarlo.
+El punto de control de reversión anterior fue eliminado por autorización
 del usuario; la alternativa segura es quitar `VACCA_BCS_CHECKPOINT` y
 `VACCA_BCS_CHECKPOINT_SHA256` y dejar BCS no disponible mientras la detección
 continúa operativa.

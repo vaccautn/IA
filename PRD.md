@@ -15,8 +15,10 @@
 > `data/bcs-category-v1`. Los ocho duplicados idénticos entre categorías fueron
 > puestos en cuarentena sin recategorización. El flujo local de categorías es el camino vigente;
 > el camino anterior de ingesta y exportación de la fuente BCS del componente de servidor fue eliminado.
-> Todavía no existe un punto de control BCS nuevo; consulte
-> `docs/estado-del-repositorio.md` para el estado operativo.
+> La ejecución local del 4 de septiembre produjo un candidato, pero falló los seis
+> controles de aceptación de ingeniería provisionales; BCS permanece deshabilitado y
+> el candidato no está aprobado para serving. Consulte el [reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md)
+> y `docs/estado-del-repositorio.md` para el estado operativo.
 
 ## 1. Resumen ejecutivo
 

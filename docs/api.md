@@ -3,9 +3,10 @@
 Esta es la guía operativa del servicio FastAPI actual. La detección de Fase 1 y
 el punto de acceso BCS están implementados, pero son capacidades independientes:
 `/detect` usa el detector YOLO local; `/bcs` usa, bajo demanda, un punto de control
-ordinal BCS configurado por entorno. No existe un punto de control NUEVO entrenado para
-la categoría, por lo que BCS permanece deshabilitado y responde `503` sin la
-configuración conjunta del punto de control y su hash confiable.
+ordinal BCS configurado por entorno. Existe un punto de control nuevo asociado a una
+ejecución local, pero el candidato falló los seis controles de aceptación de ingeniería;
+BCS permanece deshabilitado y responde `503` mientras no exista una configuración conjunta
+de un candidato aprobado y su hash confiable. Consulte el [reporte de la ejecución](../reports/bcs-category-baseline-2026-09-04.md).
 
 ## Camino rápido
 
@@ -47,8 +48,8 @@ El entorno de ejecución BCS es opcional, aislado y de carga diferida. Sólo se 
 la importación ni al consultar `/ready/bcs`. `VACCA_BCS_DEVICE` es opcional y por
 defecto vale `cpu`.
 
-No configure `VACCA_BCS_CHECKPOINT` ni `VACCA_BCS_CHECKPOINT_SHA256` todavía. La
-alternativa segura es:
+No configure `VACCA_BCS_CHECKPOINT` ni `VACCA_BCS_CHECKPOINT_SHA256`: el candidato
+local falló los controles de aceptación. La alternativa segura es:
 
 ```powershell
 Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
@@ -99,8 +100,9 @@ requiere pulsar `Calculate BCS`. Al seleccionar la pestaña se consulta
 rutas se muestran con mensajes sanitizados y la categoría exitosa se presenta como un
 entero `1..5`, sin confianza; `cow_detected: null` se muestra como `Not reported`.
 
-No existe un punto de control BCS nuevo de la ejecución local. Una ejecución en la que no estén definidas
-`VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256` debe mostrar
+La ejecución local produjo un candidato, pero fue rechazada al fallar los controles de
+aceptación. Una ejecución en la que no estén definidas `VACCA_BCS_CHECKPOINT` y
+`VACCA_BCS_CHECKPOINT_SHA256` debe mostrar
 `unconfigured` y no debe interpretarse como una categoría. Configure ambas sólo
 después de la entrega de un candidato que pase los controles de aceptación; mientras tanto no inicie BCS:
 
@@ -111,7 +113,7 @@ Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 ```
 
 Abra luego `http://127.0.0.1:8000/ui`. El entorno de ejecución falso se usa sólo en las pruebas
-deterministas; no se incluye ni se afirma un modelo BCS real.
+deterministas; no sustituye la validación del candidato documentado en el [reporte de la ejecución](../reports/bcs-category-baseline-2026-09-04.md).
 
 `/health` y `/detect` no consultan el entorno de ejecución BCS. `/bcs` no ejecuta YOLO ni
 recorta la imagen: recibe la imagen completa y usa el servicio ordinal.
