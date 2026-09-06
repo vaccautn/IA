@@ -14,13 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from vacca_vision import (  # noqa: E402
     AptitudePipeline,
     ClassificationConfig,
-    ImageMetadata,
     ModelIdentity,
     Status,
     UltralyticsAdapterError,
     UltralyticsDependencyError,
     UltralyticsDetector,
-    ValidatedImage,
     validate_image,
 )
 
