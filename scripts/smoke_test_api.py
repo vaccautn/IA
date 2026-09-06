@@ -1,4 +1,4 @@
-"""Run a local VACCA API startup/model-load smoke test without a server."""
+"""Run VACCA API lifespan/ASGI checks with optional live HTTP validation."""
 from __future__ import annotations
 
 import argparse
@@ -27,11 +27,11 @@ from vacca_api.schemas import DetectResponse, HealthResponse  # noqa: E402
 
 logger = logging.getLogger(__name__)
 LIVE_DETECT_INVALID_DETAIL = "File must be an image (JPEG or PNG)"
+LIVE_INVALID_IMAGE_DETAIL = "Image file cannot be decoded safely"
 
 
 class SmokeCheckError(RuntimeError):
     """Raised when a smoke-test response or transport is not usable."""
-
 
 def _validate_health(status_code: int, body: object) -> HealthResponse:
     if status_code != 200:
@@ -140,11 +140,17 @@ async def _request_inference(filename: str, image_bytes: bytes) -> dict[str, obj
     return response.model_dump()
 
 
-async def _asgi_request(method: str, path: str) -> tuple[int, object]:
+async def _asgi_request(
+    method: str,
+    path: str,
+    *,
+    body: bytes = b"",
+    headers: dict[str, str] | None = None,
+) -> tuple[int, object]:
     messages: list[dict[str, object]] = []
 
     async def receive() -> dict[str, object]:
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": body, "more_body": False}
 
     async def send(message: dict[str, object]) -> None:
         messages.append(message)
@@ -159,7 +165,10 @@ async def _asgi_request(method: str, path: str) -> tuple[int, object]:
             "path": path,
             "raw_path": path.encode("ascii"),
             "query_string": b"",
-            "headers": [],
+            "headers": [
+                (name.lower().encode("latin-1"), value.encode("latin-1"))
+                for name, value in (headers or {}).items()
+            ],
             "client": ("smoke-test", 0),
             "server": ("testserver", 80),
             "root_path": "",
@@ -262,6 +271,25 @@ def _run_live(
             logger.error("Live detection smoke check failed: %s", type(exc).__name__)
             return 1
         logger.info("Live /detect invalid-input contract passed")
+        try:
+            body = _multipart_body("invalid.jpg", b"not a JPEG", "image/jpeg")
+            status_code, response_body = _request_json(
+                f"{base_url}/bcs",
+                method="POST",
+                body=body,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={_BOUNDARY.decode()}"
+                },
+                timeout=timeout,
+            )
+            if status_code != 400 or not isinstance(response_body, dict):
+                raise SmokeCheckError("bcs invalid-image contract failed")
+            if response_body.get("detail") != LIVE_INVALID_IMAGE_DETAIL:
+                raise SmokeCheckError("bcs invalid-image detail is malformed")
+        except Exception as exc:
+            logger.error("Live BCS smoke check failed: %s", type(exc).__name__)
+            return 1
+        logger.info("Live /bcs invalid-image contract passed")
 
     logger.info("Live health and backend-path smoke checks passed")
     return 0

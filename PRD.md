@@ -1,7 +1,7 @@
 # PRD — Prototipo Fase 1 de Visión por Computadora para VACCA
 
 **Producto:** VACCA  
-**Documento:** Product Requirements Document (PRD)  
+**Documento:** Documento de requisitos del producto (PRD)
 **Versión:** 1.0  
 **Estado:** Borrador para revisión del equipo  
 **Fecha:** 2 de agosto de 2026  
@@ -9,13 +9,24 @@
 
 ---
 
+> **Estado actual:** Este PRD conserva la intención de producto y el alcance de la
+> Fase 1. La implementación vigente usa únicamente la fuente local para una
+> categoría BCS pública `1..5`, con la instantánea construida en
+> `data/bcs-category-v1`. Los ocho duplicados idénticos entre categorías fueron
+> puestos en cuarentena sin recategorización. El flujo local de categorías es el camino vigente;
+> el camino anterior de ingesta y exportación de la fuente BCS del componente de servidor fue eliminado.
+> La ejecución local del 4 de septiembre produjo un candidato, pero falló los seis
+> controles de aceptación de ingeniería provisionales; BCS permanece deshabilitado y
+> el candidato no está aprobado para serving. Consulte el [reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md)
+> y `docs/estado-del-repositorio.md` para el estado operativo.
+
 ## 1. Resumen ejecutivo
 
 VACCA es un sistema orientado al monitoreo de la condición corporal del ganado bovino mediante imágenes y, en etapas posteriores, video. La primera fase del componente de inteligencia artificial consiste en desarrollar un prototipo independiente capaz de analizar una imagen estática y determinar si contiene exactamente un bovino apto para continuar con el procesamiento.
 
 Este prototipo no inferirá todavía la condición corporal. Su propósito es resolver la etapa previa y obligatoria del flujo: detectar al animal, localizarlo mediante una caja delimitadora y rechazar imágenes que no cumplan condiciones mínimas para su utilización posterior.
 
-El prototipo será desarrollado desde cero como un módulo experimental desacoplado del backend actual de VACCA. Deberá permitir entrenar, validar y ejecutar al menos un modelo de detección de objetos utilizando un dataset bovino propio o adaptado. También deberá producir resultados trazables y reutilizables para una integración futura con el sistema principal.
+El prototipo será desarrollado desde cero como un módulo experimental desacoplado del componente de servidor actual de VACCA. Deberá permitir entrenar, validar y ejecutar al menos un modelo de detección de objetos utilizando un conjunto de datos bovino propio o adaptado. También deberá producir resultados trazables y reutilizables para una integración futura con el sistema principal.
 
 ---
 
@@ -25,7 +36,7 @@ La planificación del proyecto define una fase específica para identificar vaca
 
 Esta fase es necesaria porque un modelo de condición corporal no debería recibir cualquier imagen. Antes de inferir un valor nutricional, el sistema debe comprobar que la captura sea suficientemente consistente y que corresponda a un único animal.
 
-El prototipo funcionará como prueba técnica de viabilidad y como base para seleccionar y consolidar el stack tecnológico definitivo del módulo de visión por computadora.
+El prototipo funcionará como prueba técnica de viabilidad y como base para seleccionar y consolidar la pila tecnológica definitiva del módulo de visión por computadora.
 
 ---
 
@@ -56,7 +67,7 @@ El prototipo debe permitir demostrar que el equipo puede completar el flujo bás
 
 ## 5. Objetivos específicos
 
-1. Construir o adaptar un dataset inicial de imágenes bovinas.
+1. Construir o adaptar un conjunto de datos inicial de imágenes bovinas.
 2. Definir un protocolo de anotación consistente.
 3. Entrenar un modelo de detección de objetos mediante transferencia de aprendizaje.
 4. Detectar la clase `cow` o `bovine` en imágenes estáticas.
@@ -78,7 +89,7 @@ El prototipo debe permitir demostrar que el equipo puede completar el flujo bás
 - Procesamiento de imágenes estáticas.
 - Detección de bovinos.
 - Una única clase de interés: bovino.
-- Anotaciones mediante *bounding boxes*.
+- Anotaciones mediante *cajas delimitadoras*.
 - Entrenamiento con un modelo preentrenado.
 - Evaluación sobre conjuntos separados de entrenamiento, validación y prueba.
 - Conteo de animales detectados.
@@ -87,7 +98,7 @@ El prototipo debe permitir demostrar que el equipo puede completar el flujo bás
 - Validación básica de confianza, tamaño relativo del animal y encuadre.
 - Visualización de la imagen con la detección superpuesta.
 - Registro de latencia y métricas de detección.
-- Ejecución local mediante línea de comandos, notebook, interfaz sencilla o API.
+- Ejecución local mediante línea de comandos, cuaderno interactivo, interfaz sencilla o API.
 - Documentación del proceso de entrenamiento y ejecución.
 
 ### 6.2 Fuera de alcance
@@ -98,8 +109,8 @@ El prototipo debe permitir demostrar que el equipo puede completar el flujo bás
 - Reconocimiento de la caravana en la imagen.
 - Procesamiento completo de video.
 - Seguimiento de animales entre fotogramas.
-- Selección automática del mejor frame de un video.
-- Integración definitiva con el backend productivo de VACCA.
+- Selección automática del mejor fotograma de un video.
+- Integración definitiva con el componente de servidor de producción de VACCA.
 - Aplicación móvil.
 - Operación en tiempo real en la manga.
 - Segmentación precisa de la silueta.
@@ -122,7 +133,7 @@ En la versión final de VACCA, el productor cargará una imagen y recibirá una 
 
 Utilizará el prototipo para:
 
-- preparar el dataset;
+- preparar el conjunto de datos;
 - entrenar modelos;
 - ejecutar pruebas;
 - revisar errores;
@@ -134,7 +145,7 @@ Utilizará el prototipo para:
 
 - Referente del INTA.
 - Equipo docente evaluador.
-- Responsables del backend.
+- Responsables del componente de servidor.
 - Responsables del módulo de IA.
 - Responsables futuros de infraestructura y captura en campo.
 
@@ -145,9 +156,9 @@ Utilizará el prototipo para:
 - El equipo tendrá acceso a una cantidad inicial de imágenes bovinas.
 - Las imágenes podrán ser anotadas manualmente.
 - Se utilizará transferencia de aprendizaje sobre pesos preentrenados.
-- Durante el prototipo se aceptará ejecución local o en un entorno de notebook con GPU.
+- Durante el prototipo se aceptará ejecución local o en un entorno de cuaderno interactivo con GPU.
 - El objetivo inicial será detectar bovinos, no diferenciar razas, sexo ni identidad.
-- El dataset inicial puede ser limitado, por lo que los resultados no representarán todavía rendimiento productivo.
+- El conjunto de datos inicial puede ser limitado, por lo que los resultados no representarán todavía rendimiento productivo.
 - Las imágenes de prueba deberán mantenerse separadas de las utilizadas para entrenar.
 - Se intentará evitar que imágenes del mismo animal o de la misma secuencia aparezcan en conjuntos diferentes.
 
@@ -160,7 +171,7 @@ El prototipo permitirá:
 - validar si la detección automática de bovinos es viable con los datos disponibles;
 - reducir el riesgo antes de abordar la inferencia de condición corporal;
 - establecer un flujo reproducible de anotación, entrenamiento y evaluación;
-- detectar tempranamente problemas del dataset;
+- detectar tempranamente problemas del conjunto de datos;
 - definir reglas de aceptación de imágenes;
 - producir un componente desacoplado y posteriormente integrable;
 - brindar evidencia técnica para justificar la elección del stack de IA.
@@ -377,7 +388,7 @@ El sistema deberá registrar errores de carga, preprocesamiento e inferencia sin
 - Las dependencias deberán estar declaradas.
 - Las configuraciones de entrenamiento deberán versionarse.
 - Las semillas aleatorias deberán registrarse cuando sea posible.
-- Los pesos generados deberán asociarse a una configuración y una versión del dataset.
+- Los pesos generados deberán asociarse a una configuración y una versión del conjunto de datos.
 
 ### 13.2 Mantenibilidad
 
@@ -415,12 +426,12 @@ Cada ejecución relevante deberá registrar:
 
 - Las imágenes no deberán publicarse automáticamente.
 - El prototipo no deberá exponer credenciales.
-- Los datasets privados deberán permanecer en almacenamiento controlado.
+- Los conjuntos de datos privados deberán permanecer en almacenamiento controlado.
 - Si se utilizan imágenes externas, deberá documentarse su origen y licencia.
 
 ---
 
-## 14. Dataset
+## 14. Conjunto de datos
 
 ### 14.1 Unidad de dato
 
@@ -441,7 +452,7 @@ bovine
 
 No se diferenciarán razas, edades, sexos ni individuos.
 
-### 14.3 Casos que debe contener el dataset
+### 14.3 Casos que debe contener el conjunto de datos
 
 - Un bovino visible y correctamente encuadrado.
 - Bovinos de diferentes colores y razas.
@@ -464,7 +475,7 @@ No se diferenciarán razas, edades, sexos ni individuos.
 
 ### 14.5 Separación de datos
 
-El dataset se dividirá en:
+El conjunto de datos se dividirá en:
 
 - entrenamiento;
 - validación;
@@ -478,22 +489,22 @@ No se deberá dividir aleatoriamente por imagen cuando varias imágenes provenga
 
 ---
 
-## 15. Stack tecnológico propuesto
+## 15. Pila tecnológica propuesta
 
-La selección definitiva podrá cambiar como resultado de la Spike. Para el primer prototipo se propone una combinación simple y de bajo costo operativo.
+La selección definitiva podrá cambiar como resultado de la prueba exploratoria. Para el primer prototipo se propone una combinación simple y de bajo costo operativo.
 
 ### 15.1 Lenguaje
 
-**Python 3.11 o versión compatible con el framework seleccionado.**
+**CPython 3.13 (`>=3.13,<3.14`).**
 
 Motivos:
 
 - ecosistema dominante en visión por computadora;
 - compatibilidad con PyTorch;
-- facilidad para crear notebooks y APIs;
-- integración natural con el backend FastAPI de VACCA.
+- facilidad para crear cuadernos interactivos y APIs;
+- integración natural con el componente de servidor FastAPI de VACCA.
 
-### 15.2 Framework de entrenamiento
+### 15.2 Marco de trabajo de entrenamiento
 
 El prototipo podrá utilizar una de las siguientes alternativas:
 
@@ -509,7 +520,7 @@ Para una primera implementación desde cero se recomienda comenzar con Ultralyti
 
 ### 15.4 Anotación
 
-**CVAT**, exportando preferentemente a COCO para mantener el dataset reutilizable.
+**CVAT**, exportando preferentemente a COCO para mantener el conjunto de datos reutilizable.
 
 ### 15.5 Procesamiento de imágenes
 
@@ -523,14 +534,14 @@ En el prototipo mínimo se podrá comenzar con archivos JSON, CSV y carpetas ord
 
 ### 15.7 Versionado de datos
 
-Git para código y configuraciones. DVC es recomendado si el dataset comienza a cambiar con frecuencia o debe compartirse entre integrantes.
+Git para código y configuraciones. DVC es recomendado si el conjunto de datos comienza a cambiar con frecuencia o debe compartirse entre integrantes.
 
 ### 15.8 Interfaz del prototipo
 
 Una de las siguientes opciones:
 
 1. CLI para procesamiento individual y por lotes.
-2. Notebook para entrenamiento y análisis.
+2. Cuaderno interactivo para entrenamiento y análisis.
 3. Streamlit o Gradio para demostración visual.
 4. FastAPI para probar el contrato de integración futura.
 
@@ -686,7 +697,7 @@ vacca-vision-prototype/
 ### 19.1 Métricas del modelo
 
 - Precisión.
-- Recall.
+- Exhaustividad (recall).
 - F1-score.
 - AP para la clase bovino.
 - mAP@0.50.
@@ -711,9 +722,9 @@ vacca-vision-prototype/
 
 ### 19.4 Metas del prototipo
 
-Las metas definitivas deberán fijarse después de conocer el dataset. Como criterios iniciales de salida de la Spike se propone:
+Las metas definitivas deberán fijarse después de conocer el conjunto de datos. Como criterios iniciales de salida de la prueba exploratoria se propone:
 
-- el pipeline procesa imágenes individuales de principio a fin;
+- el flujo procesa imágenes individuales de principio a fin;
 - detecta al menos la mayoría de los bovinos claramente visibles del conjunto de prueba;
 - distingue correctamente los tres casos centrales: cero, uno y múltiples bovinos;
 - genera resultados estructurados y visuales;
@@ -721,7 +732,7 @@ Las metas definitivas deberán fijarse después de conocer el dataset. Como crit
 - el entrenamiento puede repetirse siguiendo el README;
 - el modelo y la configuración utilizados quedan versionados.
 
-No se considera apropiado fijar un mAP contractual antes de disponer de un dataset etiquetado y revisado.
+No se considera apropiado fijar un mAP contractual antes de disponer de un conjunto de datos etiquetado y revisado.
 
 ---
 
@@ -731,11 +742,11 @@ No se considera apropiado fijar un mAP contractual antes de disponer de un datas
 
 - Crear repositorio.
 - Definir entorno de Python.
-- Elegir el framework inicial.
+- Elegir el marco de trabajo inicial.
 - Crear estructura del proyecto.
 - Configurar ejecución en CPU y GPU.
 
-### Etapa 2 — Dataset
+### Etapa 2 — Conjunto de datos
 
 - Reunir imágenes iniciales.
 - Definir guía de anotación.
@@ -745,7 +756,7 @@ No se considera apropiado fijar un mAP contractual antes de disponer de un datas
 - Exportar a COCO o formato compatible.
 - Crear divisiones de entrenamiento, validación y prueba.
 
-### Etapa 3 — Baseline
+### Etapa 3 — Línea base
 
 - Cargar pesos preentrenados.
 - Ejecutar inferencia sin ajuste sobre imágenes de muestra.
@@ -792,7 +803,7 @@ No se considera apropiado fijar un mAP contractual antes de disponer de un datas
 El prototipo se considerará finalizado cuando:
 
 1. Exista un repositorio ejecutable y documentado.
-2. Exista un dataset inicial con anotaciones revisadas.
+2. Exista un conjunto de datos inicial con anotaciones revisadas.
 3. Exista al menos un modelo entrenado.
 4. Pueda procesarse una imagen nueva.
 5. La salida indique cero, uno o múltiples bovinos.
@@ -807,11 +818,11 @@ El prototipo se considerará finalizado cuando:
 
 ## 22. Riesgos y mitigaciones
 
-### Riesgo 1 — Dataset insuficiente
+### Riesgo 1 — Conjunto de datos insuficiente
 
 **Impacto:** El modelo podría memorizar ejemplos o fallar fuera del conjunto conocido.
 
-**Mitigación:** Comenzar con transferencia de aprendizaje, incorporar diversidad y tratar los resultados como baseline experimental.
+**Mitigación:** Comenzar con transferencia de aprendizaje, incorporar diversidad y tratar los resultados como línea base experimental.
 
 ### Riesgo 2 — Etiquetas inconsistentes
 
@@ -831,7 +842,7 @@ El prototipo se considerará finalizado cuando:
 
 **Mitigación:** Incorporar fondos rurales, instalaciones, otros animales y escenas vacías.
 
-### Riesgo 5 — Dependencia del framework
+### Riesgo 5 — Dependencia del marco de trabajo
 
 **Impacto:** El código podría quedar excesivamente acoplado a una librería.
 
@@ -863,7 +874,7 @@ El prototipo se considerará finalizado cuando:
 - Cantidad mínima inicial de imágenes.
 - Herramienta definitiva de anotación.
 - Convención exacta para bovinos parcialmente visibles.
-- Framework inicial: YOLO, MMDetection o TorchVision.
+- Marco de trabajo inicial: YOLO, MMDetection o TorchVision.
 - Requisitos de licencia aceptables para el proyecto.
 - Umbral inicial de confianza.
 - Porcentaje mínimo de área ocupada por el animal.
@@ -888,7 +899,7 @@ Una vez completado este prototipo, la siguiente fase podrá incorporar:
 - modelo de inferencia ordinal de condición corporal;
 - nivel de confianza de la evaluación;
 - asociación con animales y evaluaciones de VACCA;
-- procesamiento de video y tracking.
+- procesamiento de video y seguimiento.
 
 ---
 
@@ -896,13 +907,13 @@ Una vez completado este prototipo, la siguiente fase podrá incorporar:
 
 **Anotación:** información manual que indica dónde aparece un objeto en una imagen.
 
-**Bounding box:** rectángulo que delimita la ubicación de un objeto.
+**Caja delimitadora (bounding box):** rectángulo que delimita la ubicación de un objeto.
 
 **Clase:** categoría que el modelo debe reconocer. En esta fase será `bovine`.
 
 **Confianza:** valor que representa cuán segura es una predicción del modelo.
 
-**Dataset:** conjunto de imágenes y anotaciones utilizadas para entrenar y evaluar.
+**Conjunto de datos (dataset):** conjunto de imágenes y anotaciones utilizadas para entrenar y evaluar.
 
 **Detección de objetos:** tarea que identifica qué objetos aparecen y dónde están.
 
@@ -920,16 +931,16 @@ Una vez completado este prototipo, la siguiente fase podrá incorporar:
 
 **mAP:** métrica que resume la calidad de detección del modelo.
 
-**Modelo preentrenado:** modelo entrenado previamente con un dataset amplio y reutilizado como punto de partida.
+**Modelo preentrenado:** modelo entrenado previamente con un conjunto de datos amplio y reutilizado como punto de partida.
 
-**Overfitting:** situación en la que el modelo aprende demasiado bien los datos de entrenamiento, pero falla en imágenes nuevas.
+**Sobreajuste (overfitting):** situación en la que el modelo aprende demasiado bien los datos de entrenamiento, pero falla en imágenes nuevas.
 
-**Transfer learning:** reutilización de conocimiento aprendido por un modelo anterior para una tarea nueva.
+**Transferencia de aprendizaje (transfer learning):** reutilización de conocimiento aprendido por un modelo anterior para una tarea nueva.
 
 ---
 
 ## 26. Resumen de la decisión propuesta
 
-Para la primera fase se propone construir un prototipo independiente del backend de VACCA, basado en Python y transferencia de aprendizaje, que reciba imágenes estáticas, detecte bovinos mediante cajas delimitadoras y clasifique cada captura según contenga cero, uno o múltiples animales.
+Para la primera fase se propone construir un prototipo independiente del componente de servidor de VACCA, basado en Python y transferencia de aprendizaje, que reciba imágenes estáticas, detecte bovinos mediante cajas delimitadoras y clasifique cada captura según contenga cero, uno o múltiples animales.
 
-El objetivo no es alcanzar rendimiento productivo ni inferir condición corporal, sino demostrar un pipeline completo y reproducible, comprender las limitaciones del dataset y dejar una base técnica clara para las fases posteriores.
+El objetivo no es alcanzar rendimiento productivo ni inferir condición corporal, sino demostrar un flujo completo y reproducible, comprender las limitaciones del conjunto de datos y dejar una base técnica clara para las fases posteriores.

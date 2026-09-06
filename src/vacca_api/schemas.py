@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+from vacca_bcs.constants import SCORE_MAX, SCORE_MIN
+
+
+BCSCategory = Annotated[int, Field(strict=True, ge=SCORE_MIN, le=SCORE_MAX)]
 
 
 class BoundingBox(BaseModel):
@@ -42,15 +47,28 @@ class DetectResponse(BaseModel):
 
 
 class BCSResponse(BaseModel):
-    """Response from POST /bcs — placeholder for future BCS scoring."""
+    """Response from POST /bcs with a discrete BCS category."""
 
-    status: str = Field(default="not_implemented")
+    status: str = Field(default="ok")
     message: str = Field(
-        default="BCS scoring endpoint is not yet implemented. "
-        "Currently only cow detection is available at POST /detect."
+        default="BCS category computed successfully."
     )
     cow_detected: Optional[bool] = None
-    bcs_score: Optional[float] = None
+    # Failed requests use HTTP errors; successful responses contain category 1..5.
+    bcs_category: BCSCategory
+
+
+class BCSReadinessResponse(BaseModel):
+    """Capability-specific BCS readiness response."""
+
+    status: Literal["unconfigured", "not_loaded", "ready", "unavailable"]
+    message: str
+
+
+class ErrorResponse(BaseModel):
+    """Standard error body returned by an operation endpoint."""
+
+    detail: str
 
 
 class HealthResponse(BaseModel):

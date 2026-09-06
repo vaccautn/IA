@@ -1,8 +1,6 @@
 # Hash-locked for Windows x64 / CPython 3.13 and the API extra.
-# Regenerate deliberately when changing an API package or the target interpreter.
---index-url https://pypi.org/simple
---only-binary=:all:
---require-hashes
+# This fragment is composed with requirements-cpu.txt. The CPU lock owns the
+# index policy and --require-hashes directive for the combined installation.
 
 annotated-doc==0.0.5 \
     --hash=sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101

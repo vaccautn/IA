@@ -5,19 +5,32 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vacca-vision"
 version = "0.1.0"
-description = "Framework-neutral bovine image aptitude classification core"
+description = "Bovine detection API and BCS category 1..5 CORAL training and serving"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13,<3.14"
 license = "AGPL-3.0-only"
 dependencies = ["Pillow"]
 
 [project.optional-dependencies]
-yolo = ["ultralytics==8.4.115"]
+dev = ["pytest", "ruff==0.15.20"]
 api = [
     "fastapi==0.141.1",
     "uvicorn==0.52.4",
     "python-multipart==0.0.32",
 ]
+yolo = ["ultralytics==8.4.115"]
+bcs = [
+    "PyYAML==6.0.3",
+    "torch==2.13.0+cpu",
+    "torchvision==0.28.0+cpu",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

@@ -110,6 +110,34 @@ class ModelPathReadinessTests(unittest.TestCase):
         self.assertEqual(body["status"], "ok")  # type: ignore[index]
         self.assertTrue(body["model_loaded"])  # type: ignore[index]
 
+    def test_asgi_shared_invalid_image_contract_is_exact_for_detect_and_bcs(self) -> None:
+        async def request(path: str) -> tuple[int, object]:
+            body = smoke_test_api._multipart_body(
+                "malformed.jpg", b"not a JPEG", "image/jpeg"
+            )
+            headers = {
+                "content-type": (
+                    "multipart/form-data; boundary="
+                    f"{smoke_test_api._BOUNDARY.decode()}"
+                )
+            }
+            async with api_main.app.router.lifespan_context(api_main.app):
+                return await smoke_test_api._asgi_request(
+                    "POST", path, body=body, headers=headers
+                )
+
+        with patch.object(api_main, "get_detector", return_value=SimpleNamespace(
+            gpu_available=False
+        )):
+            for path in ("/detect", "/bcs"):
+                with self.subTest(path=path):
+                    status_code, response_body = asyncio.run(request(path))
+                    self.assertEqual(status_code, 400)
+                    self.assertEqual(
+                        response_body,
+                        {"detail": "Image file cannot be decoded safely"},
+                    )
+
     def test_startup_failure_logs_safe_error_type(self) -> None:
         with patch.object(api_main, "get_detector", side_effect=RuntimeError("secret")):
             with self.assertLogs(api_main.logger, level="ERROR") as logs:
@@ -318,6 +346,7 @@ class LiveSmokeReadinessTests(unittest.TestCase):
             side_effect=[
                 (200, self.HEALTH),
                 (400, {"detail": smoke_test_api.LIVE_DETECT_INVALID_DETAIL}),
+                (400, {"detail": smoke_test_api.LIVE_INVALID_IMAGE_DETAIL}),
             ],
         ) as request:
             result = smoke_test_api.run(
@@ -330,6 +359,8 @@ class LiveSmokeReadinessTests(unittest.TestCase):
         self.assertEqual(request.call_args_list[0].args[0], "http://127.0.0.1:8001/health")
         self.assertEqual(request.call_args_list[1].args[0], "http://127.0.0.1:8001/detect")
         self.assertEqual(request.call_args_list[1].kwargs["timeout"], 1.5)
+        self.assertEqual(request.call_args_list[2].args[0], "http://127.0.0.1:8001/bcs")
+        self.assertEqual(request.call_args_list[2].kwargs["timeout"], 1.5)
 
     def test_live_image_detect_validates_success_response_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -423,6 +454,12 @@ class LiveSmokeReadinessTests(unittest.TestCase):
 
 
 class ProjectDependencyMetadataTests(unittest.TestCase):
+    def test_project_declares_only_reproducible_cpython_313_target(self) -> None:
+        metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+        self.assertEqual(metadata["project"]["requires-python"], ">=3.13,<3.14")
+        self.assertEqual(metadata["tool"]["ruff"]["target-version"], "py313")
+
     def test_api_dependencies_are_bounded_in_project_metadata(self) -> None:
         metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         api_dependencies = metadata["project"]["optional-dependencies"]["api"]
@@ -446,7 +483,8 @@ class ProjectDependencyMetadataTests(unittest.TestCase):
             )
         }
 
-        self.assertIn("--require-hashes", lock)
+        self.assertNotIn("--index-url", lock)
+        self.assertNotIn("--extra-index-url", lock)
         self.assertIn("Windows x64 / CPython 3.13", lock)
         self.assertEqual(
             set(entries),
@@ -469,20 +507,45 @@ class ProjectDependencyMetadataTests(unittest.TestCase):
         )
         self.assertTrue(all(len(digest) == 64 for _, digest in entries.values()))
 
+        cpu_lock = (ROOT / "requirements-cpu.txt").read_text(encoding="utf-8")
+        cpu_entries = {
+            name.lower().replace("_", "-"): (version, digest)
+            for name, version, digest in re.findall(
+                r"(?m)^([A-Za-z0-9_.-]+)==([^\s\\]+) \\\n\s+--hash=sha256:([0-9a-f]{64})$",
+                cpu_lock,
+            )
+        }
+        for name in ("idna", "typing-extensions"):
+            self.assertEqual(entries[name], cpu_entries[name])
+
         metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         for requirement in metadata["project"]["optional-dependencies"]["api"]:
             name, version = requirement.split("==")
             self.assertEqual(entries[name.lower()][0], version)
 
+    def test_bcs_dependencies_match_cpu_lock_roots(self) -> None:
+        lock = (ROOT / "requirements-cpu.txt").read_text(encoding="utf-8")
+        entries = {
+            name.lower().replace("_", "-"): version
+            for name, version in re.findall(
+                r"(?m)^([A-Za-z0-9_.-]+)==([^\s\\]+) \\\n",
+                lock,
+            )
+        }
+        metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        for requirement in metadata["project"]["optional-dependencies"]["bcs"]:
+            name, version = requirement.split("==", 1)
+            self.assertEqual(entries[name.lower().replace("_", "-")], version)
+
     def test_readme_uses_cpu_and_api_locks_without_dependency_resolution(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn("- Python 3.13+", readme)
+        self.assertIn("- CPython 3.13 (`>=3.13,<3.14`)", readme)
         self.assertIn(
-            ".venv\\Scripts\\python -m pip install --require-hashes -r requirements-cpu.txt",
+            ".venv\\Scripts\\python -m pip install --require-hashes -r requirements-cpu.txt -r requirements-api.txt",
             readme,
         )
-        self.assertIn(
+        self.assertNotIn(
             ".venv\\Scripts\\python -m pip install --require-hashes -r requirements-api.txt",
             readme,
         )
