@@ -9,11 +9,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -25,11 +28,12 @@ def main() -> None:
 
     import uvicorn
 
-    print(f"\n  🐄  VACCA Vision API  —  http://{args.host}:{args.port}")
-    print(f"  📋  API docs  —  http://{args.host}:{args.port}/docs")
-    print(f"  🧪  Test UI   —  http://{args.host}:{args.port}/ui")
-    print(f"  ❤️  Health    —  http://{args.host}:{args.port}/health")
-    print()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    base_url = f"http://{args.host}:{args.port}"
+    logger.info("Starting VACCA Vision API at %s", base_url)
+    logger.info("API docs: %s/docs", base_url)
+    logger.info("Test UI: %s/ui", base_url)
+    logger.info("Health: %s/health", base_url)
 
     uvicorn.run(
         "vacca_api.main:app",
