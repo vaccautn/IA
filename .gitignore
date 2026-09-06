@@ -67,6 +67,9 @@ outputs/
 runs/
 artifacts/
 mlruns/
+/.atl/
+/.codegraph/
+/logs/
 
 # Deployment model (versioned exception for server deploys)
 !models/deploy/

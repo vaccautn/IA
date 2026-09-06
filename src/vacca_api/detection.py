@@ -11,13 +11,12 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-import numpy as np
 from PIL import Image
 
 from .schemas import BoundingBox, Detection
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL = ROOT / "outputs" / "training" / "combined-v2-finetune" / "weights" / "best.pt"
+DEFAULT_MODEL = ROOT / "models" / "deploy" / "vacca-yolo26n-v1.pt"
 
 
 class VACCADetector:
@@ -66,7 +65,6 @@ class VACCADetector:
             boxes = r.boxes
             if boxes is not None and len(boxes) > 0:
                 for box in boxes:
-                    cls_id = int(box.cls[0].item())
                     conf_val = float(box.conf[0].item())
                     xywh = box.xywh[0].tolist()  # [x_center, y_center, w, h] in pixels
 
@@ -95,7 +93,7 @@ class VACCADetector:
         return detections, img_w, img_h, inference_ms
 
 
-# Singleton — loaded once at import time
+# Module-level cache used only by the startup construction path.
 _detector: Optional[VACCADetector] = None
 
 

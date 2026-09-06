@@ -151,6 +151,47 @@ def validate_image(
             f"Image file exceeds the maximum size of {settings.max_size_bytes} bytes"
         )
 
+    metadata = _validate_image_bytes(
+        snapshot,
+        settings,
+        expected_format=FORMAT_BY_EXTENSION[extension],
+        expected_extension=extension,
+    )
+
+    return ValidatedImage(
+        _VALIDATED_IMAGE_TOKEN,
+        path=path.resolve(),
+        metadata=metadata,
+        size_bytes=size_bytes,
+        snapshot=snapshot,
+    )
+
+
+def validate_image_bytes(
+    source: bytes,
+    config: ImageValidationConfig | None = None,
+) -> ImageMetadata:
+    """Validate an already bounded image upload and return its dimensions."""
+
+    settings = config or ImageValidationConfig()
+    if not isinstance(source, bytes):
+        raise TypeError("source must be bytes")
+    if len(source) == 0:
+        raise ImageValidationError("Image file is empty")
+    if len(source) > settings.max_size_bytes:
+        raise ImageValidationError(
+            f"Image file exceeds the maximum size of {settings.max_size_bytes} bytes"
+        )
+    return _validate_image_bytes(source, settings)
+
+
+def _validate_image_bytes(
+    snapshot: bytes,
+    settings: ImageValidationConfig,
+    *,
+    expected_format: str | None = None,
+    expected_extension: str | None = None,
+) -> ImageMetadata:
     try:
         from PIL import Image
     except ImportError:
@@ -164,10 +205,10 @@ def validate_image(
             image_format = image.format
             if image_format not in SUPPORTED_FORMATS:
                 raise ImageValidationError("Decoded image format must be JPEG or PNG")
-            expected_format = FORMAT_BY_EXTENSION[extension]
-            if image_format != expected_format:
+            if expected_format is not None and image_format != expected_format:
                 raise ImageValidationError(
-                    f"Decoded {image_format} image does not match {extension} extension"
+                    f"Decoded {image_format} image does not match "
+                    f"{expected_extension} extension"
                 )
             _validate_dimensions(width, height, settings)
             image.verify()
@@ -175,14 +216,7 @@ def validate_image(
         raise
     except Exception:
         raise ImageValidationError("Image file cannot be decoded safely") from None
-
-    return ValidatedImage(
-        _VALIDATED_IMAGE_TOKEN,
-        path=path.resolve(),
-        metadata=ImageMetadata(width=width, height=height),
-        size_bytes=size_bytes,
-        snapshot=snapshot,
-    )
+    return ImageMetadata(width=width, height=height)
 
 
 def _validate_dimensions(

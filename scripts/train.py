@@ -131,7 +131,6 @@ def train(config: dict[str, Any]) -> Path:
 
     weights_dir = Path(results.save_dir) / "weights"
     best = weights_dir / "best.pt"
-    last = weights_dir / "last.pt"
 
     if best.is_file():
         export_path = Path(results.save_dir) / "exported"
@@ -221,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     best_path = save_dir / "weights" / "best.pt"
-    print(f"\n[LISTO] Entrenamiento completado.")
+    print("\n[LISTO] Entrenamiento completado.")
     print(f"  Directorio: {save_dir}")
     if best_path.is_file():
         print(f"  Mejores pesos: {best_path}")
