@@ -17,6 +17,7 @@ from .image_validation import (
     ImageValidationError,
     ValidatedImage,
     validate_image,
+    validate_image_bytes,
 )
 from .pipeline import AptitudePipeline, ClassificationConfig
 from .ultralytics_adapter import (
@@ -47,4 +48,5 @@ __all__ = [
     "UltralyticsDetector",
     "ValidatedImage",
     "validate_image",
+    "validate_image_bytes",
 ]

@@ -93,7 +93,7 @@ class VACCADetector:
         return detections, img_w, img_h, inference_ms
 
 
-# Singleton — loaded once at import time
+# Module-level cache used only by the startup construction path.
 _detector: Optional[VACCADetector] = None
 
 
