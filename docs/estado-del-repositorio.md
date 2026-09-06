@@ -30,3 +30,16 @@ La detección YOLO, sus pesos y sus salidas permanecen fuera del alcance de esta
 migración. La reversión BCS anterior fue eliminada por autorización; aunque existe un
 candidato, sus controles fallaron. Quitar `VACCA_BCS_CHECKPOINT` y
 `VACCA_BCS_CHECKPOINT_SHA256` mantiene BCS no disponible sin afectar detección.
+
+## API operativa
+
+La API se sirve por defecto en `http://127.0.0.1:8001` y carga una sola vez el modelo
+versionado `models/deploy/vacca-yolo26n-v1.pt` durante el `lifespan` de FastAPI. El
+detector vive en `request.app.state.detector`; `/health` y `/detect` siguen operativos
+aunque BCS esté sin configurar. La carga de imagen es común, acotada a 10 MiB y valida
+MIME JPEG/PNG, decodificación y dimensiones; el límite estricto devuelve `413`.
+
+`/bcs` realiza inferencia BCS sobre la imagen completa sin ejecutar YOLO. `/ready/bcs`
+no carga checkpoints y devuelve `503` para `unconfigured`, `not_loaded` o `unavailable`.
+La API no usa CORS permisivo y el smoke en proceso/live está documentado en
+`README.md` y `docs/api.md`; despliegues entre hosts deben usar una red privada.

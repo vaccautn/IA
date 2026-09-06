@@ -15,15 +15,14 @@ datos BCS ni crean un punto de control BCS.
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install -e ".[api,bcs,dev,yolo]"
-dir outputs\training\combined-v2-finetune\weights\best.pt
+.venv\Scripts\python -m pip install --require-hashes -r requirements-cpu.txt -r requirements-api.txt
+.venv\Scripts\python -m pip install --no-deps --no-build-isolation -e ".[yolo,api]"
+Test-Path models\deploy\vacca-yolo26n-v1.pt
 .venv\Scripts\python scripts/run_api.py
 ```
 
-El detector de Fase 1 necesita la salida local
-`outputs/training/combined-v2-finetune/weights/best.pt`. Ese archivo existe localmente,
-pero Git lo ignora; no está versionado y no se garantiza que exista en otro clon. `models/deploy/vacca-yolo26n-v1.pt` es un artefacto versionado,
-pero la API no lo usa como alternativa ni lo selecciona por configuración.
+El detector de Fase 1 carga únicamente el artefacto versionado
+`models/deploy/vacca-yolo26n-v1.pt`; no es necesario descargar un peso local ignorado.
 El punto de control BCS es independiente: la API puede arrancar en modo detección sin
 `VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256`; BCS permanece
 `unconfigured` hasta configurar explícitamente un punto de control compatible y aceptado
@@ -37,9 +36,9 @@ El script de arranque acepta:
 .venv\Scripts\python scripts/run_api.py --reload
 ```
 
-El puerto predeterminado es `8000` y el equipo anfitrión predeterminado es `127.0.0.1`.
-`--reload` es sólo para desarrollo. La aplicación no implementa autenticación y
-mantiene CORS abierto para el prototipo; revisar ambos límites antes de exponerla.
+El puerto predeterminado es `8001` y el equipo anfitrión predeterminado es `127.0.0.1`.
+`--reload` es sólo para desarrollo. La API no habilita CORS permisivo ni implementa
+autenticación; manténgala en una red privada y aplique autenticación en la capa de acceso.
 
 ## Configuración BCS
 
@@ -81,14 +80,15 @@ $env:VACCA_BCS_CHECKPOINT_SHA256 = "<EXACT_SHA256_FROM_OVERNIGHT_VALIDATION>"
 | Método | Ruta | Entrada | Respuesta |
 |---|---|---|---|
 | `GET` | `/health` | Ninguna | `HealthResponse`, HTTP 200 si el detector YOLO puede cargarse. |
-| `POST` | `/detect` | Multipart con campo `file` | `DetectResponse`, o HTTP 400/500. |
-| `POST` | `/bcs` | Multipart con campo `file` | `BCSResponse` en HTTP 200, o error HTTP sanitizado. |
+| `POST` | `/detect` | Multipart con campo `file` | `DetectResponse`, o HTTP 400/413/500/503. |
+| `POST` | `/bcs` | Multipart con campo `file` | `BCSResponse` en HTTP 200, o error HTTP sanitizado, incluido `503` por capacidad ocupada o BCS no disponible. |
 | `GET` | `/ready/bcs` | Ninguna | `BCSReadinessResponse`: 200 sólo en estado `ready`, 503 en otro estado. |
 | `GET` | `/ui` | Ninguna | UI HTML de prototipo; 404 si falta el archivo. |
 
-FastAPI agrega `/docs`, `/redoc` y `/openapi.json`. El OpenAPI declara el cuerpo
-exitoso de cada ruta y el cuerpo de disponibilidad `503`; los errores de operación
-`/bcs` usan el cuerpo estándar de FastAPI `{"detail":"..."}`.
+FastAPI agrega `/docs`, `/redoc` y `/openapi.json`. El OpenAPI declara los cuerpos
+exitosos y los errores `400`, `413`, `500` y `503` de `/detect`, además de `400`, `413`,
+`500` y `503` de `/bcs`; las solicitudes sin `file` conservan la validación `422` de FastAPI.
+Los errores de operación usan el cuerpo estándar `{"detail":"..."}`.
 
 ## UI de prototipo (`GET /ui`)
 
@@ -112,7 +112,7 @@ Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 .venv\Scripts\python scripts/run_api.py
 ```
 
-Abra luego `http://127.0.0.1:8000/ui`. El entorno de ejecución falso se usa sólo en las pruebas
+Abra luego `http://127.0.0.1:8001/ui`. El entorno de ejecución falso se usa sólo en las pruebas
 deterministas; no sustituye la validación del candidato documentado en el [reporte de la ejecución](../reports/bcs-category-baseline-2026-09-04.md).
 
 `/health` y `/detect` no consultan el entorno de ejecución BCS. `/bcs` no ejecuta YOLO ni
@@ -126,30 +126,37 @@ Forma exacta de `HealthResponse`:
 {
   "status": "ok",
   "model_loaded": true,
-  "model_path": "<ruta calculada al peso YOLO>",
+  "model_path": "vacca-yolo26n-v1.pt",
   "gpu_available": false
 }
 ```
 
-`model_path` refleja el singleton del detector y `gpu_available` consulta
-`torch.cuda.is_available()`. El ejemplo no afirma un valor de entorno.
+`model_path` expone siempre el nombre base estable `vacca-yolo26n-v1.pt`, nunca una
+ruta calculada o absoluta; `gpu_available` consulta `torch.cuda.is_available()`.
 
 ## `POST /detect`
 
 Solicitud multipart:
 
 ```powershell
-Invoke-RestMethod -Uri http://127.0.0.1:8000/detect `
+Invoke-RestMethod -Uri http://127.0.0.1:8001/detect `
   -Method Post `
   -Form @{file=Get-Item "ruta\a\imagen.jpg"}
 ```
 
-La validación compartida exige `content_type` que comience con `image/*` y un
-archivo no vacío. Los errores son:
+La validación compartida acepta exactamente los MIME `image/jpeg`, `image/jpg` (alias JPEG)
+e `image/png`,
+lee como máximo 10 MiB más un byte y decodifica la imagen antes de la inferencia. Los errores son:
 
-- `400` para MIME no soportado, lectura fallida o archivo vacío.
-- `500` con `{"detail":"Detection failed — check server logs"}` si falla el
-  detector o Pillow durante la detección.
+| HTTP | `detail` | Causa |
+|---:|---|---|
+| 400 | `File must be an image (JPEG or PNG)` / `Empty file` / `Failed to read uploaded file` | MIME no soportado, archivo vacío o lectura fallida. |
+| 400 | `Image file cannot be decoded safely` | Los bytes declarados como JPEG/PNG no pueden ser decodificados. |
+| 400 | `Decoded image format must be JPEG or PNG` | El decodificador abre los bytes, pero el formato real no es JPEG ni PNG. |
+| 400 | Error de validación de imagen | Dimensiones o píxeles fuera de límite. |
+| 413 | `Image file exceeds the maximum size of 10485760 bytes` | Archivo de más de 10 MiB. |
+| 500 | `Detection failed — check server logs` | Fallo del detector durante la inferencia. |
+| 503 | `Inference capacity is busy; retry shortly` | La única capacidad de inferencia está ocupada; no se ejecuta el modelo. |
 - Una solicitud sin `file` conserva la validación estándar de FastAPI.
 
 Una respuesta exitosa contiene `cow_detected`, `detection_count`, `detections`,
@@ -181,14 +188,24 @@ Errores de operación, todos con cuerpo estándar `{"detail": "..."}`:
 
 | HTTP | `detail` | Causa |
 |---:|---|---|
-| 400 | `File must be an image (JPEG, PNG, etc.)` / `Empty file` / `Failed to read uploaded file` | Validación común de la carga. |
-| 400 | `BCS image input is invalid` | La carga no es un JPEG/PNG decodificable o viola límites de imagen. |
+| 400 | `File must be an image (JPEG or PNG)` / `Empty file` / `Failed to read uploaded file` | Validación común de la carga. |
+| 400 | `Image file cannot be decoded safely` | Los bytes declarados como JPEG/PNG no pueden ser decodificados durante la validación común, antes del runtime BCS. |
+| 400 | `Decoded image format must be JPEG or PNG` | El decodificador abre los bytes, pero el formato real no es JPEG ni PNG; ocurre antes del runtime BCS. |
+| 400 | `BCS image input is invalid` | Validación semántica del runtime BCS después de que los bytes pasan la validación común de carga. |
+| 413 | `Image file exceeds the maximum size of 10485760 bytes` | Archivo de más de 10 MiB. |
 | 500 | `BCS inference failed` | El modelo no pudo producir inferencia. |
+| 503 | `Inference capacity is busy; retry shortly` | La única capacidad de inferencia está ocupada; no se invoca el runtime ni el modelo. |
 | 503 | `BCS capability is unavailable` | Falta el punto de control, no se pudo cargar o el dispositivo no está disponible. |
 
 Ejemplo de capacidad no configurada: `POST /bcs` devuelve HTTP `503` y
 `{"detail":"BCS capability is unavailable"}`; no devuelve un `BCSResponse`
 exitoso ni una categoría nula como sustituto.
+
+La capacidad de inferencia es independiente de la configuración BCS: una respuesta `503`
+con `Inference capacity is busy; retry shortly` indica saturación temporal y debe reintentarse;
+`BCS capability is unavailable` indica que BCS no puede operar. `/ready/bcs` conserva los
+estados `unconfigured`, `not_loaded`, `ready` y `unavailable` para distinguir configuración,
+carga y disponibilidad sin adquirir la compuerta ni disparar la carga diferida.
 
 ## `GET /ready/bcs`
 
@@ -223,7 +240,13 @@ el punto de control y comprobar el servicio.
   `unavailable` sin forzar la carga.
 - Si `/bcs` devuelve `503`, no lo interprete como categoría: falta una capacidad
   BCS operable.
+- Si BCS queda en `unavailable`, corrija el punto de control, el dispositivo o la configuración
+  y reinicie el proceso. El estado fallido se conserva deliberadamente: no se reintenta
+  automáticamente para evitar cargas repetidas y mantener una recuperación operativa determinista.
 - Use `file` como nombre exacto del campo multipart.
+- El límite de 10 MiB se aplica después del parser multipart; configure en el reverse proxy
+  o servidor un límite de cuerpo que incluya el overhead multipart, además de timeout y
+  concurrencia. No dependa del límite posterior al parser para proteger el transporte.
 - Ejecute la suite con `.venv\Scripts\python.exe -m pytest -q`.
 
 La verificación de entrenamiento y del proyecto se mantiene en la guía operativa y en el

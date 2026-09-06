@@ -65,6 +65,12 @@ class BCSReadinessResponse(BaseModel):
     message: str
 
 
+class ErrorResponse(BaseModel):
+    """Standard error body returned by an operation endpoint."""
+
+    detail: str
+
+
 class HealthResponse(BaseModel):
     """GET /health"""
 

@@ -1,4 +1,4 @@
-# Arquitectura de categorías BCS 1..5
+# Arquitectura de detección y categorías BCS 1..5
 
 La migración BCS usa únicamente la fuente local original, una frontera de
 filtración basada en grupos de captura derivados del nombre de archivo y el
@@ -15,6 +15,26 @@ outputs/bcs-category-coral-v1/
   ↓ servicio validado de categorías discretas
 POST /bcs → bcs_category: 1..5
 ```
+
+## Frontera de la API
+
+FastAPI se ejecuta por defecto en `http://127.0.0.1:8001` y carga el detector YOLO
+versionado `models/deploy/vacca-yolo26n-v1.pt` una sola vez en su `lifespan`. El
+detector se guarda en `request.app.state.detector`; los handlers nunca vuelven a
+invocar la fábrica. `/health` y `/detect` no inicializan BCS.
+
+Ambos endpoints de inferencia usan el validador compartido: MIME JPEG/PNG (incluido
+`image/jpg`), lectura acotada a 10 MiB, decodificación y límites de dimensiones/píxeles.
+Las cargas sobre el límite devuelven `413`; los demás errores de carga devuelven `400`
+con detalles sanitizados. No hay CORS permisivo; el acceso entre hosts debe permanecer
+en una red privada.
+
+`/bcs` lee la carga una vez y entrega los bytes a `BCSRuntime` de forma diferida; nunca
+invoca YOLO. La construcción o carga BCS fallida no impide el arranque, `/health` ni
+`/detect`. `/ready/bcs` sólo inspecciona `unconfigured`, `not_loaded`, `ready` o
+`unavailable` y nunca carga un checkpoint; devuelve `503` salvo cuando está `ready`.
+El smoke en proceso y el smoke HTTP validan estos contratos sin habilitar el candidato
+BCS rechazado.
 
 | Capa | Responsabilidad |
 |---|---|

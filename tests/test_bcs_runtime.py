@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-import time
 import hashlib
 from pathlib import Path
 
@@ -112,16 +111,51 @@ def test_failure_is_cached_as_unavailable_and_sanitized(tmp_path: Path) -> None:
     assert calls == [1]
 
 
+def test_load_failure_logs_safe_event_and_exception_type(tmp_path: Path, caplog) -> None:
+    environment, checkpoint = _configured(tmp_path)
+
+    def fail(path, *, device, expected_sha256):
+        raise RuntimeError(f"secret checkpoint {checkpoint}")
+
+    runtime = BCSRuntime(environment, loader=fail, checkpoint_root=tmp_path)
+    with caplog.at_level("ERROR", logger="vacca_api.bcs_runtime"):
+        with pytest.raises(BCSRuntimeUnavailableError):
+            runtime.get_service()
+
+    assert any("BCS checkpoint_load failure: RuntimeError" in message for message in caplog.messages)
+    assert all("secret" not in message for message in caplog.messages)
+    assert all(str(checkpoint) not in message for message in caplog.messages)
+
+
+def test_configuration_failure_logs_safe_event_and_exception_type(tmp_path: Path, caplog) -> None:
+    checkpoint = tmp_path / "outside.pt"
+    environment = {
+        "VACCA_BCS_CHECKPOINT": str(checkpoint),
+        "VACCA_BCS_CHECKPOINT_SHA256": _DIGEST,
+    }
+    with caplog.at_level("ERROR", logger="vacca_api.bcs_runtime"):
+        runtime = BCSRuntime(environment, loader=lambda *args, **kwargs: pytest.fail())
+
+    assert runtime.status == BCSRuntimeStatus.UNAVAILABLE
+    assert any("BCS configuration failure: SafePathError" in message for message in caplog.messages)
+    assert all(str(checkpoint) not in message for message in caplog.messages)
+
+
 def test_concurrent_get_service_loads_exactly_once(tmp_path: Path) -> None:
     calls = 0
     lock = threading.Lock()
+    start_barrier = threading.Barrier(8)
+    loader_entered = threading.Event()
+    release_loader = threading.Event()
     environment, _ = _configured(tmp_path)
 
     def loader(path, *, device, expected_sha256):
         nonlocal calls
         with lock:
             calls += 1
-        time.sleep(0.02)
+        loader_entered.set()
+        if not release_loader.wait(timeout=2):
+            raise AssertionError("loader was not released")
         return "loaded"
 
     runtime = BCSRuntime(
@@ -131,11 +165,27 @@ def test_concurrent_get_service_loads_exactly_once(tmp_path: Path) -> None:
         checkpoint_root=tmp_path,
     )
     results: list[object] = []
-    threads = [threading.Thread(target=lambda: results.append(runtime.get_service())) for _ in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    failures: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            start_barrier.wait(timeout=2)
+            results.append(runtime.get_service())
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    try:
+        for thread in threads:
+            thread.start()
+        assert loader_entered.wait(timeout=2)
+    finally:
+        release_loader.set()
+        for thread in threads:
+            thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
     assert results == ["loaded"] * 8
     assert calls == 1
 

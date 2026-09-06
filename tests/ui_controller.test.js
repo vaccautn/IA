@@ -8,7 +8,28 @@ const htmlPath = path.join(__dirname, '..', 'src', 'vacca_api', 'static', 'index
 const html = fs.readFileSync(htmlPath, 'utf8');
 const firstScript = html.match(/<script>\s*(\(function \(root\)[\s\S]*?\n\}\)\([^<]+<\/script>)/);
 assert(firstScript, 'controller script must remain embedded before the DOM adapter');
-const sandbox = { module: { exports: {} }, exports: {} };
+const adapterMatch = html.match(/<script>\s*(const dropzone =[\s\S]*?)\n<\/script>/);
+assert(adapterMatch, 'DOM adapter script must remain embedded after the controller');
+const adapterScript = adapterMatch[1];
+const sandbox = {
+  module: { exports: {} },
+  exports: {},
+  URL: {
+    createObjectURL(file) {
+      const url = `blob:${file.name}`;
+      return url;
+    },
+    revokeObjectURL() {},
+  },
+  AbortController: class {
+    constructor() { this.signal = {}; this.aborted = false; }
+    abort() { this.aborted = true; }
+  },
+  FormData: class {
+    constructor() { this.entries = []; }
+    append(name, value) { this.entries.push([name, value]); }
+  },
+};
 vm.runInNewContext(firstScript[1].replace('</script>', ''), sandbox, { filename: htmlPath });
 const { createUiController } = sandbox.module.exports;
 
@@ -48,6 +69,73 @@ function harness(fetchImpl) {
     onEvent: event => events.push(event),
   });
   return { controller, events, states, forms, controllers, urls };
+}
+
+function adapterHarness(fetchImpl) {
+  const elements = new Map();
+  const windowHandlers = {};
+  const context = {
+    strokeRects: [],
+    clearRect() {},
+    strokeRect(...args) { this.strokeRects.push(args); },
+    measureText(text) { return { width: text.length }; },
+    fillRect() {},
+    fillText() {},
+  };
+  function element(id = null) {
+    const handlers = {};
+    const item = {
+      id,
+      style: {},
+      className: '',
+      classList: { add() {}, remove() {}, toggle() {} },
+      children: [],
+      dataset: {},
+      files: [],
+      value: '',
+      hidden: false,
+      tabIndex: 0,
+      clientWidth: 80,
+      clientHeight: 60,
+      addEventListener(type, listener) { handlers[type] = listener; },
+      dispatch(type, event = {}) { return handlers[type]?.(event); },
+      setAttribute(name, value) { this[name] = value; },
+      removeAttribute(name) { delete this[name]; },
+      append(...items) { this.children.push(...items); },
+      replaceChildren(...items) { this.children = items; },
+      focus() {},
+      getContext() { return context; },
+    };
+    if (id) elements.set(id, item);
+    return item;
+  }
+  [
+    'dropzone', 'fileInput', 'preview', 'bboxCanvas', 'uploadHint', 'spinner',
+    'summary', 'detectTab', 'bcsTab', 'detectPanel', 'bcsPanel', 'bcsReadiness',
+    'refreshReadiness', 'calculateBcs', 'bcsProgress', 'bcsResults', 'results',
+  ].forEach(id => element(id));
+  const document = {
+    getElementById(id) { return elements.get(id); },
+    createElement() { return element(); },
+  };
+  const window = {
+    VaccaUiController: { createUiController },
+    addEventListener(type, listener) {
+      (windowHandlers[type] ||= []).push(listener);
+    },
+  };
+  const urls = { created: [], revoked: [] };
+  const urlApi = {
+    createObjectURL(file) {
+      const url = `blob:${file.name}`;
+      urls.created.push(url);
+      return url;
+    },
+    revokeObjectURL(url) { urls.revoked.push(url); },
+  };
+  const adapterSandbox = { document, window, fetch: fetchImpl, URL: urlApi };
+  vm.runInNewContext(adapterScript, adapterSandbox, { filename: htmlPath });
+  return { elements, windowHandlers, context, urls };
 }
 
 const image = name => ({ name, type: 'image/jpeg' });
@@ -140,4 +228,37 @@ test('stale readiness response cannot replace a newer request', async () => {
   first.resolve(response(503, { status: 'unavailable' }));
   await firstRequest;
   assert.equal(h.controller.getState().bcsStatus, 'ready');
+});
+
+test('DOM adapter redraws the latest detection on resize', async () => {
+  const h = adapterHarness(async url => {
+    assert.equal(url, '/detect');
+    return response(200, {
+      cow_detected: true,
+      detection_count: 1,
+      detections: [{
+        class_name: 'cow', confidence: 0.9,
+        bbox: { x_center: 0.5, y_center: 0.5, width: 0.5, height: 0.5 },
+        x1: 2, y1: 1, x2: 6, y2: 5,
+      }],
+      image_width: 8, image_height: 6, inference_time_ms: 1,
+    });
+  });
+
+  h.elements.get('fileInput').files = [image('resize.jpg')];
+  h.elements.get('fileInput').dispatch('change');
+  await flush();
+  assert.equal(h.context.strokeRects.length, 1);
+
+  h.windowHandlers.resize[0]();
+  assert.equal(h.context.strokeRects.length, 2);
+});
+
+test('DOM adapter unload delegates object URL cleanup to the controller owner', () => {
+  const h = adapterHarness(() => new Promise(() => {}));
+  h.elements.get('fileInput').files = [image('cleanup.jpg')];
+  h.elements.get('fileInput').dispatch('change');
+
+  assert.doesNotThrow(() => h.windowHandlers.beforeunload[0]());
+  assert.deepEqual(h.urls.revoked, ['blob:cleanup.jpg']);
 });

@@ -16,13 +16,18 @@ from PIL import Image
 from .schemas import BoundingBox, Detection
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL = ROOT / "outputs" / "training" / "combined-v2-finetune" / "weights" / "best.pt"
+DEFAULT_MODEL = ROOT / "models" / "deploy" / "vacca-yolo26n-v1.pt"
+DEFAULT_CONFIDENCE = 0.25
 
 
 class VACCADetector:
     """Thin wrapper around Ultralytics YOLO for cow detection."""
 
-    def __init__(self, model_path: str | Path | None = None, conf: float = 0.25) -> None:
+    def __init__(
+        self,
+        model_path: str | Path | None = None,
+        conf: float = DEFAULT_CONFIDENCE,
+    ) -> None:
         from ultralytics import YOLO
 
         self._model_path = Path(model_path or DEFAULT_MODEL)
@@ -93,11 +98,14 @@ class VACCADetector:
         return detections, img_w, img_h, inference_ms
 
 
-# Singleton — loaded once at import time
+# Module-level cache used only by the startup construction path.
 _detector: Optional[VACCADetector] = None
 
 
-def get_detector(model_path: str | Path | None = None, conf: float = 0.25) -> VACCADetector:
+def get_detector(
+    model_path: str | Path | None = None,
+    conf: float = DEFAULT_CONFIDENCE,
+) -> VACCADetector:
     """Get or create the singleton detector instance."""
     global _detector
     if _detector is None:

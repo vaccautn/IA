@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import string
 import threading
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -24,6 +25,7 @@ from vacca_bcs.path_safety import SafePathError, safe_path
 _CHECKPOINT_ENV = "VACCA_BCS_CHECKPOINT"
 _CHECKPOINT_SHA256_ENV = "VACCA_BCS_CHECKPOINT_SHA256"
 _DEVICE_ENV = "VACCA_BCS_DEVICE"
+logger = logging.getLogger(__name__)
 
 
 class BCSRuntimeStatus(str, Enum):
@@ -100,20 +102,36 @@ class BCSRuntime:
                     device=self._device,
                     expected_sha256=self._checkpoint_sha256,
                 )
-            except BCSCheckpointUnavailableError:
-                self._cache_failure("checkpoint_unavailable", "BCS checkpoint is unavailable")
+            except BCSCheckpointUnavailableError as exc:
+                self._cache_failure(
+                    "checkpoint_unavailable",
+                    "BCS checkpoint is unavailable",
+                    type(exc).__name__,
+                )
                 raise BCSRuntimeUnavailableError("BCS capability is unavailable") from None
-            except BCSCheckpointLoadError:
-                self._cache_failure("checkpoint_load", "BCS checkpoint could not be loaded")
+            except BCSCheckpointLoadError as exc:
+                self._cache_failure(
+                    "checkpoint_load",
+                    "BCS checkpoint could not be loaded",
+                    type(exc).__name__,
+                )
                 raise BCSRuntimeUnavailableError("BCS capability is unavailable") from None
-            except Exception:
-                self._cache_failure("checkpoint_load", "BCS checkpoint could not be loaded")
+            except Exception as exc:
+                self._cache_failure(
+                    "checkpoint_load",
+                    "BCS checkpoint could not be loaded",
+                    type(exc).__name__,
+                )
                 raise BCSRuntimeUnavailableError("BCS capability is unavailable") from None
 
             try:
                 self._service = self._service_factory(loaded)
-            except Exception:
-                self._cache_failure("service_factory", "BCS service could not be initialized")
+            except Exception as exc:
+                self._cache_failure(
+                    "service_factory",
+                    "BCS service could not be initialized",
+                    type(exc).__name__,
+                )
                 raise BCSRuntimeUnavailableError("BCS capability is unavailable") from None
             self._status = BCSRuntimeStatus.READY
             return self._service
@@ -134,8 +152,12 @@ class BCSRuntime:
             checkpoint = environment.get(_CHECKPOINT_ENV)
             checkpoint_sha256 = environment.get(_CHECKPOINT_SHA256_ENV)
             device = environment.get(_DEVICE_ENV, "cpu")
-        except Exception:
-            self._cache_failure("configuration", "BCS environment configuration is invalid")
+        except Exception as exc:
+            self._cache_failure(
+                "configuration",
+                "BCS environment configuration is invalid",
+                type(exc).__name__,
+            )
             return
         if checkpoint is None or (isinstance(checkpoint, str) and not checkpoint.strip()):
             if checkpoint_sha256 is not None and (
@@ -164,15 +186,25 @@ class BCSRuntime:
                     require_file=True,
                 )
             )
-        except SafePathError:
-            self._cache_failure("configuration", "BCS checkpoint path is invalid")
+        except SafePathError as exc:
+            self._cache_failure(
+                "configuration",
+                "BCS checkpoint path is invalid",
+                type(exc).__name__,
+            )
             return
         self._device = device
         self._status = BCSRuntimeStatus.NOT_LOADED
 
-    def _cache_failure(self, category: str, reason: str) -> None:
+    def _cache_failure(
+        self,
+        category: str,
+        reason: str,
+        exception_type: str = "BCSConfigurationError",
+    ) -> None:
         self._failure = BCSRuntimeFailure(category, reason)
         self._status = BCSRuntimeStatus.UNAVAILABLE
+        logger.error("BCS %s failure: %s", category, exception_type)
 
 
 _global_runtime: BCSRuntime | None = None

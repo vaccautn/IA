@@ -25,7 +25,7 @@ está archivado en `reports/historical/obsolete-bcs-integer-baseline-2026-09-02.
 
 ## Requisitos
 
-- Python 3.11+ (desarrollado y probado en 3.13)
+- CPython 3.13 (`>=3.13,<3.14`)
 - GPU NVIDIA con CUDA 12.4 (opcional, funciona en CPU pero más lento)
 - ~3 GB de espacio para el modelo y dependencias
 
@@ -50,30 +50,18 @@ reproducible, después de crear el entorno instálelo y ejecute el chequeo desde
 entorno del proyecto:
 
 ```powershell
-.venv\Scripts\python -m pip install -e ".[dev]"
-.venv\Scripts\python -m ruff check src scripts tests
-```
-
-La verificación reproducible usa Ruff `0.15.20` desde el `.venv` y terminó con
-`0 diagnostics`. El extra `dev` conserva esa versión fijada.
-
-## Configuración rápida
-
-```powershell
-# 1. Crear venv e instalar dependencias del proyecto
+# 1. Crear el entorno e instalar los locks reproducibles
 python -m venv .venv
-.venv\Scripts\python -m pip install -e ".[api,bcs,dev,yolo]"
+.venv\Scripts\python -m pip install --require-hashes -r requirements-cpu.txt -r requirements-api.txt
+.venv\Scripts\python -m pip install --no-deps --no-build-isolation -e ".[yolo,api]"
 
-# 2. Verificar el peso local requerido por el detector de Fase 1
-dir outputs\training\combined-v2-finetune\weights\best.pt
+# 2. Verificar que el modelo desplegado versionado existe
+Test-Path models\deploy\vacca-yolo26n-v1.pt
 ```
 
-El peso local de Fase 1 es una salida generada por el flujo YOLO; existe actualmente
-en el entorno local, pero Git lo ignora. No está versionado y no se garantiza que exista en otro
-clon. El artefacto versionado
-`models/deploy/vacca-yolo26n-v1.pt` se conserva para reproducibilidad y despliegue,
-pero la API actual no lo selecciona automáticamente. El BCS no tiene pesos
-versionados.
+El modelo desplegado `models/deploy/vacca-yolo26n-v1.pt` está versionado en este repositorio; no es necesario descargarlo para ejecutar la API.
+Para ejecutar el chequeo de lint, instale el extra de desarrollo fijado y ejecute
+`.venv\Scripts\python -m ruff check src scripts tests`.
 
 ## Arrancar el servidor
 
@@ -81,22 +69,39 @@ versionados.
 .venv\Scripts\python scripts/run_api.py
 ```
 
-El servidor levanta en `http://127.0.0.1:8000` con estos puntos de acceso:
+El servidor levanta en `http://127.0.0.1:8001` con estos endpoints:
 
 | Método | Ruta | Descripción |
 |--------|------|-------------|
 | `GET` | `/health` | Estado del servicio, GPU, modelo cargado |
-| `POST` | `/detect` | Recibe imagen → vacas detectadas con cajas delimitadoras |
+| `POST` | `/detect` | Recibe imagen → vacas detectadas con cajas delimitadoras; `503` si la capacidad está ocupada |
 | `POST` | `/bcs` | Categoría BCS entera `1..5` sobre la imagen completa; `503` si no está disponible |
 | `GET` | `/ready/bcs` | Estado de capacidad BCS sin cargar el punto de control |
 | `GET` | `/ui` | UI de prueba de arrastrar y soltar (prototipo) |
 | `GET` | `/docs` | Swagger interactivo |
 
+### Conectividad privada entre hosts y contenedores
+
+Por defecto, el backend que consume esta API debe utilizar `http://127.0.0.1:8001/detect` cuando ambos procesos se ejecutan en el mismo host. Para contenedores o hosts separados, configure una red privada o interna y la URL del consumidor:
+
+```powershell
+# Solo para una red privada o interna del contenedor/host.
+.venv\Scripts\python scripts/run_api.py --host 0.0.0.0 --port 8001
+
+# El backend debe apuntar al nombre DNS del servicio o al host privado de la API.
+$env:IA_SERVICE_URL = "http://ia-api:8001/detect"
+# En una red privada entre hosts, por ejemplo:
+$env:IA_SERVICE_URL = "http://192.0.2.10:8001/detect"
+```
+
+No publique estos endpoints sin autenticación en Internet ni en una red no confiable. La API no implementa autenticación; el acceso externo requiere controles de red y autenticación en la capa correspondiente.
+
 ## Probar el sistema
 
 ### Opción 1: UI web (recomendado para validar)
 
-Inicie la API y abra `http://127.0.0.1:8000/ui` en el navegador:
+Inicie la API y abra `http://127.0.0.1:8001/ui` en el navegador. Arrastre una imagen
+para ver las detecciones con cajas delimitadoras dibujadas en tiempo real.
 
 ```powershell
 # BCS es opcional; sin estas variables la pestaña BCS muestra "unconfigured".
@@ -119,21 +124,21 @@ validación operativa de un candidato.
 
 ### Opción 2: Swagger
 
-`http://127.0.0.1:8000/docs` — documentación interactiva; puede probar los puntos de acceso directamente desde el navegador.
+`http://127.0.0.1:8001/docs` — documentación interactiva; puede probar los endpoints directamente desde el navegador.
 
 ### Opción 3: curl / PowerShell
 
 ```powershell
-# Comprobación de estado
-Invoke-RestMethod http://127.0.0.1:8000/health
+# Health check
+Invoke-RestMethod http://127.0.0.1:8001/health
 
 # Detectar vacas
-Invoke-RestMethod -Uri http://127.0.0.1:8000/detect `
+Invoke-RestMethod -Uri http://127.0.0.1:8001/detect `
   -Method Post `
   -Form @{file=Get-Item "data\cow-detection-navids\valid\images\alguna.jpg"}
 
 # BCS (requiere un punto de control BCS real configurado; de lo contrario devuelve 503)
-Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs `
+Invoke-RestMethod -Uri http://127.0.0.1:8001/bcs `
   -Method Post `
   -Form @{file=Get-Item "data\cow-detection-navids\valid\images\alguna.jpg"}
 ```
@@ -144,7 +149,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/bcs `
 import requests
 
 with open("vaca.jpg", "rb") as f:
-    resp = requests.post("http://127.0.0.1:8000/detect", files={"file": f})
+    resp = requests.post("http://127.0.0.1:8001/detect", files={"file": f})
 
 data = resp.json()
 print(f"Vacas detectadas: {data['detection_count']}")
@@ -152,14 +157,83 @@ for d in data["detections"]:
     print(f"  {d['confidence']:.1%} — bbox: [{d['x1']},{d['y1']},{d['x2']},{d['y2']}]")
 ```
 
-### Opción 5: Comprobación directa del detector (sin servidor)
+### Opción 5: Smoke test en proceso, sin servidor externo
 
 ```powershell
+# Importa la aplicación, ejecuta su ciclo de vida y solicita /health en proceso.
 .venv\Scripts\python scripts/smoke_test_api.py
+
+# Agrega una inferencia si se dispone de una imagen local explícita.
+.venv\Scripts\python scripts/smoke_test_api.py --image "C:\ruta\a\imagen.jpg"
 ```
 
-Este script auxiliar no inicia FastAPI, no hace HTTP y no verifica `/bcs` ni
-`/ready/bcs`; requiere el conjunto de datos y el peso YOLO local.
+Este modo carga la aplicación, ejecuta su ciclo de vida y solicita `/health` mediante ASGI en el mismo proceso. Confirma la preparación de la aplicación y del modelo, pero no confirma que exista un listener, que la red privada sea accesible ni que el backend atraviese el parser multipart real.
+
+### Opción 6: Smoke test contra el servidor activo
+
+Use el modo de red únicamente cuando el servicio ya esté iniciado. El comando mínimo valida el `/health` real en la URL exacta del servicio:
+
+```powershell
+.venv\Scripts\python scripts/smoke_test_api.py --base-url http://127.0.0.1:8001
+```
+
+Para validar también la ruta que consume el backend (`http://127.0.0.1:8001/detect`) sin ejecutar inferencia, envíe una carga inválida controlada y espere el contrato HTTP 400:
+
+```powershell
+.venv\Scripts\python scripts/smoke_test_api.py --base-url http://127.0.0.1:8001 --check-detect
+```
+
+Con una imagen local, el smoke test envía multipart al `/detect` real y valida el contrato exitoso de `DetectResponse`:
+
+```powershell
+.venv\Scripts\python scripts/smoke_test_api.py --base-url http://127.0.0.1:8001 --image "C:\ruta\a\imagen.jpg"
+```
+
+El modo de red tiene timeout; falla ante respuestas no 200 donde corresponde, JSON malformado o contratos incompletos. No requiere `requests` ni otra dependencia adicional.
+
+### Límites de transporte y despliegue
+
+La aplicación limita los bytes después de que el parser multipart haya procesado la solicitud. No se añade middleware de pre-parser: sin conocer el overhead multipart, rechazar un cuerpo de 10 MiB podría rechazar archivos válidos de 10 MiB. Por lo tanto, el límite de la aplicación no evita todo el consumo de recursos de transporte. En cualquier despliegue en contenedor o red privada, configure antes de entregar la solicitud a la aplicación límites de tamaño total del cuerpo (10 MiB más el overhead multipart), timeout de solicitud y concurrencia.
+
+La aplicación también mantiene una compuerta de capacidad de inferencia compartida y nombrada
+(`shared-inference-capacity`), con capacidad predeterminada `1` y un timeout corto de adquisición.
+`/detect` y `/bcs` devuelven HTTP `503` con `{"detail":"Inference capacity is busy; retry shortly"}`
+cuando la única inferencia permitida ya está ocupada; no se invoca el modelo ni el runtime BCS
+en esa solicitud. La compuerta se libera incluso cuando la inferencia falla. `/health` y
+`/ready/bcs` no adquieren esta compuerta y deben permanecer disponibles durante una inferencia.
+El límite de concurrencia del reverse proxy/servidor sigue siendo necesario para controlar
+solicitudes multipart que todavía esperan ser procesadas por la aplicación.
+
+### Acceso privado y monitoreo básico
+
+La API es privada y no autenticada: no publique `/health`, `/detect`, `/bcs` ni `/docs` en Internet o redes no confiables. La autenticación y los controles de red deben existir en la capa de acceso correspondiente; este prototipo no agrega autenticación.
+
+El servicio emite logging operativo en texto plano mediante el logger estándar de Python; no promete un formato JSON ni logs estructurados. Las líneas incluyen eventos de inicio, carga del modelo, rechazos y fallas con tipos de error seguros, y `/detect` devuelve `inference_time_ms`. Para una inspección básica, revise la salida capturada del proceso y busque, por ejemplo, `Starting VACCA Vision API`, `Model loaded`, `Rejected image upload` y `failed`; contraste también el código HTTP de las solicitudes y la latencia de `inference_time_ms`. En PowerShell puede filtrar una captura con `Get-Content .\logs\api.log | Select-String -Pattern 'Starting|Model loaded|Rejected|failed'`. No hay alertas automáticas implementadas.
+
+### Rollback y fix-forward operativo
+
+1. Detenga el servicio (por ejemplo, `Ctrl+C` en la terminal de Uvicorn).
+2. Preserve los datos operativos del operador —logs, cargas, configuración y cualquier salida— fuera del checkout. No los elimine ni los sobrescriba durante el rollback.
+3. Despliegue una revisión inmutable en un checkout nuevo y limpio; use el SHA completo de la revisión conocida como buena:
+
+   ```powershell
+   $deployRoot = "C:\deploy\vacca-api-<known-good-sha>"
+   $repositoryUrl = "<repository-url>"
+   $knownGoodSha = "<known-good-sha>"
+   git clone $repositoryUrl $deployRoot
+   git -C $deployRoot switch --detach $knownGoodSha
+   if (git -C $deployRoot status --porcelain) { throw "Deployment checkout is not clean" }
+   ```
+
+   Nunca restaure una revisión con `checkout` o un reset destructivo en el worktree de un desarrollador. Si se reutiliza un checkout de despliegue desechable, `git -C $deployRoot reset --hard $knownGoodSha` solo es admisible allí, después de confirmar que los datos del operador están fuera de ese directorio.
+4. Cree el entorno virtual antes de invocar su intérprete: `& python -m venv "${deployRoot}\.venv"`.
+5. Instale el lock combinado y el proyecto sin resolver dependencias nuevamente: `& "${deployRoot}\.venv\Scripts\python.exe" -m pip install --require-hashes -r "${deployRoot}\requirements-cpu.txt" -r "${deployRoot}\requirements-api.txt"`; `& "${deployRoot}\.venv\Scripts\python.exe" -m pip install --no-deps --no-build-isolation -e "${deployRoot}[yolo,api]"`.
+6. Ejecute el smoke en proceso: `& "${deployRoot}\.venv\Scripts\python.exe" "${deployRoot}\scripts\smoke_test_api.py"`.
+7. Inicie el servicio en el puerto esperado: `& "${deployRoot}\.venv\Scripts\python.exe" "${deployRoot}\scripts\run_api.py" --host 127.0.0.1 --port 8001`.
+8. Ejecute el smoke de red: `& "${deployRoot}\.venv\Scripts\python.exe" "${deployRoot}\scripts\smoke_test_api.py" --base-url http://127.0.0.1:8001 --check-detect`.
+9. Verifique el backend con `http://127.0.0.1:8001/detect` y una imagen válida, o con el contrato 400 de carga inválida si no existe un fixture. Detenga y retire únicamente el checkout de despliegue desechable cuando finalice la operación; conserve los datos del operador.
+
+Para un fix-forward, aplique el cambio sobre la revisión conocida como buena y repita los pasos 3–9. No se fija aquí ningún SHA futuro.
 
 ## Re-entrenar el modelo
 
@@ -226,6 +300,12 @@ disponibilidad sin cargar el modelo. Sólo configure `VACCA_BCS_CHECKPOINT` y
 controles de aceptación y la entrega estricta de la guía operativa. Use el hash exacto reportado por
 la validación; no hay un hash BCS válido codificado de forma fija en este repositorio.
 
+Si una carga, configuración o inferencia BCS falla, el estado `unavailable` se conserva hasta
+reiniciar el proceso. Después de corregir el punto de control, el dispositivo o la configuración,
+detenga y vuelva a iniciar la API para aplicar la corrección. No se reintenta automáticamente:
+evitar reintentos mantiene una falla determinista, impide repetir cargas costosas o inseguras en
+cada solicitud y permite corregir la causa antes de habilitar nuevamente el modelo.
+
 ## Resultados de entrenamiento
 
 | Ejecución | Imágenes | Épocas | mAP50 | mAP50-95 | Precisión | Exhaustividad | Tiempo |
@@ -240,9 +320,9 @@ IA/
 ├── src/vacca_api/           ← Microservicio FastAPI
 │   ├── main.py              ← Rutas: /detect, /bcs, /ready/bcs, /health, /ui
 │   ├── detection.py         ← Adaptador YOLO (singleton)
+│   ├── upload_validation.py ← Límite y validación común de uploads
 │   ├── schemas.py           ← Modelos Pydantic
 │   ├── bcs_runtime.py       ← Entorno de ejecución BCS de carga diferida y estados de disponibilidad
-│   ├── upload_validation.py ← Validación compartida de cargas
 │   └── static/index.html    ← UI de prototipo (descartable)
 ├── src/vacca_bcs/           ← Paquete de categorías BCS 1..5
 │   ├── constants.py         ← Dominio de categorías y constantes compartidas
@@ -260,7 +340,7 @@ IA/
 │   ├── run_bcs_overnight.py ← Operador local de ejecución nocturna
 │   ├── run_baseline.py       ← Línea base reproducible de Fase 1
 │   ├── run_api.py           ← Script de arranque del servidor API
-│   └── smoke_test_api.py    ← Comprobación directa del detector y los esquemas
+│   └── smoke_test_api.py    ← Ciclo de vida FastAPI, /health ASGI y HTTP en vivo opcional
 ├── configs/                 ← Archivos YAML de entrenamiento
 ├── data/                    ← (ignorado por Git)
 │   ├── bcs/dataset/         ← Carpetas locales de la fuente fraccional

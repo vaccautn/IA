@@ -9,7 +9,6 @@ coverage.json
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
-.codegraph/
 htmlcov/
 
 # Local environments and packaging output
@@ -33,7 +32,8 @@ Thumbs.db
 !.env.example
 
 # Logs, temporary files, backups, and editor swap files
-logs/
+/.codegraph/
+/logs/
 *.log
 temp/
 tmp/

@@ -495,7 +495,7 @@ La selección definitiva podrá cambiar como resultado de la prueba exploratoria
 
 ### 15.1 Lenguaje
 
-**Python 3.11 o versión compatible con el marco de trabajo seleccionado.**
+**CPython 3.13 (`>=3.13,<3.14`).**
 
 Motivos:
 

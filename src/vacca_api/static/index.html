@@ -185,7 +185,7 @@
 <footer class="api-footer">
   Endpoints: <code>POST /detect</code> &nbsp;|&nbsp; <code>GET /health</code> &nbsp;|&nbsp;
   <code>POST /bcs</code> &nbsp;|&nbsp; <code>GET /ready/bcs</code> &nbsp;|&nbsp;
-  Modelo: combined-v2-finetune (Navid + BCS) &nbsp;|&nbsp; YOLO26n
+  Modelo: vacca-yolo26n-v1.pt &nbsp;|&nbsp; YOLO26n
 </footer>
 
 <script>
@@ -198,9 +198,10 @@
   });
   const validReadiness = new Set(Object.keys(readinessMessages));
   const errorMessages = Object.freeze({
-    'File must be an image (JPEG, PNG, etc.)': 'Seleccioná una imagen válida.',
+    'File must be an image (JPEG or PNG)': 'Seleccioná una imagen válida.',
     'Empty file': 'El archivo está vacío.',
     'Failed to read uploaded file': 'No se pudo leer la imagen.',
+    'Image file cannot be decoded safely': 'La imagen no se puede decodificar de forma segura.',
     'BCS image input is invalid': 'La imagen no es válida para BCS.',
     'BCS capability is unavailable': 'BCS no está disponible en este momento.',
     'BCS inference failed': 'No se pudo calcular el BCS.',
@@ -330,7 +331,7 @@
         if (!response.ok) {
           state.bcsLoading = false;
           if (response.status === 503) {
-            state.bcsStatus = detail(body) === 'BCS capability is unavailable' ? 'unavailable' : 'unavailable';
+            state.bcsStatus = 'unavailable';
             state.bcsMessage = readinessMessages.unavailable;
           }
           emit({ type: 'error', target: 'bcs', status: response.status,
@@ -388,7 +389,7 @@ function handleControllerEvent(event) {
   if (event.type === 'error') showError(event.target === 'bcs' ? bcsResults : results, event.status, event.message);
   if (event.type === 'bcs-result') renderBcsResult(event.data);
 }
-const controller = window.VaccaUiController.createUiController({ fetchImpl: (...args) => fetch(...args), onState: syncUi, onEvent: handleControllerEvent });
+const controller = window.VaccaUiController.createUiController({ fetchImpl: (...args) => fetch(...args), urlApi: URL, onState: syncUi, onEvent: handleControllerEvent });
 fileInput.addEventListener('change', () => { if (fileInput.files.length > 0) controller.selectFile(fileInput.files[0]); fileInput.value = ''; });
 dropzone.addEventListener('dragover', event => { event.preventDefault(); dropzone.classList.add('dragover'); });
 dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
@@ -487,12 +488,9 @@ calculateBcs.addEventListener('click', () => controller.calculateBcs());
 refreshReadiness.addEventListener('click', () => controller.refreshReadiness());
 window.addEventListener('beforeunload', () => controller.destroy());
 window.addEventListener('resize', () => {
-  if (latestDetection && latestDetectionVersion === selectionVersion) {
+  if (latestDetection && latestDetectionVersion === controller.getState().generation) {
     drawBoxes(latestDetection, latestDetectionVersion);
   }
-});
-window.addEventListener('beforeunload', () => {
-  if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
 });
 </script>
 </body>

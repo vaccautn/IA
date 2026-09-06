@@ -123,3 +123,15 @@ $env:VACCA_BCS_CHECKPOINT_SHA256 = "<EXACT_SHA256_FROM_OVERNIGHT_VALIDATION>"
 
 `GET /ready/bcs` valida disponibilidad sin cargar el modelo; `POST /bcs`
 responde `bcs_category` como un entero 1..5. La detección YOLO no cambia.
+
+La API opera por defecto en `http://127.0.0.1:8001` y su detector versionado es
+`models/deploy/vacca-yolo26n-v1.pt`. FastAPI lo carga una sola vez durante el
+`lifespan` y lo conserva en `request.app.state.detector`; `/bcs` no invoca ese
+detector. `/bcs` y `/detect` comparten validación acotada de cargas JPEG/PNG, incluido
+`image/jpg`, con decodificación, límites de dimensiones/píxeles y `413` para más de
+10 MiB. No se habilita CORS permisivo.
+
+Antes de cualquier candidato aprobado, mantenga ambas variables BCS sin configurar.
+El smoke en proceso y el smoke contra el listener deben confirmar `/health` y el
+contrato controlado de `/detect`; ningún smoke activa, descarga o carga el candidato
+rechazado.
