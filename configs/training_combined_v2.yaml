@@ -1,5 +1,5 @@
-# VACCA Fase 1 — Fine-tuning v2: BCS imágenes NO usadas + todo Navid
-# 18,013 imágenes totales (14,791 train / 3,222 val)
+# VACCA Fase 1 — Ajuste fino v2: imágenes BCS no utilizadas + todo Navid
+# 18,013 imágenes totales (14,791 entrenamiento / 3,222 validación)
 # ~40-45 min en RTX 4060
 
 data: data/combined-v2/data.yaml
