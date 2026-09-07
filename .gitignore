@@ -73,11 +73,13 @@ images/
 *.tar
 *.tar.gz
 *.zip
+*.zip.sha256
 
 # Checkpoints, weights, and exported models
 checkpoints/
 models/checkpoints/
 models/weights/
+/models/private/
 weights/
 *.ckpt
 *.onnx
@@ -91,6 +93,7 @@ weights/
 outputs/
 runs/
 artifacts/
+/artifacts/private/
 mlruns/
 reports/generated/
 reports/generated-*

@@ -1,0 +1,53 @@
+name: Public quality
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  public-quality:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out public repository
+        uses: actions/checkout@v4
+
+      - name: Set up CPython 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install locked CPU, API, and development dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --require-hashes -r requirements-cpu.txt -r requirements-api.txt -r requirements-dev.txt
+          python -m pip install --no-deps --no-build-isolation -e ".[yolo,api]"
+
+      - name: Prove private payloads are absent
+        shell: pwsh
+        run: |
+          python -c "from vacca_bcs.serving_package import PRIVATE_ARCHIVE_PATH, PRIVATE_PACKAGE_ROOT; assert not PRIVATE_ARCHIVE_PATH.exists(); assert not PRIVATE_PACKAGE_ROOT.exists()"
+          git check-ignore --no-index models/private/bcs-category-coral-2026-09-04/model_state.pt
+          git check-ignore --no-index artifacts/private/bcs-category-coral-2026-09-04/vacca-bcs-category-coral-2026-09-04-experimental.zip
+
+      - name: Run public Python suite with deprecations as errors
+        shell: pwsh
+        run: python -m pytest --disable-warnings --strict-config --strict-markers -W error::DeprecationWarning -q
+
+      - name: Run JavaScript UI tests
+        shell: pwsh
+        run: node --test tests/ui_controller.test.js
+
+      - name: Run Ruff
+        shell: pwsh
+        run: python -m ruff check src scripts tests
+
+      - name: Compile Python sources
+        shell: pwsh
+        run: python -m compileall -q src scripts tests
+
+      - name: Check working tree formatting
+        shell: pwsh
+        run: git diff --check
