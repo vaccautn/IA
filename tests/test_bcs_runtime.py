@@ -11,6 +11,7 @@ from vacca_api.bcs_runtime import (
     BCSRuntimeStatus,
     BCSRuntimeUnavailableError,
 )
+import vacca_api.bcs_runtime as runtime_module
 
 
 def _service(value: str = "service") -> object:
@@ -29,14 +30,42 @@ def _configured(tmp_path: Path, name: str = "model.pt") -> tuple[dict[str, str],
     }, path
 
 
-def test_missing_or_blank_checkpoint_is_unconfigured_without_loading() -> None:
+def test_default_private_package_is_lazy_and_partial_checkpoint_configuration_fails_closed() -> None:
     calls: list[tuple[object, object]] = []
-    for value in (None, "", "   "):
+    runtime = BCSRuntime({}, loader=calls.append)
+    assert runtime.status == BCSRuntimeStatus.NOT_LOADED
+    assert runtime.model_status.value == "experimental_not_approved"
+    with pytest.raises(BCSRuntimeUnavailableError):
+        runtime.get_service()
+    assert calls == []
+    for value in ("", "   "):
         runtime = BCSRuntime({"VACCA_BCS_CHECKPOINT": value}, loader=calls.append)
-        assert runtime.status == BCSRuntimeStatus.UNCONFIGURED
+        assert runtime.status == BCSRuntimeStatus.UNAVAILABLE
         with pytest.raises(BCSRuntimeUnavailableError):
             runtime.get_service()
     assert calls == []
+
+
+def test_explicit_disable_is_unconfigured() -> None:
+    runtime = BCSRuntime({"VACCA_BCS_DISABLED": "1"})
+    assert runtime.status == BCSRuntimeStatus.UNCONFIGURED
+    assert runtime.model_status.value == "none"
+    with pytest.raises(BCSRuntimeUnavailableError):
+        runtime.get_service()
+
+
+def test_missing_private_package_reports_recoverable_backup_without_absolute_path(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(runtime_module, "PRIVATE_PACKAGE_ROOT", tmp_path / "missing")
+    monkeypatch.setattr(
+        runtime_module,
+        "find_recoverable_backups",
+        lambda: (tmp_path / ".bcs-category-coral-2026-09-04.backup-token",),
+    )
+    runtime = BCSRuntime({})
+    assert runtime.status == BCSRuntimeStatus.NOT_INSTALLED
+    assert runtime.failure is not None
+    assert "retained recovery backup is available" in runtime.failure.reason
+    assert str(tmp_path) not in runtime.failure.reason
 
 
 def test_configured_runtime_is_not_loaded_until_explicit_get_and_passes_device(tmp_path: Path) -> None:
@@ -223,6 +252,48 @@ def test_missing_or_malformed_checkpoint_digest_is_unavailable_without_loading()
         with pytest.raises(BCSRuntimeUnavailableError):
             runtime.get_service()
     assert calls == []
+
+
+def test_invalid_disable_value_fails_closed_without_loading() -> None:
+    calls: list[object] = []
+    runtime = BCSRuntime({"VACCA_BCS_DISABLED": "true"}, loader=lambda *args, **kwargs: calls.append(True))
+    assert runtime.status == BCSRuntimeStatus.UNAVAILABLE
+    with pytest.raises(BCSRuntimeUnavailableError):
+        runtime.get_service()
+    assert calls == []
+
+
+def test_default_package_is_preflighted_before_not_loaded(monkeypatch, tmp_path: Path) -> None:
+    import vacca_api.bcs_runtime as runtime_module
+
+    private_package = tmp_path / "private" / "bcs-category-coral-2026-09-04"
+    private_package.mkdir(parents=True)
+    monkeypatch.setattr(runtime_module, "PRIVATE_PACKAGE_ROOT", private_package)
+
+    def fail_preflight():
+        raise runtime_module.ServingPackageError("tampered package")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "validate_installed_package",
+        fail_preflight,
+    )
+    runtime = BCSRuntime({})
+    assert runtime.status == BCSRuntimeStatus.UNAVAILABLE
+    assert runtime.failure is not None
+    assert runtime.failure.category == "package_unavailable"
+
+
+def test_missing_private_package_is_not_installed_without_affecting_custom_loader(monkeypatch, tmp_path: Path) -> None:
+    import vacca_api.bcs_runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "PRIVATE_PACKAGE_ROOT", tmp_path / "missing")
+    runtime = BCSRuntime({})
+    assert runtime.status == BCSRuntimeStatus.NOT_INSTALLED
+    assert runtime.failure is not None
+    assert runtime.failure.category == "package_not_installed"
+    with pytest.raises(BCSRuntimeUnavailableError):
+        runtime.get_service()
 
 
 def test_external_checkpoint_path_is_unavailable_without_loading() -> None:

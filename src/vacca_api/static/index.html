@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VACCA Vision — Prototype</title>
+<title>VACCA Vision — Prototipo</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -110,6 +110,7 @@
   .primary-button { background:var(--accent); border-color:var(--accent); color:#000; width:100%; }
   button:disabled { cursor:not-allowed; opacity:.5; }
   .bcs-help { color:var(--muted); font-size:14px; line-height:1.5; margin:0 0 16px; }
+  .bcs-experimental-warning { background:#3d2e00; border:1px solid var(--warning); border-radius:6px; color:#f0d98c; font-size:13px; line-height:1.45; margin:0 0 16px; padding:10px 12px; }
   .progress { color:var(--accent); font-size:14px; padding:20px 0; text-align:center; }
   .category-card { background:var(--bg); border:1px solid var(--accent); border-radius:8px; margin-top:16px; padding:20px; text-align:center; }
   .category-label { color:var(--muted); font-size:13px; letter-spacing:.5px; text-transform:uppercase; }
@@ -148,10 +149,10 @@
     <h2>📤 Imagen</h2>
     <div class="dropzone" id="dropzone">
       <input type="file" id="fileInput" accept="image/*" aria-label="Seleccionar imagen">
-      <img id="preview" style="display:none" alt="Preview">
+      <img id="preview" style="display:none" alt="Vista previa">
       <canvas id="bboxCanvas" class="overlay" style="display:none"></canvas>
       <div class="upload-hint" id="uploadHint">
-        <strong>Arrastrá una imagen</strong> o hacé clic<br>
+         <strong>Arrastre una imagen</strong> o haga clic<br>
         <span style="font-size:12px">JPEG, PNG — máx ~10 MB</span>
       </div>
     </div>
@@ -161,8 +162,8 @@
 
   <!-- RIGHT: Results and BCS -->
   <div class="panel">
-    <div class="tab-list" role="tablist" aria-label="Prototype modes">
-      <button type="button" class="tab" id="detectTab" role="tab" aria-selected="true" aria-controls="detectPanel" tabindex="0">Detect</button>
+    <div class="tab-list" role="tablist" aria-label="Modos de prototipo">
+       <button type="button" class="tab" id="detectTab" role="tab" aria-selected="true" aria-controls="detectPanel" tabindex="0">Detección</button>
       <button type="button" class="tab" id="bcsTab" role="tab" aria-selected="false" aria-controls="bcsPanel" tabindex="-1">BCS</button>
     </div>
 
@@ -172,10 +173,11 @@
     </section>
 
     <section class="tab-panel" id="bcsPanel" role="tabpanel" aria-labelledby="bcsTab" hidden>
-       <h2>📊 BCS category 1..5</h2>
-       <p class="bcs-help">Calculá la categoría BCS 1..5 sobre la imagen completa. Esta capacidad necesita un checkpoint compatible y su digest SHA-256 confiable.</p>
+       <h2>📊 Categoría BCS 1..5</h2>
+         <p class="bcs-help">Calcule la categoría BCS 1..5 sobre la imagen completa. El estado del paquete local se muestra abajo; el archivo privado sólo puede obtenerse desde la ubicación privada de VACCA Drive del equipo o del mantenedor.</p>
+       <p class="bcs-experimental-warning" id="bcsExperimentalWarning" role="alert"><strong>Advertencia:</strong> BCS es experimental y no está aprobado para producción. Su estado seguirá visible aunque esté listo o muestre un resultado.</p>
       <div class="readiness-row"><span class="readiness-badge" id="bcsReadiness" role="status" aria-live="polite" data-status="unknown">BCS: estado no consultado.</span><button type="button" class="secondary-button" id="refreshReadiness">Actualizar</button></div>
-      <button type="button" class="primary-button" id="calculateBcs" disabled>Calculate BCS</button>
+       <button type="button" class="primary-button" id="calculateBcs" disabled>Calcular BCS</button>
       <div class="progress" id="bcsProgress" role="status" aria-live="polite" hidden></div>
       <div id="bcsResults" aria-live="polite" aria-atomic="true"></div>
     </section>
@@ -183,28 +185,49 @@
 </main>
 
 <footer class="api-footer">
-  Endpoints: <code>POST /detect</code> &nbsp;|&nbsp; <code>GET /health</code> &nbsp;|&nbsp;
+  Rutas: <code>POST /detect</code> &nbsp;|&nbsp; <code>GET /health</code> &nbsp;|&nbsp;
   <code>POST /bcs</code> &nbsp;|&nbsp; <code>GET /ready/bcs</code> &nbsp;|&nbsp;
   Modelo: vacca-yolo26n-v1.pt &nbsp;|&nbsp; YOLO26n
 </footer>
 
 <script>
 (function (root) {
-  const readinessMessages = Object.freeze({
-    ready: 'BCS listo para calcular.',
-    not_loaded: 'BCS configurado, pero todavía no está cargado.',
-    unconfigured: 'BCS no está configurado en este servidor.',
-    unavailable: 'BCS no está disponible en este momento.',
-  });
+   const readinessMessages = Object.freeze({
+     ready: 'BCS listo para calcular; continúa experimental y no aprobado.',
+      not_loaded: 'BCS privado instalado, pero todavía no está cargado; continúa experimental y no aprobado.',
+      not_installed: 'BCS privado no instalado; obtenga el ZIP desde la ubicación privada de VACCA Drive del equipo o del mantenedor.',
+     unconfigured: 'BCS no está configurado o fue deshabilitado en este servidor.',
+     unavailable: 'BCS no está disponible en este momento; el estado requiere revisión.',
+   });
+   const readinessMessage = (status, modelStatus, packageId, apiMessage) => {
+      if (status === 'not_installed') return 'BCS privado no está instalado; obtenga el ZIP desde la ubicación privada de VACCA Drive del equipo o del mantenedor.';
+     if (modelStatus === 'external_unclassified') return status === 'ready'
+       ? 'BCS externo listo; permanece no clasificado y no aprobado.'
+       : 'BCS externo configurado; permanece no clasificado y no aprobado.';
+     if (modelStatus === 'experimental_not_approved' && (status === 'not_loaded' || status === 'ready')) {
+       return packageId
+         ? `BCS privado instalado; estado experimental no aprobado (${status}).`
+         : `BCS experimental no aprobado (${status}).`;
+     }
+     return typeof apiMessage === 'string' && apiMessage ? apiMessage : readinessMessages[status];
+   };
   const validReadiness = new Set(Object.keys(readinessMessages));
+  const readinessLabels = Object.freeze({
+    ready: 'Listo', not_loaded: 'No cargado', not_installed: 'No instalado', unconfigured: 'No configurado', unavailable: 'No disponible',
+  });
+  root.VaccaReadinessLabels = readinessLabels;
   const errorMessages = Object.freeze({
-    'File must be an image (JPEG or PNG)': 'Seleccioná una imagen válida.',
+    'File must be an image (JPEG or PNG)': 'Seleccione una imagen válida.',
     'Empty file': 'El archivo está vacío.',
     'Failed to read uploaded file': 'No se pudo leer la imagen.',
     'Image file cannot be decoded safely': 'La imagen no se puede decodificar de forma segura.',
     'BCS image input is invalid': 'La imagen no es válida para BCS.',
     'BCS capability is unavailable': 'BCS no está disponible en este momento.',
     'BCS inference failed': 'No se pudo calcular el BCS.',
+  });
+  const bcsResultMessages = Object.freeze({
+    'Experimental BCS category 1..5 computed successfully; not approved for production.': 'Categoría BCS experimental calculada; no aprobada para producción.',
+    'BCS category 1..5 computed successfully.': 'Categoría BCS calculada correctamente.',
   });
 
   function createUiController({
@@ -218,7 +241,8 @@
   }) {
     const state = {
       generation: 0, selectedFile: null, objectUrl: null, bcsStatus: null,
-      bcsMessage: '', readinessLoading: false, detectLoading: false, bcsLoading: false,
+          bcsMessage: '', modelStatus: null, packageId: null,
+          readinessLoading: false, detectLoading: false, bcsLoading: false,
     };
     let detectRequest = null, bcsRequest = null, readinessRequest = null, readinessId = 0;
     const snapshot = () => ({ ...state, canCalculate: Boolean(
@@ -240,7 +264,7 @@
       detectRequest = bcsRequest = readinessRequest = null;
       if (state.objectUrl) { try { urlApi.revokeObjectURL(state.objectUrl); } catch (_) {} }
       Object.assign(state, {
-        selectedFile: null, objectUrl: null, bcsStatus: null, bcsMessage: '',
+          selectedFile: null, objectUrl: null, bcsStatus: null, bcsMessage: '', modelStatus: null, packageId: null,
         readinessLoading: false, detectLoading: false, bcsLoading: false,
       });
       emit({ type: 'selection-reset', reason });
@@ -277,7 +301,7 @@
     function selectFile(file) {
       if (!isImageFile(file)) {
         invalidateSelection('invalid-file');
-        emit({ type: 'error', target: 'detect', status: 400, message: 'Seleccioná sólo imágenes (JPEG, PNG).' });
+        emit({ type: 'error', target: 'detect', status: 400, message: 'Seleccione sólo imágenes (JPEG, PNG).' });
         return false;
       }
       invalidateSelection('new-selection');
@@ -304,7 +328,10 @@
         const body = await payload(response);
         if (requestId !== readinessId) return;
         const status = body && validReadiness.has(body.status) ? body.status : 'unavailable';
-        state.bcsStatus = status; state.bcsMessage = readinessMessages[status];
+            state.bcsStatus = status;
+            state.modelStatus = body && typeof body.model_status === 'string' ? body.model_status : null;
+            state.packageId = body && typeof body.package_id === 'string' ? body.package_id : null;
+            state.bcsMessage = readinessMessage(status, state.modelStatus, state.packageId, body && body.message);
         emit({ type: 'readiness', status, message: state.bcsMessage });
       } catch (error) {
         if (error.name === 'AbortError' || requestId !== readinessId) return;
@@ -329,7 +356,9 @@
         const body = await payload(response);
         if (!current(generation)) return false;
         if (!response.ok) {
-          state.bcsLoading = false;
+            state.bcsLoading = false;
+            state.modelStatus = typeof body.model_status === 'string' ? body.model_status : state.modelStatus;
+            state.packageId = typeof body.package_id === 'string' ? body.package_id : state.packageId;
           if (response.status === 503) {
             state.bcsStatus = 'unavailable';
             state.bcsMessage = readinessMessages.unavailable;
@@ -374,12 +403,25 @@ const tabs = [document.getElementById('detectTab'), document.getElementById('bcs
 const tabPanels = { detectTab: document.getElementById('detectPanel'), bcsTab: document.getElementById('bcsPanel') };
 
 const COLORS = ['#58a6ff','#3fb950','#d2991d','#f85149','#bc8cff','#ff7b72'];
-const bcsReadiness = document.getElementById('bcsReadiness'), refreshReadiness = document.getElementById('refreshReadiness'), calculateBcs = document.getElementById('calculateBcs'), bcsProgress = document.getElementById('bcsProgress'), bcsResults = document.getElementById('bcsResults');
+const readinessLabels = window.VaccaReadinessLabels;
+const bcsReadiness = document.getElementById('bcsReadiness'), refreshReadiness = document.getElementById('refreshReadiness'), calculateBcs = document.getElementById('calculateBcs'), bcsProgress = document.getElementById('bcsProgress'), bcsResults = document.getElementById('bcsResults'), bcsExperimentalWarning = document.getElementById('bcsExperimentalWarning');
 let latestDetection = null, latestDetectionVersion = 0;
 
 function selectTab(tab) { tabs.forEach(candidate => { const selected = candidate === tab; candidate.setAttribute('aria-selected', String(selected)); candidate.tabIndex = selected ? 0 : -1; tabPanels[candidate.id].hidden = !selected; }); if (tab.id === 'bcsTab') controller.refreshReadiness(); }
 tabs.forEach((tab, index) => { tab.addEventListener('click', () => selectTab(tab)); tab.addEventListener('keydown', event => { if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0; const targetIndex = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + offset + tabs.length) % tabs.length; tabs[targetIndex].focus(); selectTab(tabs[targetIndex]); }); });
-function syncUi(state) { calculateBcs.disabled = !state.canCalculate; bcsProgress.hidden = !state.bcsLoading; bcsProgress.textContent = state.bcsLoading ? 'Calculando BCS…' : ''; spinner.classList.toggle('active', state.detectLoading); bcsReadiness.dataset.status = state.readinessLoading ? 'loading' : (state.bcsStatus || 'unknown'); bcsReadiness.textContent = state.readinessLoading ? 'BCS: comprobando disponibilidad…' : state.bcsStatus ? `${state.bcsStatus}: ${state.bcsMessage}` : 'BCS: estado no consultado.'; }
+function modelWarning(state) {
+  const multiCow = ' Use una sola vaca; una imagen con varias vacas es ambigua.';
+   if (state.bcsStatus === 'not_installed') return 'BCS privado no está instalado. Obtenga el ZIP desde la ubicación privada de VACCA Drive del equipo o del mantenedor.' + multiCow;
+  if (state.bcsStatus === 'unavailable') return 'BCS no está disponible; revise el estado del servicio sin asumir que el paquete está instalado.' + multiCow;
+  if (state.modelStatus === 'experimental_not_approved') {
+    const installed = (state.bcsStatus === 'not_loaded' || state.bcsStatus === 'ready') && Boolean(state.packageId);
+    return `${installed ? 'BCS privado instalado; ' : ''}es experimental y no está aprobado para producción.${multiCow}`;
+  }
+  if (state.modelStatus === 'external_unclassified') return 'Aviso: BCS usa un modelo externo no clasificado. No se presenta como aprobado. Verifique su procedencia antes de usarlo.' + multiCow;
+  if (state.modelStatus === 'none') return 'Estado: BCS está deshabilitado o no configurado en este proceso.' + multiCow;
+  return 'Advertencia: BCS es un prototipo experimental.' + multiCow;
+}
+function syncUi(state) { calculateBcs.disabled = !state.canCalculate; bcsProgress.hidden = !state.bcsLoading; bcsProgress.textContent = state.bcsLoading ? 'Calculando BCS…' : ''; spinner.classList.toggle('active', state.detectLoading); bcsReadiness.dataset.status = state.readinessLoading ? 'loading' : (state.bcsStatus || 'unknown'); bcsReadiness.textContent = state.readinessLoading ? 'BCS: comprobando disponibilidad…' : state.bcsStatus ? `${readinessLabels[state.bcsStatus] || state.bcsStatus}: ${state.bcsMessage}` : 'BCS: estado no consultado.'; bcsExperimentalWarning.textContent = modelWarning(state); }
 function resetVisualState() { preview.removeAttribute('src'); preview.style.display = 'none'; uploadHint.style.display = 'block'; dropzone.classList.remove('has-image'); results.replaceChildren(); summary.replaceChildren(); summary.style.display = 'none'; canvas.style.display = 'none'; bcsResults.replaceChildren(); }
 function handleControllerEvent(event) {
   if (event.type === 'selection-reset') resetVisualState();
@@ -411,14 +453,15 @@ function renderResults(data) {
     const rank = createTextElement('div', 'result-rank', String(index + 1));
     rank.style.backgroundColor = COLORS[index % COLORS.length];
     const info = createTextElement('div', 'result-info', '');
-    info.append(createTextElement('div', 'result-class', `🐄 ${String(detection.class_name || 'cow')}`));
+        const className = detection.class_name === 'cow' ? 'vaca' : String(detection.class_name || 'vaca');
+        info.append(createTextElement('div', 'result-class', `🐄 ${className}`));
     const confidence = Number(detection.confidence);
     info.append(createTextElement('div', 'result-conf', `${(Number.isFinite(confidence) ? confidence * 100 : 0).toFixed(1)}%`));
     const bbox = detection.bbox || {};
     const norm = [bbox.x_center, bbox.y_center, bbox.width, bbox.height]
       .map(value => Number.isFinite(Number(value)) ? Number(value).toFixed(3) : '—').join(', ');
-    info.append(createTextElement('div', 'result-bbox', `bbox: [${detection.x1}, ${detection.y1}, ${detection.x2}, ${detection.y2}]`));
-    info.append(createTextElement('div', 'result-bbox', `norm: [${norm}]`));
+    info.append(createTextElement('div', 'result-bbox', `caja: [${detection.x1}, ${detection.y1}, ${detection.x2}, ${detection.y2}]`));
+    info.append(createTextElement('div', 'result-bbox', `normalizado: [${norm}]`));
     card.append(rank, info);
     results.append(card);
   });
@@ -458,7 +501,7 @@ function drawBoxes(data, version) {
     context.lineWidth = 2;
     context.strokeRect(x1, y1, width, height);
     const confidence = Number(detection.confidence);
-    const label = `cow ${(Number.isFinite(confidence) ? confidence * 100 : 0).toFixed(0)}%`;
+     const label = `vaca ${(Number.isFinite(confidence) ? confidence * 100 : 0).toFixed(0)}%`;
     context.fillStyle = color;
     context.font = '12px monospace';
     const textWidth = context.measureText(label).width + 8;
@@ -475,12 +518,15 @@ function renderBcsResult(data) {
     return;
   }
   const card = createTextElement('section', 'category-card', '');
-  card.append(createTextElement('p', 'category-label', 'BCS category (1..5)'));
+  card.append(createTextElement('p', 'category-label', 'Categoría BCS (1..5)'));
   card.append(createTextElement('p', 'category-value', String(category)));
-  const detail = createTextElement('div', 'bcs-detail', '');
-  appendSummaryRow(detail, 'Estado', String(data.status || 'ok'));
-  appendSummaryRow(detail, 'Mensaje', String(data.message || 'BCS calculado.'));
-  appendSummaryRow(detail, 'Cow detected', data.cow_detected === null ? 'Not reported' : (data.cow_detected ? 'Detected' : 'Not detected'));
+      const detail = createTextElement('div', 'bcs-detail', '');
+      appendSummaryRow(detail, 'Estado', data.status === 'ok' ? 'Correcto' : String(data.status || 'Correcto'));
+      appendSummaryRow(detail, 'Mensaje', bcsResultMessages[data.message] || String(data.message || 'BCS calculado.'));
+      const modelStatusLabels = { experimental_not_approved: 'Experimental; no aprobado', external_unclassified: 'Externo; no clasificado', none: 'Deshabilitado o no configurado' };
+      appendSummaryRow(detail, 'Estado del modelo', modelStatusLabels[data.model_status] || 'No informado');
+      if (typeof data.package_id === 'string') appendSummaryRow(detail, 'Paquete', data.package_id);
+      appendSummaryRow(detail, 'Vaca detectada', data.cow_detected === null ? 'No informado' : (data.cow_detected ? 'Detectada' : 'No detectada'));
   card.append(detail);
   bcsResults.append(card);
 }

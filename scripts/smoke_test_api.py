@@ -23,11 +23,11 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from vacca_api import main as api_main  # noqa: E402
 from vacca_api.detection import DEFAULT_MODEL  # noqa: E402
-from vacca_api.schemas import DetectResponse, HealthResponse  # noqa: E402
+from vacca_api.schemas import BCSReadinessResponse, BCSResponse, DetectResponse, HealthResponse  # noqa: E402
+from vacca_bcs.serving_package import PRIVATE_PACKAGE_ID  # noqa: E402
 
 logger = logging.getLogger(__name__)
 LIVE_DETECT_INVALID_DETAIL = "File must be an image (JPEG or PNG)"
-LIVE_INVALID_IMAGE_DETAIL = "Image file cannot be decoded safely"
 
 
 class SmokeCheckError(RuntimeError):
@@ -63,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="In live mode, exercise /detect with a controlled invalid upload when no image is given.",
     )
     parser.add_argument(
+        "--check-bcs",
+        action="store_true",
+        help="Check lazy BCS readiness, a real fixture inference, category, and experimental status.",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=5.0,
@@ -76,20 +81,24 @@ def run(
     base_url: str | None = None,
     check_detect: bool = False,
     timeout: float = 5.0,
+    check_bcs: bool = False,
 ) -> int:
     """Run either the safe in-process check or an optional live network check."""
     if base_url is not None:
-        return _run_live(image_path, base_url, check_detect, timeout)
+        return _run_live(image_path, base_url, check_detect, check_bcs, timeout)
 
-    return _run_in_process(image_path)
+    return _run_in_process(image_path, check_bcs)
 
 
-def _run_in_process(image_path: Path | None) -> int:
+def _run_in_process(image_path: Path | None, check_bcs: bool = False) -> int:
     """Run the FastAPI lifecycle and request /health in-process."""
     if not DEFAULT_MODEL.is_file():
         logger.error("Tracked deployment model is missing: %s", DEFAULT_MODEL)
         return 1
 
+    if check_bcs:
+        image_path = ROOT / "fixtures" / "cow_female_black_white.jpg" if image_path is None else image_path
+        return asyncio.run(_run_in_process_bcs(image_path))
     try:
         status_code, body = asyncio.run(_request_health())
         health = _validate_health(status_code, body)
@@ -118,6 +127,66 @@ def _run_in_process(image_path: Path | None) -> int:
     logger.info("Detection: %s", response.model_dump_json())
     logger.info("Startup, model-load, and inference smoke checks passed")
     return 0
+
+
+async def _run_in_process_bcs(image_path: Path) -> int:
+    if not image_path.expanduser().is_file():
+        logger.error("BCS smoke image is missing: %s", image_path)
+        return 1
+    try:
+        async with api_main.app.router.lifespan_context(api_main.app):
+            status_code, body = await _asgi_request("GET", "/health")
+            _validate_health(status_code, body)
+            before = _readiness_payload(api_main.bcs_readiness())
+            _validate_bcs_before(before)
+            payload = image_path.read_bytes()
+            upload = UploadFile(
+                file=BytesIO(payload),
+                filename=image_path.name,
+                headers=Headers({"content-type": "image/jpeg"}),
+            )
+            response = await api_main.bcs(upload)
+            _validate_bcs_response(response.model_dump())
+            after = _readiness_payload(api_main.bcs_readiness())
+            if after.status != "ready":
+                raise SmokeCheckError("BCS readiness did not reach ready after inference")
+    except Exception as exc:
+        logger.error("In-process BCS smoke check failed: %s", type(exc).__name__)
+        return 1
+    logger.info("BCS readiness: not_loaded -> ready; category and experimental status passed")
+    return 0
+
+
+def _readiness_payload(response: object) -> BCSReadinessResponse:
+    if isinstance(response, BCSReadinessResponse):
+        return response
+    status_code = getattr(response, "status_code", 200)
+    if status_code != 200:
+        raw = json.loads(response.body)
+        return BCSReadinessResponse.model_validate(raw)
+    return BCSReadinessResponse.model_validate(response)
+
+
+def _validate_bcs_before(readiness: BCSReadinessResponse) -> None:
+    if readiness.status == "not_installed":
+        raise SmokeCheckError(
+            "BCS package is not installed; obtain the private ZIP from the private VACCA Drive location or maintainer and run the installer"
+        )
+    if readiness.status != "not_loaded":
+        raise SmokeCheckError(f"BCS readiness before inference was {readiness.status!r}")
+    if readiness.model_status != "experimental_not_approved" or readiness.package_id != PRIVATE_PACKAGE_ID:
+        raise SmokeCheckError("BCS smoke check requires the installed bundled experimental package")
+
+
+def _validate_bcs_response(body: object) -> BCSResponse:
+    response = BCSResponse.model_validate(body)
+    if response.status != "ok" or response.bcs_category not in {1, 2, 3, 4, 5}:
+        raise SmokeCheckError("BCS response category/status contract failed")
+    if response.model_status != "experimental_not_approved":
+        raise SmokeCheckError("BCS response did not identify the experimental package")
+    if response.package_id != PRIVATE_PACKAGE_ID:
+        raise SmokeCheckError("BCS response did not identify the bundled package")
+    return response
 
 
 async def _request_health() -> tuple[int, object]:
@@ -193,6 +262,7 @@ def _run_live(
     image_path: Path | None,
     base_url: str,
     check_detect: bool,
+    check_bcs: bool,
     timeout: float,
 ) -> int:
     """Validate the actual listener, including its HTTP and multipart path."""
@@ -214,11 +284,43 @@ def _run_live(
         return 1
 
     logger.info("Live health: %s", health.model_dump_json())
+    explicit_image = image_path is not None
+    if check_bcs:
+        image_path = ROOT / "fixtures" / "cow_female_black_white.jpg" if image_path is None else image_path
+        try:
+            _, before_body = _request_json(f"{base_url}/ready/bcs", timeout=timeout)
+            before = BCSReadinessResponse.model_validate(before_body)
+            _validate_bcs_before(before)
+            image_path = image_path.expanduser()
+            if not image_path.is_file():
+                raise SmokeCheckError("BCS smoke image is missing")
+            bcs_body = _multipart_body(image_path.name, image_path.read_bytes(), "image/jpeg")
+            status_code, response_body = _request_json(
+                f"{base_url}/bcs",
+                method="POST",
+                body=bcs_body,
+                headers={"Content-Type": f"multipart/form-data; boundary={_BOUNDARY.decode()}"},
+                timeout=timeout,
+            )
+            if status_code != 200:
+                raise SmokeCheckError(f"bcs returned HTTP {status_code}")
+            _validate_bcs_response(response_body)
+            after_status, after_body = _request_json(f"{base_url}/ready/bcs", timeout=timeout)
+            after = BCSReadinessResponse.model_validate(after_body)
+            if after_status != 200 or after.status != "ready":
+                raise SmokeCheckError("live BCS readiness did not reach ready")
+        except Exception as exc:
+            logger.error("Live BCS smoke check failed: %s", type(exc).__name__)
+            return 1
+        logger.info("Live BCS readiness: not_loaded -> ready; category and experimental status passed")
+
+    if check_bcs and not check_detect:
+        return 0
     if image_path is None and not check_detect:
         logger.info("Live /health smoke check passed")
         return 0
 
-    if image_path is not None:
+    if image_path is not None and (not check_bcs or explicit_image):
         image_path = image_path.expanduser()
         if not image_path.is_file():
             logger.error("Smoke-test image is missing: %s", image_path)
@@ -271,26 +373,6 @@ def _run_live(
             logger.error("Live detection smoke check failed: %s", type(exc).__name__)
             return 1
         logger.info("Live /detect invalid-input contract passed")
-        try:
-            body = _multipart_body("invalid.jpg", b"not a JPEG", "image/jpeg")
-            status_code, response_body = _request_json(
-                f"{base_url}/bcs",
-                method="POST",
-                body=body,
-                headers={
-                    "Content-Type": f"multipart/form-data; boundary={_BOUNDARY.decode()}"
-                },
-                timeout=timeout,
-            )
-            if status_code != 400 or not isinstance(response_body, dict):
-                raise SmokeCheckError("bcs invalid-image contract failed")
-            if response_body.get("detail") != LIVE_INVALID_IMAGE_DETAIL:
-                raise SmokeCheckError("bcs invalid-image detail is malformed")
-        except Exception as exc:
-            logger.error("Live BCS smoke check failed: %s", type(exc).__name__)
-            return 1
-        logger.info("Live /bcs invalid-image contract passed")
-
     logger.info("Live health and backend-path smoke checks passed")
     return 0
 
@@ -345,7 +427,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.check_detect and args.base_url is None:
         build_parser().error("--check-detect requires --base-url")
-    return run(args.image, args.base_url, args.check_detect, args.timeout)
+    return run(
+        args.image,
+        args.base_url,
+        args.check_detect,
+        args.timeout,
+        args.check_bcs,
+    )
 
 
 if __name__ == "__main__":
