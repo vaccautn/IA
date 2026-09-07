@@ -1,8 +1,13 @@
 # Línea base BCS de categorías 1..5 — ejecución 2026-09-04
 
-> **Decisión: RECHAZADO; NO APROBADO PARA SERVING.** Existe un candidato entrenado,
-> pero falló los seis controles de aceptación de ingeniería medidos sobre TEST.
-> El serving de BCS permanece deshabilitado.
+> **Calidad: RECHAZADO; NO APROBADO PARA PRODUCCIÓN NI SERVING APROBADO.** Existe un
+> candidato entrenado, pero falló los seis controles de aceptación de ingeniería medidos
+> sobre TEST. **Decisión actual del prototipo:** el mantenedor aceptó el 2026-09-06 el
+> riesgo de licenciamiento para distribución interna privada de prototipo únicamente. El
+> ZIP y su sidecar sólo están autorizados para carga y descarga en la ubicación privada de
+> VACCA Drive del equipo; no deben entrar en Git público ni distribuirse desde GitHub. Esta
+> decisión no modifica las métricas, los controles, el rechazo, ni la falta de aprobación
+> para producción o uso clínico.
 
 ## Resumen de la ejecución
 
@@ -74,9 +79,10 @@ Todos son controles de ingeniería provisionales; no constituyen validación cl�
 
 El registro `provisional_acceptance.passed` es `false` y sus seis comprobaciones son
 `false`. En consecuencia, el candidato queda rechazado y **no está aprobado para serving**.
-No deben configurarse `VACCA_BCS_CHECKPOINT` ni `VACCA_BCS_CHECKPOINT_SHA256`; la
-capacidad BCS debe seguir devolviendo indisponibilidad mientras la detección continúa
-operativa de forma independiente.
+Para la entrega operativa de esa ejecución histórica no debían configurarse
+`VACCA_BCS_CHECKPOINT` ni `VACCA_BCS_CHECKPOINT_SHA256`; la capacidad BCS debía seguir
+independiente de la detección. La aceptación posterior sólo habilita el prototipo interno
+privado y no cambia el rechazo de las métricas.
 
 ## Reproducibilidad y evidencia
 
@@ -98,3 +104,25 @@ permanecen ignorados por Git. Por lo tanto, este reporte conserva la decisión y
 trazabilidad, pero no contiene por sí solo los bytes necesarios para reproducir la
 ejecución en otro clon; se requiere disponer de esos artefactos locales con las
 identidades indicadas.
+
+## Addendum operativo — aceptación privada de prototipo del 2026-09-06
+
+Este addendum **no reescribe las métricas ni la decisión de rechazo anteriores**. El
+candidato continúa fallando los seis controles y no está aprobado para producción.
+
+El estado derivado queda distribuido como ZIP privado, con catálogo público y digest
+esperado en `models/catalog/bcs-category-coral-2026-09-04/`. El ZIP y su sidecar sólo
+pueden cargarse o descargarse en la ubicación privada de VACCA Drive del equipo; una
+instalación verificada en `models/private/` permite la selección por defecto y la carga
+lazy en la primera solicitud `/bcs`. Los pesos no se versionan en Git y no se autoriza
+redistribución pública.
+
+La operación actual queda documentada en `README.md` y `docs/api.md`: el disable exacto
+`VACCA_BCS_DISABLED=1` gana a cualquier selección y requiere reinicio; un par externo
+completo reemplaza una selección privada autorizada y se marca `external_unclassified`; un
+par parcial falla cerrado; sin override, una instalación privada autorizada puede
+seleccionarse, o `not_installed` si falta.
+`/health` y `/detect` permanecen
+independientes. Esta decisión de prototipo supersede únicamente la frase histórica de
+distribución previa del reporte; no cambia su evidencia, métricas, hashes, rechazo ni
+aprobación de producción.

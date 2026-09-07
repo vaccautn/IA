@@ -1,32 +1,41 @@
 # API de detección y BCS
 
-Esta es la guía operativa del servicio FastAPI actual. La detección de Fase 1 y
-el punto de acceso BCS están implementados, pero son capacidades independientes:
-`/detect` usa el detector YOLO local; `/bcs` usa, bajo demanda, un punto de control
-ordinal BCS configurado por entorno. Existe un punto de control nuevo asociado a una
-ejecución local, pero el candidato falló los seis controles de aceptación de ingeniería;
-BCS permanece deshabilitado y responde `503` mientras no exista una configuración conjunta
-de un candidato aprobado y su hash confiable. Consulte el [reporte de la ejecución](../reports/bcs-category-baseline-2026-09-04.md).
+Esta es la guía operativa del servicio FastAPI actual. La detección de Fase 1 y BCS son
+capacidades independientes: `/detect` usa el detector YOLO local; después de descargar el
+ZIP desde la ubicación privada de VACCA Drive del equipo e instalarlo, `/bcs` puede seleccionar el paquete local
+`bcs-category-coral-2026-09-04` bajo demanda y con validación estricta. El paquete es experimental, fue rechazado por los
+seis controles de aceptación y **no está aprobado para producción**. Consulte el [reporte
+de la ejecución](../reports/bcs-category-baseline-2026-09-04.md), la [tarjeta del
+modelo](../models/catalog/bcs-category-coral-2026-09-04/MODEL_CARD.md) y los [avisos de
+terceros](../models/catalog/bcs-category-coral-2026-09-04/THIRD_PARTY_NOTICES.md).
 
 ## Camino rápido
 
-Los siguientes comandos preparan y arrancan el prototipo local. No descargan
-datos BCS ni crean un punto de control BCS.
+Los siguientes comandos preparan el prototipo local. Obtenga el ZIP y su sidecar únicamente
+desde la ubicación privada de VACCA Drive del equipo. No se descargan datos BCS ni se crea un punto
+de control BCS.
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\python -m pip install --require-hashes -r requirements-cpu.txt -r requirements-api.txt
+.venv\Scripts\python -m pip install --require-hashes -r requirements-dev.txt
 .venv\Scripts\python -m pip install --no-deps --no-build-isolation -e ".[yolo,api]"
 Test-Path models\deploy\vacca-yolo26n-v1.pt
+# Obtenga el ZIP únicamente desde la ubicación privada de VACCA Drive del equipo.
+$archive = Join-Path $HOME "Downloads\vacca-bcs-category-coral-2026-09-04-experimental.zip"
+.venv\Scripts\python scripts\install_bcs_serving_package.py --archive $archive
 .venv\Scripts\python scripts/run_api.py
 ```
 
 El detector de Fase 1 carga únicamente el artefacto versionado
 `models/deploy/vacca-yolo26n-v1.pt`; no es necesario descargar un peso local ignorado.
-El punto de control BCS es independiente: la API puede arrancar en modo detección sin
-`VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256`; BCS permanece
-`unconfigured` hasta configurar explícitamente un punto de control compatible y aceptado
-junto con su hash exacto.
+El paquete BCS se verifica y permanece `not_loaded` hasta la primera solicitud `/bcs` sólo
+cuando está instalado en `models/private/`. Sin instalación, `/ready/bcs` devuelve
+`not_installed`; un paquete alterado devuelve `unavailable`. La consulta de estado valida
+manifiesto, tarjeta, avisos, existencia, tamaño y digest sin deserializar ni construir el
+modelo; descarta esos bytes. `/health` y `/detect` permanecen disponibles en ambos casos.
+Después de una carga exitosa, el estado
+es `ready` y el `model_status` sigue siendo `experimental_not_approved`.
 
 El script de arranque acepta:
 
@@ -42,22 +51,58 @@ autenticación; manténgala en una red privada y aplique autenticación en la ca
 
 ## Configuración BCS
 
-El entorno de ejecución BCS es opcional, aislado y de carga diferida. Sólo se configura cuando existen
-`VACCA_BCS_CHECKPOINT` y `VACCA_BCS_CHECKPOINT_SHA256`; no carga el modelo durante
-la importación ni al consultar `/ready/bcs`. `VACCA_BCS_DEVICE` es opcional y por
-defecto vale `cpu`.
+El entorno de ejecución BCS es aislado y de carga diferida. Después de la descarga privada
+e instalación local, sin variables de override puede seleccionar el paquete
+privado; `VACCA_BCS_DEVICE` es opcional; por defecto
+vale `cpu`. La carga valida el manifiesto de esquema `vacca-bcs-serving-package-v1`, la
+ruta POSIX relativa, los bytes, el tamaño, el digest, el estado de tensores, el modelo
+ResNet18+CORAL y el linaje completo.
 
-No configure `VACCA_BCS_CHECKPOINT` ni `VACCA_BCS_CHECKPOINT_SHA256`: el candidato
-local falló los controles de aceptación. La alternativa segura es:
+La instalación CPU con estos locks es el único camino verificado. CUDA requiere una
+instalación separada y compatible de PyTorch y torchvision siguiendo la guía oficial de
+PyTorch, fuera del lock CPU. Sólo después de verificarla se puede definir
+`VACCA_BCS_DEVICE=cuda:0`; configurar esa variable por sí sola no instala ni habilita
+CUDA. El valor predeterminado es `cpu`.
+
+### Deshabilitación de emergencia
+
+Sólo `VACCA_BCS_DISABLED=1` deshabilita BCS. Un valor diferente falla cerrado; `/health`
+y `/detect` permanecen disponibles. El estado es `unconfigured` con `model_status: none`.
+Detenga el proceso actual, defina la variable, reinicie y confirme `/ready/bcs`; cambiar
+el entorno no reconfigura el runtime cacheado de un proceso en ejecución.
+
+### Override externo
+
+Si aparece `VACCA_BCS_CHECKPOINT` o `VACCA_BCS_CHECKPOINT_SHA256`, ambas deben formar un
+par completo y válido. Se conserva el cargador externo existente y el estado se expone
+como `external_unclassified`, nunca como aprobación. Un par parcial o inválido se marca
+`unavailable` sin cargar nada. El override no relaja las validaciones existentes de
+checkpoint-set, ruta segura, SHA, lineage ni categorías. `VACCA_BCS_DEVICE` continúa
+siendo opcional.
+
+La precedencia exacta es: disable exacto primero e ignorando paquete privado/externo hasta
+reinicio; sin disable, par externo completo sobre una selección privada autorizada; par
+parcial falla; sin externo, una instalación privada autorizada puede seleccionarse. Si falta
+la instalación, el estado es `not_installed`.
+
+Para deshabilitar una instalación privada de forma explícita, detenga la API primero. El
+comando renombra el paquete validado a un backup `disabled-*`; no borra bytes y no debe
+ejecutarse antes de una actualización:
 
 ```powershell
 Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
 Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
+Remove-Item Env:VACCA_BCS_DISABLED -ErrorAction SilentlyContinue
+.venv\Scripts\python scripts\install_bcs_serving_package.py --uninstall
 .venv\Scripts\python scripts/run_api.py
 ```
 
-Sólo un candidato finalizado que pase los controles de aceptación provisionales y la entrega estricta
-de la guía operativa puede habilitarse posteriormente.
+Para recuperar un backup `.backup-*` o `.disabled-*` retenido, detenga la API y use la ruta exacta informada por el
+instalador con `--recover-backup`. Una instalación válida bloquea la recuperación sin
+modificar bytes; una instalación inválida se pone en cuarentena antes de restaurar.
+
+El override externo es únicamente una ruta de compatibilidad y permanece clasificado como
+`external_unclassified`; no convierte el candidato en aprobado.
 
 El punto de control debe tener el esquema `bcs-category-coral-checkpoint-v1`, dominio
 `bcs-category-1-5-v1`, escala/clases `1..5` y trazabilidad compatible con
@@ -83,6 +128,7 @@ $env:VACCA_BCS_CHECKPOINT_SHA256 = "<EXACT_SHA256_FROM_OVERNIGHT_VALIDATION>"
 | `POST` | `/detect` | Multipart con campo `file` | `DetectResponse`, o HTTP 400/413/500/503. |
 | `POST` | `/bcs` | Multipart con campo `file` | `BCSResponse` en HTTP 200, o error HTTP sanitizado, incluido `503` por capacidad ocupada o BCS no disponible. |
 | `GET` | `/ready/bcs` | Ninguna | `BCSReadinessResponse`: 200 sólo en estado `ready`, 503 en otro estado. |
+| `GET` | `/metrics` | Ninguna | Contadores y latencias path-free por capacidad para operación del prototipo. |
 | `GET` | `/ui` | Ninguna | UI HTML de prototipo; 404 si falta el archivo. |
 
 FastAPI agrega `/docs`, `/redoc` y `/openapi.json`. El OpenAPI declara los cuerpos
@@ -92,23 +138,22 @@ Los errores de operación usan el cuerpo estándar `{"detail":"..."}`.
 
 ## UI de prototipo (`GET /ui`)
 
-La UI conserva la detección automática en la pestaña `Detect` y comparte la imagen
+La UI conserva la detección automática en la pestaña `Detección` y comparte la imagen
 seleccionada con la pestaña `BCS`. BCS no se ejecuta al seleccionar una imagen:
-requiere pulsar `Calculate BCS`. Al seleccionar la pestaña se consulta
+requiere pulsar `Calcular BCS`. Al seleccionar la pestaña se consulta
 `/ready/bcs`; `ready` y `not_loaded` habilitan el cálculo, mientras que
-`unconfigured` y `unavailable` lo mantienen deshabilitado. Los errores de las
+`unconfigured`, `not_installed` y `unavailable` lo mantienen deshabilitado. Los errores de las
 rutas se muestran con mensajes sanitizados y la categoría exitosa se presenta como un
-entero `1..5`, sin confianza; `cow_detected: null` se muestra como `Not reported`.
+entero `1..5`, sin confianza; `cow_detected: null` se muestra como `No informado`.
 
 La ejecución local produjo un candidato, pero fue rechazada al fallar los controles de
-aceptación. Una ejecución en la que no estén definidas `VACCA_BCS_CHECKPOINT` y
-`VACCA_BCS_CHECKPOINT_SHA256` debe mostrar
-`unconfigured` y no debe interpretarse como una categoría. Configure ambas sólo
-después de la entrega de un candidato que pase los controles de aceptación; mientras tanto no inicie BCS:
+aceptación. Después de la descarga desde la ubicación privada autorizada, una instalación local puede seleccionarse y la UI muestra persistentemente
+que es experimental y no aprobado. Para deshabilitarlo explícitamente:
 
 ```powershell
 Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
 Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
+$env:VACCA_BCS_DISABLED = "1"
 .venv\Scripts\python scripts/run_api.py
 ```
 
@@ -156,7 +201,7 @@ lee como máximo 10 MiB más un byte y decodifica la imagen antes de la inferenc
 | 400 | Error de validación de imagen | Dimensiones o píxeles fuera de límite. |
 | 413 | `Image file exceeds the maximum size of 10485760 bytes` | Archivo de más de 10 MiB. |
 | 500 | `Detection failed — check server logs` | Fallo del detector durante la inferencia. |
-| 503 | `Inference capacity is busy; retry shortly` | La única capacidad de inferencia está ocupada; no se ejecuta el modelo. |
+| 503 | `Inference capacity is busy; retry shortly` | La compuerta de la capacidad solicitada está ocupada; no se ejecuta ese modelo. |
 - Una solicitud sin `file` conserva la validación estándar de FastAPI.
 
 Una respuesta exitosa contiene `cow_detected`, `detection_count`, `detections`,
@@ -170,15 +215,21 @@ La ruta estima la categoría desde la imagen completa. `BCSResponse` tiene esta 
 ```json
 {
   "status": "ok",
-  "message": "BCS category 1..5 computed successfully.",
+  "message": "Experimental BCS category 1..5 computed successfully; not approved for production.",
   "cow_detected": null,
-  "bcs_category": 3
+  "model_status": "experimental_not_approved",
+  "package_id": "bcs-category-coral-2026-09-04",
+  "bcs_category": 3,
+  "inference_time_ms": 85.2
 }
 ```
 
 Una respuesta HTTP 200 exitosa contiene un entero estricto de
 `1` a `5`; `bcs_category` es obligatorio y no nulo. `cow_detected` es siempre `null` en el éxito BCS porque esta ruta no
-ejecuta detección. No se expone confianza.
+ejecuta detección. No se expone confianza. Las respuestas incluyen `model_status`:
+`experimental_not_approved` para el paquete privado instalado o `external_unclassified`
+para un override; la respuesta también contiene `package_id` y la latencia medida de la
+llamada de servicio en `inference_time_ms`.
 
 El servicio toma la clase discreta de CORAL (`1 + cantidad de umbrales superados`) y
 publica directamente la categoría discreta. No hay expectativa fraccional ni
@@ -194,8 +245,9 @@ Errores de operación, todos con cuerpo estándar `{"detail": "..."}`:
 | 400 | `BCS image input is invalid` | Validación semántica del runtime BCS después de que los bytes pasan la validación común de carga. |
 | 413 | `Image file exceeds the maximum size of 10485760 bytes` | Archivo de más de 10 MiB. |
 | 500 | `BCS inference failed` | El modelo no pudo producir inferencia. |
-| 503 | `Inference capacity is busy; retry shortly` | La única capacidad de inferencia está ocupada; no se invoca el runtime ni el modelo. |
-| 503 | `BCS capability is unavailable` | Falta el punto de control, no se pudo cargar o el dispositivo no está disponible. |
+| 503 | `Inference capacity is busy; retry shortly` | La compuerta BCS está ocupada; no se invoca el runtime ni el modelo BCS. |
+| 503 | `BCS capability is unavailable` | La instalación está alterada, no se pudo cargar o el dispositivo no está disponible. |
+| 503 | `BCS capability is unavailable` | El paquete privado no está instalado; `/ready/bcs` lo distingue como `not_installed`. |
 
 Ejemplo de capacidad no configurada: `POST /bcs` devuelve HTTP `503` y
 `{"detail":"BCS capability is unavailable"}`; no devuelve un `BCSResponse`
@@ -204,7 +256,7 @@ exitoso ni una categoría nula como sustituto.
 La capacidad de inferencia es independiente de la configuración BCS: una respuesta `503`
 con `Inference capacity is busy; retry shortly` indica saturación temporal y debe reintentarse;
 `BCS capability is unavailable` indica que BCS no puede operar. `/ready/bcs` conserva los
-estados `unconfigured`, `not_loaded`, `ready` y `unavailable` para distinguir configuración,
+estados `unconfigured`, `not_installed`, `not_loaded`, `ready` y `unavailable` para distinguir configuración,
 carga y disponibilidad sin adquirir la compuerta ni disparar la carga diferida.
 
 ## `GET /ready/bcs`
@@ -213,17 +265,86 @@ Esta ruta inspecciona el estado sin disparar la carga diferida. El cuerpo exacto
 `BCSReadinessResponse`:
 
 ```json
-{"status":"unconfigured","message":"BCS capability is not configured."}
+{"status":"not_loaded","message":"BCS capability is configured but not loaded.","model_status":"experimental_not_approved","package_id":"bcs-category-coral-2026-09-04"}
 ```
 
 Estados y códigos HTTP:
 
 | Estado | HTTP | Mensaje |
 |---|---:|---|
-| `unconfigured` | 503 | `BCS capability is not configured.` |
-| `not_loaded` | 503 | `BCS capability is configured but not loaded.` |
-| `ready` | 200 | `BCS capability is ready.` |
-| `unavailable` | 503 | `BCS capability is unavailable.` |
+| `unconfigured` | 503 | `BCS capability is not configured.`; `model_status: none` en la deshabilitación de emergencia |
+| `not_installed` | 503 | `BCS private serving package is not installed.`; obtenga el ZIP desde la ubicación privada de VACCA Drive del equipo o del mantenedor |
+| `not_loaded` | 503 | `BCS capability is configured but not loaded.`; incluye el estado experimental del paquete |
+| `ready` | 200 | `BCS capability is ready.`; el paquete continúa sin aprobación de producción |
+| `unavailable` | 503 | `BCS capability is unavailable.`; el fallo queda cacheado hasta reiniciar |
+
+## `GET /metrics` (operación de prototipo)
+
+Esta ruta privada de observación devuelve JSON sin rutas, secretos, checkpoints ni
+digests. No adquiere ninguna compuerta y separa detección de BCS:
+
+```json
+{
+  "measurement_window_started_at_utc": "2026-09-07T00:00:00+00:00",
+  "detect": {
+    "requests": 1,
+    "client_rejections": 0,
+    "busy_rejections": 0,
+    "server_runtime_failures": 0,
+    "inference_attempts": 1,
+    "inference_successes": 1,
+    "inference_failures": 0,
+    "successful_inference_ms": 12.4,
+    "failed_inference_ms": 0.0,
+    "last_successful_inference_ms": 12.4,
+    "last_failed_inference_ms": null,
+    "request_wall_time_ms_total": 14.1,
+    "last_request_wall_time_ms": 14.1,
+    "non_inference_wall_time_ms_total": 1.7,
+    "last_non_inference_wall_time_ms": 1.7,
+    "eligible_operational_requests": 1,
+    "service_impacting_failures": 0,
+    "service_impacting_failure_rate": 0.0,
+    "service_impacting_failure_rate_review_thresholds": [0.01, 0.02, 0.05]
+  },
+  "bcs": {
+    "requests": 1,
+    "client_rejections": 0,
+    "busy_rejections": 0,
+    "server_runtime_failures": 0,
+    "inference_attempts": 1,
+    "inference_successes": 1,
+    "inference_failures": 0,
+    "successful_inference_ms": 85.2,
+    "failed_inference_ms": 0.0,
+    "last_successful_inference_ms": 85.2,
+    "last_failed_inference_ms": null,
+    "request_wall_time_ms_total": 92.8,
+    "last_request_wall_time_ms": 92.8,
+    "non_inference_wall_time_ms_total": 7.6,
+    "last_non_inference_wall_time_ms": 7.6,
+    "eligible_operational_requests": 1,
+    "service_impacting_failures": 0,
+    "service_impacting_failure_rate": 0.0,
+    "service_impacting_failure_rate_review_thresholds": [0.01, 0.02, 0.05]
+  }
+}
+```
+
+Los rechazos de cliente (MIME, bytes, decodificación) se separan de fallas de servidor o
+runtime y de rechazos `busy`. `request_wall_time_ms_total` mide desde la entrada del
+handler e incluye espera de compuerta y carga lazy; `successful_inference_ms` y
+`failed_inference_ms` sólo miden `service.infer` o `detector.detect`. `inference_attempts`
+es `inference_successes + inference_failures`. El marcador
+`measurement_window_started_at_utc` cambia al reiniciar el proceso; las métricas son
+locales al proceso. `service_impacting_failures` es la suma de
+`server_runtime_failures + inference_failures`; `eligible_operational_requests` es
+`requests - client_rejections - busy_rejections`. La razón es la primera cifra dividida
+por la segunda cuando ésta es mayor que cero; en cero es `null`. Los umbrales de revisión
+de `1%`, `2%` y `5%` aplican a esa razón amplia, incluidos runtime e inferencia. No se
+aplican a errores de cliente ni a rechazos `busy`. Si ambas
+capacidades usan CUDA, sus compuertas son independientes pero pueden competir por memoria
+y cómputo.
 
 ## Entrega desde el entrenamiento
 
@@ -234,13 +355,15 @@ el punto de control y comprobar el servicio.
 
 ## Resolución de problemas y verificación
 
-- Confirme que la salida YOLO de Fase 1 existe antes de iniciar la API; el
-  punto de control BCS sólo es necesario para habilitar esa capacidad opcional.
-- Consulte `/ready/bcs` para distinguir `unconfigured`, `not_loaded`, `ready` y
+- Desde la ubicación privada de VACCA Drive del equipo, confirme que el ZIP privado, su
+  sidecar y el catálogo esperado están disponibles; instálelo antes de iniciar la API.
+  Si no está instalado, mantenga `not_installed`: no se requiere entrenamiento ni
+  configuración BCS.
+- Consulte `/ready/bcs` para distinguir `unconfigured`, `not_installed`, `not_loaded`, `ready` y
   `unavailable` sin forzar la carga.
 - Si `/bcs` devuelve `503`, no lo interprete como categoría: falta una capacidad
   BCS operable.
-- Si BCS queda en `unavailable`, corrija el punto de control, el dispositivo o la configuración
+- Si BCS queda en `unavailable`, corrija el paquete, el punto de control externo, el dispositivo o la configuración
   y reinicie el proceso. El estado fallido se conserva deliberadamente: no se reintenta
   automáticamente para evitar cargas repetidas y mantener una recuperación operativa determinista.
 - Use `file` como nombre exacto del campo multipart.

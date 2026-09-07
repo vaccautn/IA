@@ -11,14 +11,29 @@
 
 > **Estado actual:** Este PRD conserva la intención de producto y el alcance de la
 > Fase 1. La implementación vigente usa únicamente la fuente local para una
-> categoría BCS pública `1..5`, con la instantánea construida en
+> categoría BCS experimental `1..5`, con la instantánea construida en
 > `data/bcs-category-v1`. Los ocho duplicados idénticos entre categorías fueron
 > puestos en cuarentena sin recategorización. El flujo local de categorías es el camino vigente;
 > el camino anterior de ingesta y exportación de la fuente BCS del componente de servidor fue eliminado.
 > La ejecución local del 4 de septiembre produjo un candidato, pero falló los seis
-> controles de aceptación de ingeniería provisionales; BCS permanece deshabilitado y
-> el candidato no está aprobado para serving. Consulte el [reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md)
+> controles de aceptación de ingeniería provisionales; ese candidato no está aprobado
+> para producción. El 6 de septiembre de 2026 el mantenedor aceptó explícitamente el
+> riesgo de licenciamiento para distribución interna privada de prototipo únicamente. El
+> ZIP y su sidecar están autorizados para carga y descarga sólo en la ubicación privada de
+> VACCA Drive del equipo; no deben entrar en Git público ni distribuirse desde GitHub.
+> Esta decisión no modifica las métricas ni la evaluación, no es autorización legal y no
+> aprueba producción ni uso clínico.
+> Consulte el [reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md)
 > y `docs/estado-del-repositorio.md` para el estado operativo.
+
+### Addendum operativo de prototipo — 2026-09-07
+
+El alcance de producto original continúa sin aprobación de producción ni validación
+clínica. El ZIP privado del candidato rechazado puede instalarse con verificación
+independiente y cargarse de forma lazy para el prototipo interno. El ZIP y su sidecar sólo
+pueden cargarse o descargarse en la ubicación privada de VACCA Drive del equipo; no deben
+entrar en Git público ni distribuirse desde GitHub. Esta aceptación no convierte el modelo
+en una capacidad de producción ni modifica sus seis fallos, métricas o requisitos de revisión.
 
 ## 1. Resumen ejecutivo
 
@@ -875,7 +890,7 @@ El prototipo se considerará finalizado cuando:
 - Herramienta definitiva de anotación.
 - Convención exacta para bovinos parcialmente visibles.
 - Marco de trabajo inicial: YOLO, MMDetection o TorchVision.
-- Requisitos de licencia aceptables para el proyecto.
+- Permiso específico para los pesos preentrenados: permanece indeterminado y requiere revisión legal separada.
 - Umbral inicial de confianza.
 - Porcentaje mínimo de área ocupada por el animal.
 - Márgenes de encuadre permitidos.

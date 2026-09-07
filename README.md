@@ -3,6 +3,61 @@
 Microservicio de detección de bovinos con YOLO26n ajustado finamente sobre Navid HSM + BCS ScienceDB.
 **mAP50: 0.974 · mAP50-95: 0.610 · Precisión: 0.976 · Exhaustividad: 0.924**
 
+> **Distribución:** BCS sigue siendo experimental y no aprobado. Los pesos no forman
+> parte del repositorio público. El ZIP y su sidecar están autorizados únicamente para
+> carga y descarga en la ubicación privada de VACCA Drive del equipo, para distribución
+> interna de prototipo. No deben entrar en Git público ni distribuirse desde GitHub.
+
+## Camino rápido desde un clon limpio (sin entrenamiento)
+
+BCS queda activo por defecto **sólo después de instalar** el paquete privado
+`bcs-category-coral-2026-09-04`. No descargue datos ni entrene para ejecutar el prototipo:
+El siguiente bloque describe el flujo operativo autorizado con el archivo obtenido desde la
+ubicación privada de VACCA Drive del equipo.
+
+```powershell
+git clone <repository-url> IA
+Set-Location IA
+py -3.13 -m venv .venv
+.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-cpu.txt -r requirements-api.txt
+.venv\Scripts\python.exe -m pip install --no-deps --no-build-isolation -e ".[yolo,api]"
+# Obtenga estos dos archivos únicamente desde la ubicación privada de VACCA Drive del equipo:
+#   Downloads\vacca-bcs-category-coral-2026-09-04-experimental.zip
+#   Downloads\vacca-bcs-category-coral-2026-09-04-experimental.zip.sha256
+$catalog = Get-Content models\catalog\bcs-category-coral-2026-09-04\archive.json | ConvertFrom-Json
+$archive = Join-Path $HOME "Downloads\$($catalog.archive_filename)"
+$sidecar = "$archive.sha256"
+$line = (Get-Content $sidecar -Raw).Trim()
+if ($line -ne "$($catalog.archive_sha256)  $($catalog.archive_filename)") { throw "BCS sidecar does not match the tracked catalog" }
+if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne $catalog.archive_sha256) { throw "BCS archive SHA-256 is not trusted" }
+.venv\Scripts\python.exe scripts\install_bcs_serving_package.py --archive $archive
+.venv\Scripts\python.exe -c "from vacca_bcs.serving_package import validate_installed_package; print(validate_installed_package()['package_id'])"
+.venv\Scripts\python.exe scripts/run_api.py
+```
+
+La API usa `http://127.0.0.1:8001`. El detector YOLO se carga durante el arranque; el
+paquete BCS se carga **una sola vez y de forma lazy** en la primera solicitud `POST
+/bcs`. Sin instalación, `GET /ready/bcs` devuelve `503` con `status: not_installed` y
+mantiene `/health` y `/detect` operativos. Después de instalar, devuelve primero
+`not_loaded` y luego `ready`, pero continúa indicando que el modelo es experimental y no
+aprobado. La presencia del paquete **no es aprobación de producción ni de uso clínico**.
+La creación del runtime pre valida manifiesto, tarjeta, avisos, tamaño y digest sin
+deserializar ni construir el modelo; si el paquete falta o está alterado, informa
+`not_installed`/`unavailable` honestamente.
+
+Para una verificación mínima:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8001/health
+Invoke-RestMethod http://127.0.0.1:8001/ready/bcs # not_installed antes de instalar; not_loaded después
+Invoke-RestMethod -Uri http://127.0.0.1:8001/bcs -Method Post -Form @{file=Get-Item ".\fixtures\cow_female_black_white.jpg"}
+Invoke-RestMethod http://127.0.0.1:8001/ready/bcs
+```
+
+También están disponibles Swagger en `http://127.0.0.1:8001/docs` y la UI de prototipo
+en `http://127.0.0.1:8001/ui`. La UI mantiene una advertencia accesible y persistente
+en los estados no cargado, listo, resultado y error.
+
 ## Documentación
 
 - [Estado del repositorio](docs/estado-del-repositorio.md): estado operativo, controles de aceptación, riesgos y próximos pasos.
@@ -19,15 +74,24 @@ La detección de Fase 1 mantiene un camino local de prototipo. El flujo de fuent
 instantánea, el núcleo ordinal BCS, el entrenador y el servicio BCS están implementados
 y cubiertos por pruebas deterministas. La ejecución del 4 de septiembre produjo un
 candidato, pero falló los seis controles de aceptación de ingeniería provisionales;
-BCS permanece deshabilitado y el candidato no está aprobado para serving. Consulte el
+BCS está disponible como paquete experimental no aprobado para serving de prototipo; la
+distribución privada queda limitada a carga y descarga en la ubicación privada de VACCA
+Drive del equipo.
+Consulte el
 [reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md). El reporte anterior
 está archivado en `reports/historical/obsolete-bcs-integer-baseline-2026-09-02.md`.
 
 ## Requisitos
 
 - CPython 3.13 (`>=3.13,<3.14`)
-- GPU NVIDIA con CUDA 12.4 (opcional, funciona en CPU pero más lento)
+- CPU con el lock combinado verificado (camino reproducible y predeterminado)
 - ~3 GB de espacio para el modelo y dependencias
+
+La instalación bloqueada de CPU es el único camino de instalación verificado. CUDA no
+se habilita instalando solamente una variable: requiere una instalación separada y
+compatible de PyTorch y torchvision siguiendo la guía oficial de PyTorch, fuera de estos
+locks CPU. Sólo después de verificar esa instalación puede definir
+`VACCA_BCS_DEVICE=cuda:0`; el valor predeterminado continúa siendo `cpu`.
 
 ## Artefactos versionados y política de lint
 
@@ -37,6 +101,8 @@ Estos artefactos se versionan intencionalmente para reproducibilidad y despliegu
 - `fixtures/cow_female_black_white.jpg`: archivo de prueba reproducible de inferencia.
 - `configs/baseline_manifest.json`: manifiesto de configuración y procedencia.
 - `reports/baseline-inference-2026-08-02.md`: evidencia de la línea base reproducible.
+- `models/catalog/bcs-category-coral-2026-09-04/`: catálogo Git-tracked, tarjeta,
+  avisos de terceros y digest esperado del ZIP privado. Los pesos no están aquí.
 
 Los reportes generados bajo `reports/generated/` (excepto la línea base indicada),
 puntos de control, conjuntos de datos, ejecuciones, salidas y pesos locales permanecen
@@ -53,6 +119,7 @@ entorno del proyecto:
 # 1. Crear el entorno e instalar los locks reproducibles
 python -m venv .venv
 .venv\Scripts\python -m pip install --require-hashes -r requirements-cpu.txt -r requirements-api.txt
+.venv\Scripts\python -m pip install --require-hashes -r requirements-dev.txt
 .venv\Scripts\python -m pip install --no-deps --no-build-isolation -e ".[yolo,api]"
 
 # 2. Verificar que el modelo desplegado versionado existe
@@ -62,6 +129,41 @@ Test-Path models\deploy\vacca-yolo26n-v1.pt
 El modelo desplegado `models/deploy/vacca-yolo26n-v1.pt` está versionado en este repositorio; no es necesario descargarlo para ejecutar la API.
 Para ejecutar el chequeo de lint, instale el extra de desarrollo fijado y ejecute
 `.venv\Scripts\python -m ruff check src scripts tests`.
+
+La suite pública no requiere el ZIP privado ni `models/private/`:
+
+```powershell
+.venv\Scripts\python -m pytest -q
+```
+
+Las pruebas que necesitan el artefacto real están marcadas `private_model` y se omiten
+con una razón explícita si el ZIP externo no está disponible. Con el ZIP descargado desde
+la ubicación privada de VACCA Drive del equipo, el comando exacto desde la raíz del
+repositorio es:
+
+```powershell
+$privateArchive = Join-Path $HOME "Downloads\vacca-bcs-category-coral-2026-09-04-experimental.zip"
+.venv\Scripts\python -m pytest tests -m private_model --private-model-archive $privateArchive -q
+```
+
+Ese comando prueba el contenido del ZIP sin inspeccionar la instalación fija. Para la matriz
+que también inspecciona la instalación fija, agregue explícitamente
+`--private-model-install` después de instalar el paquete.
+
+El flujo productor mantenido por el equipo es separado y requiere el checkpoint ignorado
+completo (`best.pt`, su `checkpoint_set.json` y metadatos compatibles). **Sólo después de
+preparar ese origen local**, ejecute:
+
+```powershell
+$sourceCheckpoint = "outputs\bcs-category-coral-v1\weights\best.pt"
+.venv\Scripts\python -m pytest tests -m private_source_model --private-source-checkpoint $sourceCheckpoint -q
+```
+
+El comando productor no es necesario para consumidores del ZIP y no autoriza redistribución
+pública ni incorporación del artefacto a Git.
+
+No se debe agregar el ZIP, el sidecar ni el modelo privado a Git para hacer pasar la
+suite pública.
 
 ## Arrancar el servidor
 
@@ -77,6 +179,7 @@ El servidor levanta en `http://127.0.0.1:8001` con estos endpoints:
 | `POST` | `/detect` | Recibe imagen → vacas detectadas con cajas delimitadoras; `503` si la capacidad está ocupada |
 | `POST` | `/bcs` | Categoría BCS entera `1..5` sobre la imagen completa; `503` si no está disponible |
 | `GET` | `/ready/bcs` | Estado de capacidad BCS sin cargar el punto de control |
+| `GET` | `/metrics` | Contadores y latencias path-free de detección y BCS para el prototipo |
 | `GET` | `/ui` | UI de prueba de arrastrar y soltar (prototipo) |
 | `GET` | `/docs` | Swagger interactivo |
 
@@ -104,19 +207,19 @@ Inicie la API y abra `http://127.0.0.1:8001/ui` en el navegador. Arrastre una im
 para ver las detecciones con cajas delimitadoras dibujadas en tiempo real.
 
 ```powershell
-# BCS es opcional; sin estas variables la pestaña BCS muestra "unconfigured".
-# El candidato local falló los controles de aceptación; mantener la capacidad deshabilitada.
+# BCS usa automáticamente el paquete privado identificado por versión; el ZIP no está rastreado ni versionado en Git.
 Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
 Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
 .venv\Scripts\python scripts/run_api.py
 ```
 
-Después, arrastre una imagen o seleccione un archivo. La pestaña `Detect` conserva
+Después, arrastre una imagen o seleccione un archivo. La pestaña `Detección` conserva
 el envío automático y dibuja cajas delimitadoras; la pestaña `BCS` consulta
-`/ready/bcs` al abrirse y sólo envía la imagen a `/bcs` al pulsar `Calculate BCS`.
-La ejecución local produjo un candidato, pero falló los controles de aceptación: sin
-configuración la UI muestra honestamente `unconfigured` y mantiene el cálculo
-deshabilitado. Consulte el [reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md).
+`/ready/bcs` al abrirse y sólo envía la imagen a `/bcs` al pulsar `Calcular BCS`.
+La ejecución local produjo un candidato, pero falló los controles de aceptación. La UI
+muestra persistentemente `experimental_not_approved`; esto no equivale a aprobación.
+Consulte el [reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md) y la
+[tarjeta del modelo](models/catalog/bcs-category-coral-2026-09-04/MODEL_CARD.md).
 Las pruebas de API usan un entorno de ejecución falso controlado; no sustituyen la
 validación operativa de un candidato.
 
@@ -137,7 +240,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8001/detect `
   -Method Post `
   -Form @{file=Get-Item "data\cow-detection-navids\valid\images\alguna.jpg"}
 
-# BCS (requiere un punto de control BCS real configurado; de lo contrario devuelve 503)
+# BCS (primera llamada: carga lazy del paquete experimental)
 Invoke-RestMethod -Uri http://127.0.0.1:8001/bcs `
   -Method Post `
   -Form @{file=Get-Item "data\cow-detection-navids\valid\images\alguna.jpg"}
@@ -165,9 +268,19 @@ for d in data["detections"]:
 
 # Agrega una inferencia si se dispone de una imagen local explícita.
 .venv\Scripts\python scripts/smoke_test_api.py --image "C:\ruta\a\imagen.jpg"
+
+# Verifica not_loaded → /bcs exitoso → ready con la fixture rastreada.
+.venv\Scripts\python scripts/smoke_test_api.py --check-bcs
 ```
 
-Este modo carga la aplicación, ejecuta su ciclo de vida y solicita `/health` mediante ASGI en el mismo proceso. Confirma la preparación de la aplicación y del modelo, pero no confirma que exista un listener, que la red privada sea accesible ni que el backend atraviese el parser multipart real.
+`--check-bcs` además exige el paquete privado instalado, confirma `not_loaded`, ejecuta
+una categoría estricta `1..5` con estado experimental y `package_id`, y confirma `ready`.
+Valida únicamente el paquete privado predeterminado; no es una prueba de los modos
+deshabilitado u override externo, que están cubiertos por las pruebas nombradas de
+runtime/API.
+Si falta el paquete, falla con instrucciones de instalación. Este modo no confirma que
+exista un listener, que la red privada sea accesible ni que el backend atraviese el parser
+multipart real.
 
 ### Opción 6: Smoke test contra el servidor activo
 
@@ -181,7 +294,13 @@ Para validar también la ruta que consume el backend (`http://127.0.0.1:8001/det
 
 ```powershell
 .venv\Scripts\python scripts/smoke_test_api.py --base-url http://127.0.0.1:8001 --check-detect
+
+# Verifica readiness previa, BCS real con la fixture rastreada y readiness final.
+.venv\Scripts\python scripts/smoke_test_api.py --base-url http://127.0.0.1:8001 --check-bcs
 ```
+
+`--check-detect` sólo llama `/detect`; no llama `/bcs`. `--check-bcs` sólo valida el paquete
+bundled experimental instalado. Para validar ambos se deben pasar ambas banderas explícitamente.
 
 Con una imagen local, el smoke test envía multipart al `/detect` real y valida el contrato exitoso de `DetectResponse`:
 
@@ -195,12 +314,14 @@ El modo de red tiene timeout; falla ante respuestas no 200 donde corresponde, JS
 
 La aplicación limita los bytes después de que el parser multipart haya procesado la solicitud. No se añade middleware de pre-parser: sin conocer el overhead multipart, rechazar un cuerpo de 10 MiB podría rechazar archivos válidos de 10 MiB. Por lo tanto, el límite de la aplicación no evita todo el consumo de recursos de transporte. En cualquier despliegue en contenedor o red privada, configure antes de entregar la solicitud a la aplicación límites de tamaño total del cuerpo (10 MiB más el overhead multipart), timeout de solicitud y concurrencia.
 
-La aplicación también mantiene una compuerta de capacidad de inferencia compartida y nombrada
-(`shared-inference-capacity`), con capacidad predeterminada `1` y un timeout corto de adquisición.
-`/detect` y `/bcs` devuelven HTTP `503` con `{"detail":"Inference capacity is busy; retry shortly"}`
-cuando la única inferencia permitida ya está ocupada; no se invoca el modelo ni el runtime BCS
-en esa solicitud. La compuerta se libera incluso cuando la inferencia falla. `/health` y
-`/ready/bcs` no adquieren esta compuerta y deben permanecer disponibles durante una inferencia.
+La aplicación mantiene dos compuertas de capacidad independientes por proceso, una para
+`/detect` y otra para `/bcs`, cada una con capacidad predeterminada `1` y timeout corto.
+Cada endpoint devuelve HTTP `503` con `{"detail":"Inference capacity is busy; retry shortly"}`
+cuando su propia capacidad está ocupada; el tráfico BCS no consume la admisión de detección
+ni viceversa. Las compuertas se liberan incluso cuando la inferencia falla. `/health` y
+`/ready/bcs` no adquieren ninguna compuerta y deben permanecer disponibles durante una
+inferencia. Límites de proxy, proceso y recursos externos siguen siendo necesarios; CUDA
+puede sufrir competencia de memoria y cómputo aunque las compuertas sean independientes.
 El límite de concurrencia del reverse proxy/servidor sigue siendo necesario para controlar
 solicitudes multipart que todavía esperan ser procesadas por la aplicación.
 
@@ -283,28 +404,114 @@ no está disponible.
 
 ### Servicio de BCS
 
-No configure BCS: existe un candidato nuevo, pero fue rechazado al fallar los controles
-de aceptación. La detección permanece operativa de forma independiente. Consulte el
-[reporte de la ejecución](reports/bcs-category-baseline-2026-09-04.md).
+El paquete local preparado `bcs-category-coral-2026-09-04` es la selección predeterminada **sólo cuando
+está instalado** en `models/private/`; se verifica contra el catálogo Git-tracked y se
+carga de forma lazy. Es un prototipo experimental no aprobado; la detección permanece
+operativa de forma independiente. Consulte la
+[tarjeta del modelo](models/catalog/bcs-category-coral-2026-09-04/MODEL_CARD.md),
+ los [avisos de terceros](models/catalog/bcs-category-coral-2026-09-04/THIRD_PARTY_NOTICES.md)
+y el [reporte histórico](reports/bcs-category-baseline-2026-09-04.md).
+
+La exportación genera únicamente `artifacts/private/bcs-category-coral-2026-09-04/`, que
+está ignorado por Git. El instalador valida el ZIP, sidecar, catálogo y modelo en staging
+antes de tocar la instalación. Un paquete idéntico hace no-op; una instalación distinta
+se rechaza sin `--repair`. `--repair` mueve la instalación actual a un backup validado,
+instala la nueva y revierte el backup si falla. Detenga la API antes de reparar o
+desinstalar; nunca se elimina primero una instalación funcional.
+Este flujo está autorizado únicamente para carga y descarga del ZIP y su sidecar en la
+ubicación privada de VACCA Drive del equipo. No se autoriza redistribución pública ni
+incorporación del artefacto a Git.
+Una nueva versión requiere un `package_id`, directorio, política, catálogo y digest
+nuevos; no existe un override de package ID por CLI.
 
 ```powershell
-# Alternativa segura mientras BCS siga deshabilitado:
-Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
-Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
+# Obtenga el ZIP únicamente desde la ubicación privada de VACCA Drive del equipo; detenga primero Uvicorn (Ctrl+C).
+$archive = Join-Path $HOME "Downloads\vacca-bcs-category-coral-2026-09-04-experimental.zip"
+.venv\Scripts\python scripts/install_bcs_serving_package.py --archive $archive --repair
+.venv\Scripts\python scripts/smoke_test_api.py --check-bcs
+
+# Para deshabilitar de forma reversible, detenga la API y conserve el backup reportado:
+.venv\Scripts\python scripts/install_bcs_serving_package.py --uninstall
+
+# Para recuperar un backup `.backup-*` o `.disabled-*` retenido, sólo con la API detenida
+# y la ruta reportada:
+# Reemplace el valor por la ruta exacta que informó el instalador.
+$backup = "C:\\ruta\\privada\\.bcs-category-coral-2026-09-04.backup-<token>"
+.venv\Scripts\python scripts/install_bcs_serving_package.py --recover-backup $backup
+
+# La deshabilitación de emergencia no reemplaza la reparación:
+$env:VACCA_BCS_DISABLED = "1"
 .venv\Scripts\python scripts/run_api.py
 ```
 
-El cargador BCS es de carga diferida y está aislado de `/health` y `/detect`. `/ready/bcs` informa
-disponibilidad sin cargar el modelo. Sólo configure `VACCA_BCS_CHECKPOINT` y
-`VACCA_BCS_CHECKPOINT_SHA256` después de que un candidato finalizado pase los
-controles de aceptación y la entrega estricta de la guía operativa. Use el hash exacto reportado por
-la validación; no hay un hash BCS válido codificado de forma fija en este repositorio.
+Sólo `VACCA_BCS_DISABLED=1` deshabilita BCS de forma segura. Otros valores son inválidos
+y fallan cerrados. El cambio de entorno no reconfigura un runtime ya creado: detenga y
+reinicie el proceso, y verifique después `GET /ready/bcs` (`unconfigured`, `none`).
+`/health` y `/detect` no se ven afectados.
 
-Si una carga, configuración o inferencia BCS falla, el estado `unavailable` se conserva hasta
-reiniciar el proceso. Después de corregir el punto de control, el dispositivo o la configuración,
-detenga y vuelva a iniciar la API para aplicar la corrección. No se reintenta automáticamente:
-evitar reintentos mantiene una falla determinista, impide repetir cargas costosas o inseguras en
-cada solicitud y permite corregir la causa antes de habilitar nuevamente el modelo.
+### Override externo
+
+Si aparece cualquiera de las variables heredadas, deben aparecer ambas y el punto de
+control debe estar dentro de la raíz permitida con el SHA exacto. El modo externo se
+identifica siempre como `external_unclassified`; nunca se presenta como aprobado:
+el override conserva las validaciones existentes de checkpoint-set, ruta segura, SHA,
+lineage y categorías, y no puede convertir el paquete privado ni el modelo externo en
+un estado aprobado.
+
+```powershell
+Remove-Item Env:VACCA_BCS_DISABLED -ErrorAction SilentlyContinue
+$env:VACCA_BCS_CHECKPOINT = "outputs\bcs-category-coral-v1\weights\best.pt"
+$env:VACCA_BCS_CHECKPOINT_SHA256 = "592f8ce762b8a2bf68b722c8d4de4cb21f8ae48fdf42ea1979869e8d8105e38c"
+.venv\Scripts\python scripts/run_api.py
+```
+
+La selección sigue este orden exacto: `VACCA_BCS_DISABLED=1` gana y omite cualquier
+selección privada o externa hasta el reinicio; sin disable, un par externo completo
+reemplaza el paquete privado; un par externo parcial falla cerrado; sin variables
+externas, una instalación autorizada puede seleccionar el paquete privado. El cargador BCS es lazy y está aislado de
+`/health` y `/detect`. `/ready/bcs` informa `not_installed` si falta el ZIP instalado,
+`not_loaded` antes de la primera carga, y `unavailable` si la instalación está alterada.
+Reinicie el proceso después de corregir la causa; no hay reintentos automáticos.
+
+No desinstale antes de una actualización. El instalador actual fija un único `package_id` y
+no admite reemplazos de identidad por CLI. Una nueva versión exige un nuevo catálogo,
+política, `package_id`, directorio de paquete e instalador/revisión. Esa nueva versión debe
+validarse e instalarse junto a la anterior, ejecutar un smoke explícito contra su selección,
+y sólo después cambiar la revisión de código que la selecciona; el paquete anterior debe
+conservarse como rollback. Este checkout no ofrece un comando para simular ese flujo con el
+package ID actual.
+
+```powershell
+Remove-Item Env:VACCA_BCS_CHECKPOINT -ErrorAction SilentlyContinue
+Remove-Item Env:VACCA_BCS_CHECKPOINT_SHA256 -ErrorAction SilentlyContinue
+Remove-Item Env:VACCA_BCS_DISABLED -ErrorAction SilentlyContinue
+# El bloque de actualización se ejecuta sólo con el instalador de la nueva revisión.
+```
+
+Después de cambiar cualquiera de estas variables, reinicie siempre el proceso y confirme
+`/ready/bcs`: `not_installed` si falta el paquete, `not_loaded`/`experimental_not_approved` para el paquete privado,
+`not_loaded`/`external_unclassified` para un override, o `unconfigured`/`none` si se
+deshabilitó. El runtime cachea su selección y sus fallas durante toda la vida del proceso.
+
+### Observabilidad y capacidad
+
+`GET /metrics` expone JSON sin rutas, secretos, checkpoints ni digests. Incluye por
+capacidad (`detect` y `bcs`) solicitudes, rechazos de cliente, fallas de servidor/runtime,
+éxitos y fallas de inferencia, rechazos por capacidad ocupada, latencias exitosas y
+fallidas, y un marcador `measurement_window_started_at_utc`. Las compuertas de detección y BCS son independientes: el tráfico BCS no
+consume la admisión de detección y viceversa. Si ambas capacidades usan CUDA, pueden
+competir por memoria y cómputo aunque sus compuertas sean independientes.
+
+No hay alertas automáticas y las métricas son locales al proceso. Calcule
+`service_impacting_failures = server_runtime_failures + inference_failures` y
+`eligible_operational_requests = requests - client_rejections - busy_rejections`.
+La razón es `service_impacting_failures / eligible_operational_requests` cuando el
+denominador es mayor que cero; en cero solicitudes elegibles es `null`. Los umbrales de
+revisión de `1%`, `2%` y `5%` aplican a esa razón amplia, que incluye fallas de runtime y
+de inferencia; no aplican a rechazos de cliente ni a rechazos `busy`.
+
+BCS siempre recibe la imagen completa: se recomienda una sola vaca; con varias vacas el
+resultado es ambiguo y no se puede atribuir de manera segura a una vaca individual.
 
 ## Resultados de entrenamiento
 
@@ -331,7 +538,8 @@ IA/
 │   ├── model.py             ← Modelo ordinal ResNet18 + CORAL
 │   ├── source_plan.py       ← Normalización de la fuente local
 │   ├── category_split_plan.py ← División determinista por grupos
-│   └── serving.py           ← Cargador de puntos de control validados e inferencia sobre la imagen completa
+│   ├── serving.py           ← Cargador externo validado e inferencia sobre la imagen completa
+│   └── serving_package.py   ← Frontera estricta del paquete BCS privado y su catálogo
 ├── scripts/
 │   ├── train.py             ← Entrenamiento YOLO de Fase 1
 │   ├── build_combined_v2.py ← Conjunto de datos combinado separado de Fase 1
@@ -340,6 +548,7 @@ IA/
 │   ├── run_bcs_overnight.py ← Operador local de ejecución nocturna
 │   ├── run_baseline.py       ← Línea base reproducible de Fase 1
 │   ├── run_api.py           ← Script de arranque del servidor API
+│   ├── export_bcs_serving_package.py ← Exportación reproducible de state-dict-only
 │   └── smoke_test_api.py    ← Ciclo de vida FastAPI, /health ASGI y HTTP en vivo opcional
 ├── configs/                 ← Archivos YAML de entrenamiento
 ├── data/                    ← (ignorado por Git)
@@ -351,6 +560,7 @@ IA/
 │   ├── bcs-category-coral-v1/ ← Raíz del entrenador de categorías CORAL
 │   └── training/             ← Salidas de entrenamiento de Fase 1
 ├── models/deploy/           ← Modelo versionado de despliegue de Fase 1
+├── models/catalog/          ← Catálogo público; los pesos privados no se versionan
 └── PRD.md                   ← Documento de requisitos del producto
 ```
 
@@ -445,5 +655,10 @@ de incorporación (Pull Request).
 
 ## Licencia
 
-AGPL-3.0-only. Ultralytics YOLO bajo AGPL-3.0. Conjuntos de datos: CC BY 4.0.
-Ver [LICENSE](LICENSE) y [PRD.md](PRD.md) para restricciones de uso comercial.
+El código del repositorio permanece bajo AGPL-3.0-only. La atribución del conjunto
+Science Data Bank V3, la licencia CC BY 4.0 y los avisos de PyTorch/torchvision están en
+[`THIRD_PARTY_NOTICES.md`](models/catalog/bcs-category-coral-2026-09-04/THIRD_PARTY_NOTICES.md).
+La [tarjeta del modelo](models/catalog/bcs-category-coral-2026-09-04/MODEL_CARD.md)
+documenta las limitaciones, la procedencia de ResNet18 IMAGENET1K_V1 y la incertidumbre
+sobre permisos específicos de redistribución de esos pesos. Consulte también
+[LICENSE](LICENSE) y [PRD.md](PRD.md).
