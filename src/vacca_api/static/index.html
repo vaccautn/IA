@@ -229,6 +229,7 @@
     'Experimental BCS category 1..5 computed successfully; not approved for production.': 'Categoría BCS experimental calculada; no aprobada para producción.',
     'BCS category 1..5 computed successfully.': 'Categoría BCS calculada correctamente.',
   });
+  root.VaccaBcsResultMessages = bcsResultMessages;
 
   function createUiController({
     fetchImpl,
@@ -350,15 +351,25 @@
       const formData = formDataFactory();
       formData.append('file', state.selectedFile);
       try {
-        const response = await fetchImpl('/bcs', {
-          method: 'POST', body: formData, signal: bcsRequest.signal,
-        });
-        const body = await payload(response);
+        let response;
+        let body;
+        try {
+          response = await fetchImpl('/bcs', {
+            method: 'POST', body: formData, signal: bcsRequest.signal,
+          });
+          body = await payload(response);
+        } catch (error) {
+          if (!current(generation) || error.name === 'AbortError') return false;
+          state.bcsLoading = false;
+          emit({ type: 'error', target: 'bcs', status: '—', message: 'Error de conexión con el servicio BCS.' });
+          return false;
+        }
         if (!current(generation)) return false;
         if (!response.ok) {
+            const errorBody = body && typeof body === 'object' ? body : {};
             state.bcsLoading = false;
-            state.modelStatus = typeof body.model_status === 'string' ? body.model_status : state.modelStatus;
-            state.packageId = typeof body.package_id === 'string' ? body.package_id : state.packageId;
+            state.modelStatus = typeof errorBody.model_status === 'string' ? errorBody.model_status : state.modelStatus;
+            state.packageId = typeof errorBody.package_id === 'string' ? errorBody.package_id : state.packageId;
           if (response.status === 503) {
             state.bcsStatus = 'unavailable';
             state.bcsMessage = readinessMessages.unavailable;
@@ -372,11 +383,6 @@
         emit({ type: 'bcs-result', data: body });
         refreshReadiness();
         return true;
-      } catch (error) {
-        if (!current(generation) || error.name === 'AbortError') return false;
-        state.bcsLoading = false;
-        emit({ type: 'error', target: 'bcs', status: '—', message: 'Error de conexión con el servicio BCS.' });
-        return false;
       } finally {
         if (current(generation)) { bcsRequest = null; emit(); }
       }
@@ -404,6 +410,7 @@ const tabPanels = { detectTab: document.getElementById('detectPanel'), bcsTab: d
 
 const COLORS = ['#58a6ff','#3fb950','#d2991d','#f85149','#bc8cff','#ff7b72'];
 const readinessLabels = window.VaccaReadinessLabels;
+const bcsResultMessages = window.VaccaBcsResultMessages;
 const bcsReadiness = document.getElementById('bcsReadiness'), refreshReadiness = document.getElementById('refreshReadiness'), calculateBcs = document.getElementById('calculateBcs'), bcsProgress = document.getElementById('bcsProgress'), bcsResults = document.getElementById('bcsResults'), bcsExperimentalWarning = document.getElementById('bcsExperimentalWarning');
 let latestDetection = null, latestDetectionVersion = 0;
 
