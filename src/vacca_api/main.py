@@ -245,14 +245,16 @@ async def bcs(file: UploadFile = File(...)) -> BCSResponse:
         try:
             result = await run_in_threadpool(service.infer, image_bytes)
         except Exception as exc:
+            if _is_bcs_input_error(exc):
+                metrics.client_rejection("bcs", (perf_counter() - request_started) * 1000)
+                logger.info("BCS image input rejected: %s", type(exc).__name__)
+                raise HTTPException(status_code=400, detail="BCS image input is invalid") from None
             metrics.inference_failure(
                 "bcs",
                 (perf_counter() - started) * 1000,
                 (perf_counter() - request_started) * 1000,
             )
             logger.error("BCS inference failed: %s", type(exc).__name__)
-            if _is_bcs_input_error(exc):
-                raise HTTPException(status_code=400, detail="BCS image input is invalid") from None
             raise HTTPException(status_code=500, detail="BCS inference failed") from None
         inference_time_ms = (perf_counter() - started) * 1000
         metrics.inference_success(

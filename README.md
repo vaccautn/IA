@@ -503,12 +503,12 @@ consume la admisión de detección y viceversa. Si ambas capacidades usan CUDA, 
 competir por memoria y cómputo aunque sus compuertas sean independientes.
 
 No hay alertas automáticas y las métricas son locales al proceso. Calcule
-`service_impacting_failures = server_runtime_failures + inference_failures` y
-`eligible_operational_requests = requests - client_rejections - busy_rejections`.
+`service_impacting_failures = busy_rejections + server_runtime_failures + inference_failures` y
+`eligible_operational_requests = requests - client_rejections`.
 La razón es `service_impacting_failures / eligible_operational_requests` cuando el
 denominador es mayor que cero; en cero solicitudes elegibles es `null`. Los umbrales de
 revisión de `1%`, `2%` y `5%` aplican a esa razón amplia, que incluye fallas de runtime y
-de inferencia; no aplican a rechazos de cliente ni a rechazos `busy`.
+de inferencia, además de rechazos `busy`; no aplican a rechazos de cliente.
 
 BCS siempre recibe la imagen completa: se recomienda una sola vaca; con varias vacas el
 resultado es ambiguo y no se puede atribuir de manera segura a una vaca individual.

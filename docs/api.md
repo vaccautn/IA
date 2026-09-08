@@ -338,11 +338,12 @@ handler e incluye espera de compuerta y carga lazy; `successful_inference_ms` y
 es `inference_successes + inference_failures`. El marcador
 `measurement_window_started_at_utc` cambia al reiniciar el proceso; las métricas son
 locales al proceso. `service_impacting_failures` es la suma de
-`server_runtime_failures + inference_failures`; `eligible_operational_requests` es
-`requests - client_rejections - busy_rejections`. La razón es la primera cifra dividida
+`busy_rejections + server_runtime_failures + inference_failures`; `eligible_operational_requests` es
+`requests - client_rejections`. La razón es la primera cifra dividida
 por la segunda cuando ésta es mayor que cero; en cero es `null`. Los umbrales de revisión
 de `1%`, `2%` y `5%` aplican a esa razón amplia, incluidos runtime e inferencia. No se
-aplican a errores de cliente ni a rechazos `busy`. Si ambas
+aplican a errores de cliente; los rechazos `busy` sí se consideran fallas que impactan el
+servicio. Si ambas
 capacidades usan CUDA, sus compuertas son independientes pero pueden competir por memoria
 y cómputo.
 

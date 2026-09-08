@@ -53,8 +53,8 @@ def test_metrics_schema_and_documentation_use_service_impacting_rate() -> None:
     )
     assert all(field in schema and field in metrics and field in api_doc for field in required)
     assert "server_runtime_failure_review_thresholds" not in schema + metrics + api_doc
-    assert "server_runtime_failures + inference_failures" in api_doc
-    assert "requests - client_rejections - busy_rejections" in api_doc
+    assert "busy_rejections + server_runtime_failures + inference_failures" in api_doc
+    assert "requests - client_rejections" in api_doc
 
 
 def test_private_marker_without_readable_archive_fails_instead_of_skipping(tmp_path: Path) -> None:

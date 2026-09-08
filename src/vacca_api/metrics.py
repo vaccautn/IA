@@ -98,8 +98,12 @@ class PrototypeMetrics:
                 **{name: asdict(value) for name, value in self._values.items()},
             }
             for data in (result["detect"], result["bcs"]):
-                eligible = data["requests"] - data["client_rejections"] - data["busy_rejections"]
-                failures = data["server_runtime_failures"] + data["inference_failures"]
+                eligible = data["requests"] - data["client_rejections"]
+                failures = (
+                    data["busy_rejections"]
+                    + data["server_runtime_failures"]
+                    + data["inference_failures"]
+                )
                 data["eligible_operational_requests"] = eligible
                 data["service_impacting_failures"] = failures
                 data["service_impacting_failure_rate"] = (

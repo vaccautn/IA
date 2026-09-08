@@ -242,6 +242,36 @@ def test_bcs_inference_failure_logs_safe_event_and_status(monkeypatch, caplog) -
     assert all("secret" not in message for message in caplog.messages)
 
 
+def test_bcs_input_failure_is_client_rejection_in_http_metrics(monkeypatch) -> None:
+    metrics = main.PrototypeMetrics()
+    runtime = _FakeRuntime(_FakeService(failure=BCSInferenceInputError("secret image")))
+    monkeypatch.setattr(main.app.state, "metrics", metrics, raising=False)
+    monkeypatch.setattr(
+        main.app.state,
+        "bcs_inference_gate",
+        main.InferenceCapacityGate("bcs"),
+        raising=False,
+    )
+    monkeypatch.setattr(main, "get_bcs_runtime", lambda: runtime)
+
+    with pytest.raises(HTTPException) as failure:
+        asyncio.run(main.bcs(_Upload("image/jpeg", _valid_image_bytes())))
+
+    assert (failure.value.status_code, failure.value.detail) == (
+        400,
+        "BCS image input is invalid",
+    )
+    bcs_metrics = main.metrics().model_dump()["bcs"]
+    assert bcs_metrics["requests"] == 1
+    assert bcs_metrics["client_rejections"] == 1
+    assert bcs_metrics["inference_attempts"] == 0
+    assert bcs_metrics["inference_failures"] == 0
+    assert bcs_metrics["server_runtime_failures"] == 0
+    assert bcs_metrics["eligible_operational_requests"] == 0
+    assert bcs_metrics["service_impacting_failures"] == 0
+    assert bcs_metrics["service_impacting_failure_rate"] is None
+
+
 def test_unconfigured_bcs_upload_returns_503_without_loading(monkeypatch) -> None:
     runtime = BCSRuntime({"VACCA_BCS_DISABLED": "1"})
     monkeypatch.setattr(main, "get_bcs_runtime", lambda: runtime)
@@ -623,34 +653,53 @@ def test_metrics_report_success_failure_latency_and_no_cross_contamination(monke
     assert "checkpoint" not in repr(endpoint_snapshot).lower()
 
 
-def test_metrics_service_impacting_rate_uses_broad_failures_and_zero_denominators() -> None:
+def test_metrics_service_impacting_rate_counts_all_busy_requests() -> None:
     metrics = main.PrototypeMetrics()
-
-    for _ in range(2):
-        metrics.request("detect")
-        metrics.client_rejection("detect", 1.0)
-    all_client = metrics.snapshot()["detect"]
-    assert all_client["eligible_operational_requests"] == 0
-    assert all_client["service_impacting_failures"] == 0
-    assert all_client["service_impacting_failure_rate"] is None
 
     for _ in range(3):
         metrics.request("bcs")
         metrics.busy("bcs", 1.0)
     all_busy = metrics.snapshot()["bcs"]
-    assert all_busy["eligible_operational_requests"] == 0
-    assert all_busy["service_impacting_failures"] == 0
-    assert all_busy["service_impacting_failure_rate"] is None
+    assert all_busy["busy_rejections"] == 3
+    assert all_busy["eligible_operational_requests"] == 3
+    assert all_busy["service_impacting_failures"] == 3
+    assert all_busy["service_impacting_failure_rate"] == 1.0
+
+
+def test_metrics_service_impacting_rate_mixes_success_busy_runtime_and_inference() -> None:
+    metrics = main.PrototypeMetrics()
 
     metrics.request("detect")
+    metrics.inference_success("detect", 0.5, 1.0)
+    metrics.request("detect")
+    metrics.busy("detect", 1.0)
     metrics.request("detect")
     metrics.server_runtime_failure("detect", 1.0)
+    metrics.request("detect")
     metrics.inference_failure("detect", 0.5, 1.0)
     mixed = metrics.snapshot()["detect"]
-    assert mixed["eligible_operational_requests"] == 2
-    assert mixed["service_impacting_failures"] == 2
-    assert mixed["service_impacting_failure_rate"] == 1.0
+    assert mixed["requests"] == 4
+    assert mixed["busy_rejections"] == 1
+    assert mixed["eligible_operational_requests"] == 4
+    assert mixed["service_impacting_failures"] == 3
+    assert mixed["service_impacting_failure_rate"] == 0.75
     assert mixed["service_impacting_failure_rate_review_thresholds"] == [0.01, 0.02, 0.05]
+
+
+def test_metrics_service_impacting_rate_excludes_client_rejections() -> None:
+    metrics = main.PrototypeMetrics()
+
+    metrics.request("detect")
+    metrics.client_rejection("detect", 1.0)
+    metrics.request("detect")
+    metrics.inference_success("detect", 0.5, 1.0)
+
+    snapshot = metrics.snapshot()["detect"]
+    assert snapshot["requests"] == 2
+    assert snapshot["client_rejections"] == 1
+    assert snapshot["eligible_operational_requests"] == 1
+    assert snapshot["service_impacting_failures"] == 0
+    assert snapshot["service_impacting_failure_rate"] == 0.0
 
 
 def test_bcs_request_wall_time_includes_lazy_runtime_load(monkeypatch) -> None:
