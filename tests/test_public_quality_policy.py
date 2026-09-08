@@ -10,6 +10,38 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_NODE_TEST_FOCUS_PATTERN = re.compile(
+    r"\b(?:test|it|describe|suite)\s*\.\s*(?:only|skip)\s*\("
+)
+_NODE_TEST_OPTION_PATTERN = re.compile(
+    r"\b(?:test|it|describe|suite)\s*\([^)]*,\s*\{[^}]*\b(?:only|skip)\s*:\s*true\b",
+    re.DOTALL,
+)
+
+
+def _mask_javascript_comments_and_literals(source: str) -> str:
+    pattern = re.compile(
+        r"//[^\r\n]*|/\*.*?\*/|'(?:\\.|[^'\\\r\n])*'|\"(?:\\.|[^\"\\\r\n])*\"|`(?:\\.|[^`\\])*`",
+        re.DOTALL,
+    )
+
+    def blank(match: re.Match[str]) -> str:
+        return "".join("\n" if character == "\n" else " " for character in match.group())
+
+    return pattern.sub(blank, source)
+
+
+def _find_forbidden_node_test_declarations(root: Path) -> list[str]:
+    violations: list[str] = []
+    for path in sorted(root.rglob("*.js")):
+        source = _mask_javascript_comments_and_literals(path.read_text(encoding="utf-8"))
+        for match in _NODE_TEST_FOCUS_PATTERN.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            violations.append(f"{path}:{line}: focused or skipped Node test declaration")
+        for match in _NODE_TEST_OPTION_PATTERN.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            violations.append(f"{path}:{line}: focused or skipped Node test option")
+    return violations
 
 
 def test_public_workflow_has_no_private_download_or_test_access() -> None:
@@ -55,6 +87,31 @@ def test_metrics_schema_and_documentation_use_service_impacting_rate() -> None:
     assert "server_runtime_failure_review_thresholds" not in schema + metrics + api_doc
     assert "busy_rejections + server_runtime_failures + inference_failures" in api_doc
     assert "requests - client_rejections" in api_doc
+
+
+def test_node_test_policy_guard_self_verifies_code_and_ignores_text(tmp_path: Path) -> None:
+    fixture = tmp_path / "fixture.test.js"
+    fixture.write_text(
+        """
+        // test.only('comment') and test.skip('comment')
+        const text = "describe.only('text')";
+        test.only('focused', () => {});
+        it.skip('skipped', () => {});
+        describe('skipped', { skip: true }, () => {});
+        """,
+        encoding="utf-8",
+    )
+
+    violations = _find_forbidden_node_test_declarations(tmp_path)
+
+    assert len(violations) == 3
+    assert any("focused or skipped Node test declaration" in violation for violation in violations)
+    assert any("focused or skipped Node test option" in violation for violation in violations)
+
+
+def test_public_node_tests_do_not_use_focused_or_skipped_declarations() -> None:
+    violations = _find_forbidden_node_test_declarations(ROOT / "tests")
+    assert not violations, "\n".join(violations)
 
 
 def test_private_marker_without_readable_archive_fails_instead_of_skipping(tmp_path: Path) -> None:
