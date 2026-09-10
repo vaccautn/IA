@@ -1,0 +1,89 @@
+{
+  "activation": "private_team_package_after_install",
+  "approval": {
+    "failed_check_ids": [
+      "macro_f1",
+      "balanced_accuracy",
+      "class_f1",
+      "class_within_one",
+      "class_error_ge_2",
+      "ordinal_mae"
+    ],
+    "serving_status": "not_approved",
+    "status": "experimental",
+    "validation_status": "failed"
+  },
+  "artifact": {
+    "format": "torch_state_dict",
+    "path": "model_state.pt",
+    "sha256": "41f0e9a644e25f4be6facba7f7c2dcbf2988c5332293970d8d521e67a0d44e60",
+    "size_bytes": 44784009
+  },
+  "artifact_license": {
+    "code_license": "AGPL-3.0-only",
+    "dataset_license": "CC BY 4.0 applies to attributed Science Data Bank V3 source material",
+    "model_artifact_license": "derived_research_prototype_private_team_distribution; component permissions are not asserted",
+    "pretrained_weights_permission": "undetermined; private team distributor must determine permission for intended use",
+    "private_distribution_acceptance": "maintainer_accepted_internal_private_team_prototype_distribution_2026-09-06",
+    "status": "experimental_private_team_prototype_distribution_internal_only"
+  },
+  "capability": "bcs_ordinal_category_1_5",
+  "documentation": {
+    "model_card": {
+      "path": "MODEL_CARD.md",
+      "sha256": "84cf063c80056eadad8c5436a7524a514259b343442e4a4fe26336c36c81b2ea"
+    },
+    "third_party_notices": {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "sha256": "e0e9fc21178fdb995b3acee29157e009e0f886801d65e7be22fecc87f80cbdf9"
+    }
+  },
+  "lineage": {
+    "checkpoint_schema_version": "bcs-category-coral-checkpoint-v1",
+    "config_sha256": "c394d1c5806cf115fc158af889c2eab7ac55d2b323cd03af7606e283fd2639cc",
+    "dataset_manifest_digest": "39468cba1fc147abc47528518db2059808d98bb8051b69a50ccf0dc3d021d016",
+    "domain_id": "bcs-category-1-5-v1",
+    "missing_classes": [],
+    "observed_classes": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "run_id": "4321a60b44e04947a4b8bebc47401fc5",
+    "snapshot_identity": "4acbc454aa1544f0418277204f6f5f173749675043ed1205147282e350c1eab2",
+    "snapshot_schema": "bcs-category-snapshot-v1",
+    "source_identity_scheme": "local-path-sha256-v1",
+    "source_mapping": {
+      "3.25": 1,
+      "3.5": 2,
+      "3.75": 3,
+      "4.0": 4,
+      "4.25": 5
+    },
+    "source_schema": "bcs-local-category-source-v1"
+  },
+  "model": {
+    "architecture": "resnet18_coral",
+    "classes": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "imgsz": 224,
+    "thresholds": 4
+  },
+  "package_id": "bcs-category-coral-2026-09-04",
+  "report_path": "reports/bcs-category-baseline-2026-09-04.md",
+  "schema": "vacca-bcs-serving-package-v1",
+  "source_checkpoint": {
+    "best_epoch": 30,
+    "epoch": 30,
+    "role": "best",
+    "selection_identity": "db3d2f34e69bc162b94ed7cdc98442ea4e5e9a27ac95822de715b6cea600fd45",
+    "sha256": "592f8ce762b8a2bf68b722c8d4de4cb21f8ae48fdf42ea1979869e8d8105e38c"
+  }
+}

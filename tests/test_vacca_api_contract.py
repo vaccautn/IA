@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import threading
+import time
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -203,6 +204,30 @@ def test_bcs_valid_upload_returns_category(monkeypatch) -> None:
     assert upload.read_count == 1
 
 
+def test_private_runtime_readiness_is_lazy_and_stays_experimental(monkeypatch) -> None:
+    service = _FakeService(category=3)
+    loaded = object()
+    calls: list[object] = []
+    runtime = BCSRuntime(
+        {},
+        loader=lambda path, *, device, expected_sha256: calls.append(path) or loaded,
+        service_factory=lambda value: service,
+    )
+    monkeypatch.setattr(main, "get_bcs_runtime", lambda: runtime)
+    readiness = main.bcs_readiness()
+    assert readiness.status_code == 503
+    assert json.loads(readiness.body)["model_status"] == "experimental_not_approved"
+    assert calls == []
+    response = asyncio.run(main.bcs(_Upload("image/png", _valid_image_bytes("PNG"))))
+    assert response.model_status == "experimental_not_approved"
+    assert response.package_id == "bcs-category-coral-2026-09-04"
+    assert "not approved" in response.message
+    ready = main.bcs_readiness()
+    assert ready.status == "ready"
+    assert ready.model_status == "experimental_not_approved"
+    assert calls == [None]
+
+
 def test_bcs_inference_failure_logs_safe_event_and_status(monkeypatch, caplog) -> None:
     failure = BCSInferenceExecutionError("secret model detail")
     runtime = _FakeRuntime(_FakeService(failure=failure))
@@ -217,8 +242,38 @@ def test_bcs_inference_failure_logs_safe_event_and_status(monkeypatch, caplog) -
     assert all("secret" not in message for message in caplog.messages)
 
 
+def test_bcs_input_failure_is_client_rejection_in_http_metrics(monkeypatch) -> None:
+    metrics = main.PrototypeMetrics()
+    runtime = _FakeRuntime(_FakeService(failure=BCSInferenceInputError("secret image")))
+    monkeypatch.setattr(main.app.state, "metrics", metrics, raising=False)
+    monkeypatch.setattr(
+        main.app.state,
+        "bcs_inference_gate",
+        main.InferenceCapacityGate("bcs"),
+        raising=False,
+    )
+    monkeypatch.setattr(main, "get_bcs_runtime", lambda: runtime)
+
+    with pytest.raises(HTTPException) as failure:
+        asyncio.run(main.bcs(_Upload("image/jpeg", _valid_image_bytes())))
+
+    assert (failure.value.status_code, failure.value.detail) == (
+        400,
+        "BCS image input is invalid",
+    )
+    bcs_metrics = main.metrics().model_dump()["bcs"]
+    assert bcs_metrics["requests"] == 1
+    assert bcs_metrics["client_rejections"] == 1
+    assert bcs_metrics["inference_attempts"] == 0
+    assert bcs_metrics["inference_failures"] == 0
+    assert bcs_metrics["server_runtime_failures"] == 0
+    assert bcs_metrics["eligible_operational_requests"] == 0
+    assert bcs_metrics["service_impacting_failures"] == 0
+    assert bcs_metrics["service_impacting_failure_rate"] is None
+
+
 def test_unconfigured_bcs_upload_returns_503_without_loading(monkeypatch) -> None:
-    runtime = BCSRuntime({})
+    runtime = BCSRuntime({"VACCA_BCS_DISABLED": "1"})
     monkeypatch.setattr(main, "get_bcs_runtime", lambda: runtime)
 
     with pytest.raises(HTTPException) as captured:
@@ -257,6 +312,7 @@ def test_bcs_failure_mapping_is_typed_and_sanitized(
     [
         ("unconfigured", "BCS capability is not configured."),
         ("not_loaded", "BCS capability is configured but not loaded."),
+        ("not_installed", "BCS private serving package is not installed."),
         ("ready", "BCS capability is ready."),
         ("unavailable", "BCS capability is unavailable."),
     ],
@@ -288,7 +344,7 @@ def test_bcs_readiness_openapi_and_health_remain_bcs_independent(monkeypatch) ->
     assert readiness_schema["$ref"].endswith("/BCSReadinessResponse")
     assert schema["components"]["schemas"]["BCSReadinessResponse"]["properties"]["status"][
         "enum"
-    ] == ["unconfigured", "not_loaded", "ready", "unavailable"]
+    ] == ["unconfigured", "not_loaded", "not_installed", "ready", "unavailable"]
     detect_responses = schema["paths"]["/detect"]["post"]["responses"]
     bcs_responses = schema["paths"]["/bcs"]["post"]["responses"]
     assert detect_responses["200"]["content"]
@@ -343,12 +399,9 @@ def test_blocked_inference_does_not_block_health_or_bcs_readiness(endpoint, monk
         assert release.wait(timeout=2)
 
     async def exercise() -> None:
-        monkeypatch.setattr(
-            main.app.state,
-            "inference_capacity_gate",
-            main.InferenceCapacityGate(),
-            raising=False,
-        )
+        monkeypatch.setattr(main.app.state, "metrics", main.PrototypeMetrics(), raising=False)
+        monkeypatch.setattr(main.app.state, "detect_inference_gate", main.InferenceCapacityGate("detect"), raising=False)
+        monkeypatch.setattr(main.app.state, "bcs_inference_gate", main.InferenceCapacityGate("bcs"), raising=False)
         monkeypatch.setattr(
             main.app.state,
             "detector",
@@ -397,16 +450,14 @@ def test_blocked_inference_does_not_block_health_or_bcs_readiness(endpoint, monk
 
 
 @pytest.mark.parametrize(
-    ("blocked_endpoint", "busy_endpoint"),
+    ("blocked_endpoint", "other_endpoint"),
     [(main.detect, main.bcs), (main.bcs, main.detect)],
 )
-def test_shared_inference_capacity_returns_busy_without_second_runtime_call(
-    blocked_endpoint, busy_endpoint, monkeypatch
+def test_independent_capacity_allows_other_capability_while_one_is_blocked(
+    blocked_endpoint, other_endpoint, monkeypatch
 ) -> None:
     started = threading.Event()
     release = threading.Event()
-    detector_calls = 0
-    runtime_calls = 0
 
     def wait_for_release() -> None:
         started.set()
@@ -424,31 +475,23 @@ def test_shared_inference_capacity_returns_busy_without_second_runtime_call(
             wait_for_release()
             return SimpleNamespace(bcs_category=3)
 
-    def never_called_detector(image_bytes: bytes):
-        nonlocal detector_calls
-        detector_calls += 1
-        raise AssertionError("busy request invoked detector")
-
-    def never_called_runtime():
-        nonlocal runtime_calls
-        runtime_calls += 1
-        raise AssertionError("busy request invoked BCS runtime")
-
     async def exercise() -> None:
-        monkeypatch.setattr(
-            main.app.state,
-            "inference_capacity_gate",
-            main.InferenceCapacityGate(),
-            raising=False,
-        )
+        monkeypatch.setattr(main.app.state, "metrics", main.PrototypeMetrics(), raising=False)
+        monkeypatch.setattr(main.app.state, "detect_inference_gate", main.InferenceCapacityGate("detect"), raising=False)
+        monkeypatch.setattr(main.app.state, "bcs_inference_gate", main.InferenceCapacityGate("bcs"), raising=False)
         if blocked_endpoint is main.detect:
             monkeypatch.setattr(main.app.state, "detector", BlockingDetector(), raising=False)
-            monkeypatch.setattr(main, "get_bcs_runtime", never_called_runtime)
+            service = _FakeService(category=3)
+            monkeypatch.setattr(
+                main,
+                "get_bcs_runtime",
+                lambda: SimpleNamespace(status="ready", get_service=lambda: service),
+            )
         else:
             monkeypatch.setattr(
                 main.app.state,
                 "detector",
-                SimpleNamespace(detect=never_called_detector, gpu_available=False),
+                SimpleNamespace(detect=lambda image_bytes: ([], 8, 6, 1.0), gpu_available=False),
                 raising=False,
             )
             service = BlockingService()
@@ -463,22 +506,219 @@ def test_shared_inference_capacity_returns_busy_without_second_runtime_call(
         )
         try:
             await asyncio.wait_for(run_in_threadpool(started.wait, 2), timeout=2)
+            other = await asyncio.wait_for(
+                _call_endpoint(other_endpoint, _Upload("image/jpeg", _valid_image_bytes())),
+                timeout=1,
+            )
+            if other_endpoint is main.bcs:
+                assert other.bcs_category == 3
+            else:
+                assert other.detection_count == 0
+        finally:
+            release.set()
+            await first
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("endpoint", [main.detect, main.bcs])
+def test_each_capability_rejects_its_own_excess_concurrency(endpoint, monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def wait_for_release() -> None:
+        started.set()
+        assert release.wait(timeout=2)
+
+    async def exercise() -> None:
+        monkeypatch.setattr(main.app.state, "metrics", main.PrototypeMetrics(), raising=False)
+        monkeypatch.setattr(main.app.state, "detect_inference_gate", main.InferenceCapacityGate("detect"), raising=False)
+        monkeypatch.setattr(main.app.state, "bcs_inference_gate", main.InferenceCapacityGate("bcs"), raising=False)
+        if endpoint is main.detect:
+            class BlockingDetector:
+                gpu_available = False
+
+                def detect(self, image_bytes: bytes):
+                    wait_for_release()
+                    return [], 8, 6, 1.0
+
+            monkeypatch.setattr(main.app.state, "detector", BlockingDetector(), raising=False)
+        else:
+            class BlockingService:
+                def infer(self, image_bytes: bytes):
+                    wait_for_release()
+                    return SimpleNamespace(bcs_category=3)
+
+            monkeypatch.setattr(
+                main,
+                "get_bcs_runtime",
+                lambda: SimpleNamespace(status="ready", get_service=lambda: BlockingService()),
+            )
+        first = asyncio.create_task(_call_endpoint(endpoint, _Upload("image/jpeg", _valid_image_bytes())))
+        try:
+            await asyncio.wait_for(run_in_threadpool(started.wait, 2), timeout=2)
             with pytest.raises(HTTPException) as failure:
                 await asyncio.wait_for(
-                    _call_endpoint(busy_endpoint, _Upload("image/jpeg", _valid_image_bytes())),
+                    _call_endpoint(endpoint, _Upload("image/jpeg", _valid_image_bytes())),
                     timeout=1,
                 )
             assert (failure.value.status_code, failure.value.detail) == (
                 503,
                 main.INFERENCE_CAPACITY_BUSY_DETAIL,
             )
-            assert detector_calls == 0
-            assert runtime_calls == 0
+            snapshot = main.app.state.metrics.snapshot()
+            assert snapshot["detect"]["busy_rejections"] == (1 if endpoint is main.detect else 0)
+            assert snapshot["bcs"]["busy_rejections"] == (1 if endpoint is main.bcs else 0)
+            capability = "detect" if endpoint is main.detect else "bcs"
+            assert snapshot[capability]["inference_attempts"] == 0
+            assert snapshot[capability]["request_wall_time_ms_total"] > 0.0
         finally:
             release.set()
             await first
 
     asyncio.run(exercise())
+
+
+def test_metrics_report_success_failure_latency_and_no_cross_contamination(monkeypatch) -> None:
+    metrics = main.PrototypeMetrics()
+    monkeypatch.setattr(main.app.state, "metrics", metrics, raising=False)
+    monkeypatch.setattr(main.app.state, "detect_inference_gate", main.InferenceCapacityGate("detect"), raising=False)
+    monkeypatch.setattr(main.app.state, "bcs_inference_gate", main.InferenceCapacityGate("bcs"), raising=False)
+
+    class Detector:
+        gpu_available = False
+
+        def detect(self, image_bytes: bytes):
+            return [], 8, 6, 1.0
+
+    monkeypatch.setattr(main.app.state, "detector", Detector(), raising=False)
+    success_service = _FakeService(category=3)
+    monkeypatch.setattr(
+        main,
+        "get_bcs_runtime",
+        lambda: SimpleNamespace(status="ready", get_service=lambda: success_service),
+    )
+    asyncio.run(main.detect(_request(), _Upload("image/jpeg", _valid_image_bytes())))
+    asyncio.run(main.bcs(_Upload("image/jpeg", _valid_image_bytes())))
+
+    snapshot = metrics.snapshot()
+    assert isinstance(snapshot["measurement_window_started_at_utc"], str)
+    for capability in ("detect", "bcs"):
+        assert snapshot[capability]["requests"] == 1
+        assert snapshot[capability]["client_rejections"] == 0
+        assert snapshot[capability]["busy_rejections"] == 0
+        assert snapshot[capability]["server_runtime_failures"] == 0
+        assert snapshot[capability]["inference_attempts"] == 1
+        assert snapshot[capability]["inference_successes"] == 1
+        assert snapshot[capability]["inference_failures"] == 0
+        assert snapshot[capability]["successful_inference_ms"] >= 0.0
+        assert snapshot[capability]["last_successful_inference_ms"] is not None
+        assert snapshot[capability]["request_wall_time_ms_total"] > 0.0
+        assert snapshot[capability]["last_request_wall_time_ms"] is not None
+
+    failing_service = _FakeService(failure=BCSInferenceExecutionError("secret"))
+    monkeypatch.setattr(
+        main,
+        "get_bcs_runtime",
+        lambda: SimpleNamespace(status="ready", get_service=lambda: failing_service),
+    )
+    with pytest.raises(HTTPException) as failure:
+        asyncio.run(main.bcs(_Upload("image/jpeg", _valid_image_bytes())))
+    assert failure.value.status_code == 500
+    snapshot = metrics.snapshot()
+    assert snapshot["bcs"]["requests"] == 2
+    assert snapshot["bcs"]["inference_successes"] == 1
+    assert snapshot["bcs"]["inference_failures"] == 1
+    assert snapshot["bcs"]["inference_attempts"] == 2
+    assert snapshot["detect"]["requests"] == 1
+    assert snapshot["detect"]["server_runtime_failures"] == 0
+    with pytest.raises(HTTPException) as client_failure:
+        asyncio.run(main.detect(_request(), _Upload("text/plain", b"not an image")))
+    assert client_failure.value.status_code == 400
+    runtime_failure = SimpleNamespace(
+        status="not_loaded",
+        get_service=lambda: (_ for _ in ()).throw(RuntimeError("secret runtime")),
+    )
+    monkeypatch.setattr(main, "get_bcs_runtime", lambda: runtime_failure)
+    with pytest.raises(HTTPException) as server_failure:
+        asyncio.run(main.bcs(_Upload("image/jpeg", _valid_image_bytes())))
+    assert server_failure.value.status_code == 503
+    snapshot = metrics.snapshot()
+    assert snapshot["detect"]["client_rejections"] == 1
+    assert snapshot["detect"]["server_runtime_failures"] == 0
+    assert snapshot["bcs"]["server_runtime_failures"] == 1
+    assert snapshot["bcs"]["inference_attempts"] == 2
+    endpoint_snapshot = main.metrics().model_dump()
+    assert set(endpoint_snapshot) == {"measurement_window_started_at_utc", "detect", "bcs"}
+    assert "checkpoint" not in repr(endpoint_snapshot).lower()
+
+
+def test_metrics_service_impacting_rate_counts_all_busy_requests() -> None:
+    metrics = main.PrototypeMetrics()
+
+    for _ in range(3):
+        metrics.request("bcs")
+        metrics.busy("bcs", 1.0)
+    all_busy = metrics.snapshot()["bcs"]
+    assert all_busy["busy_rejections"] == 3
+    assert all_busy["eligible_operational_requests"] == 3
+    assert all_busy["service_impacting_failures"] == 3
+    assert all_busy["service_impacting_failure_rate"] == 1.0
+
+
+def test_metrics_service_impacting_rate_mixes_success_busy_runtime_and_inference() -> None:
+    metrics = main.PrototypeMetrics()
+
+    metrics.request("detect")
+    metrics.inference_success("detect", 0.5, 1.0)
+    metrics.request("detect")
+    metrics.busy("detect", 1.0)
+    metrics.request("detect")
+    metrics.server_runtime_failure("detect", 1.0)
+    metrics.request("detect")
+    metrics.inference_failure("detect", 0.5, 1.0)
+    mixed = metrics.snapshot()["detect"]
+    assert mixed["requests"] == 4
+    assert mixed["busy_rejections"] == 1
+    assert mixed["eligible_operational_requests"] == 4
+    assert mixed["service_impacting_failures"] == 3
+    assert mixed["service_impacting_failure_rate"] == 0.75
+    assert mixed["service_impacting_failure_rate_review_thresholds"] == [0.01, 0.02, 0.05]
+
+
+def test_metrics_service_impacting_rate_excludes_client_rejections() -> None:
+    metrics = main.PrototypeMetrics()
+
+    metrics.request("detect")
+    metrics.client_rejection("detect", 1.0)
+    metrics.request("detect")
+    metrics.inference_success("detect", 0.5, 1.0)
+
+    snapshot = metrics.snapshot()["detect"]
+    assert snapshot["requests"] == 2
+    assert snapshot["client_rejections"] == 1
+    assert snapshot["eligible_operational_requests"] == 1
+    assert snapshot["service_impacting_failures"] == 0
+    assert snapshot["service_impacting_failure_rate"] == 0.0
+
+
+def test_bcs_request_wall_time_includes_lazy_runtime_load(monkeypatch) -> None:
+    service = _FakeService(category=3)
+
+    def load_once():
+        time.sleep(0.01)
+        return service
+
+    monkeypatch.setattr(main.app.state, "metrics", main.PrototypeMetrics(), raising=False)
+    monkeypatch.setattr(main.app.state, "bcs_inference_gate", main.InferenceCapacityGate("bcs"), raising=False)
+    monkeypatch.setattr(
+        main,
+        "get_bcs_runtime",
+        lambda: SimpleNamespace(status="not_loaded", get_service=load_once),
+    )
+    asyncio.run(main.bcs(_Upload("image/jpeg", _valid_image_bytes())))
+    snapshot = main.app.state.metrics.snapshot()["bcs"]
+    assert snapshot["request_wall_time_ms_total"] > snapshot["successful_inference_ms"]
 
 
 @pytest.mark.parametrize("endpoint", [main.detect, main.bcs])
@@ -496,12 +736,8 @@ def test_inference_capacity_releases_after_success(endpoint, monkeypatch) -> Non
     service = _FakeService()
 
     async def exercise() -> None:
-        monkeypatch.setattr(
-            main.app.state,
-            "inference_capacity_gate",
-            main.InferenceCapacityGate(),
-            raising=False,
-        )
+        monkeypatch.setattr(main.app.state, "detect_inference_gate", main.InferenceCapacityGate("detect"), raising=False)
+        monkeypatch.setattr(main.app.state, "bcs_inference_gate", main.InferenceCapacityGate("bcs"), raising=False)
         monkeypatch.setattr(main.app.state, "detector", Detector(), raising=False)
         monkeypatch.setattr(
             main,
@@ -541,12 +777,8 @@ def test_inference_capacity_releases_after_failure(endpoint, monkeypatch) -> Non
             return SimpleNamespace(bcs_category=3)
 
     async def exercise() -> None:
-        monkeypatch.setattr(
-            main.app.state,
-            "inference_capacity_gate",
-            main.InferenceCapacityGate(),
-            raising=False,
-        )
+        monkeypatch.setattr(main.app.state, "detect_inference_gate", main.InferenceCapacityGate("detect"), raising=False)
+        monkeypatch.setattr(main.app.state, "bcs_inference_gate", main.InferenceCapacityGate("bcs"), raising=False)
         if endpoint is main.detect:
             monkeypatch.setattr(
                 main.app.state,
@@ -582,9 +814,10 @@ def test_prototype_ui_delivery_and_bcs_contract() -> None:
     html = response.body.decode("utf-8")
     for fragment in (
         'role="tablist"', 'id="detectTab"', 'id="bcsTab"', 'aria-selected=',
-        'id="bcsReadiness"', 'GET /ready/bcs', 'POST /bcs', 'Calculate BCS',
-        'bcs_category', 'Not reported', 'aria-live="polite"', 'vacca-yolo26n-v1.pt',
-        'ready', 'not_loaded', 'unconfigured', 'unavailable',
+        'id="bcsReadiness"', 'GET /ready/bcs', 'POST /bcs', 'Calcular BCS',
+        'bcs_category', 'No informado', 'aria-live="polite"', 'vacca-yolo26n-v1.pt',
+        'ready', 'not_loaded', 'not_installed', 'unconfigured', 'unavailable',
+        'bcsExperimentalWarning', 'experimental', 'no está aprobado',
     ):
         assert fragment in html
     assert "innerHTML" not in html

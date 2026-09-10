@@ -33,6 +33,14 @@ const sandbox = {
 vm.runInNewContext(firstScript[1].replace('</script>', ''), sandbox, { filename: htmlPath });
 const { createUiController } = sandbox.module.exports;
 
+test('UI keeps the experimental warning visible and never labels BCS as approved', () => {
+  assert.match(html, /id="bcsExperimentalWarning"/);
+  assert.match(html, /experimental/i);
+  assert.match(html, /no está aprobado/i);
+  assert.match(html, /ubicación privada de VACCA Drive del equipo o del mantenedor/);
+  assert.doesNotMatch(html, /BCS[^\n]*production ready/i);
+});
+
 function response(status, body) {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
@@ -111,7 +119,7 @@ function adapterHarness(fetchImpl) {
   }
   [
     'dropzone', 'fileInput', 'preview', 'bboxCanvas', 'uploadHint', 'spinner',
-    'summary', 'detectTab', 'bcsTab', 'detectPanel', 'bcsPanel', 'bcsReadiness',
+    'summary', 'detectTab', 'bcsTab', 'detectPanel', 'bcsPanel', 'bcsReadiness', 'bcsExperimentalWarning',
     'refreshReadiness', 'calculateBcs', 'bcsProgress', 'bcsResults', 'results',
   ].forEach(id => element(id));
   const document = {
@@ -120,6 +128,8 @@ function adapterHarness(fetchImpl) {
   };
   const window = {
     VaccaUiController: { createUiController },
+    VaccaReadinessLabels: { ready: 'Listo', not_loaded: 'No cargado', not_installed: 'No instalado', unconfigured: 'No configurado', unavailable: 'No disponible' },
+    VaccaBcsResultMessages: sandbox.VaccaBcsResultMessages,
     addEventListener(type, listener) {
       (windowHandlers[type] ||= []).push(listener);
     },
@@ -140,6 +150,7 @@ function adapterHarness(fetchImpl) {
 
 const image = name => ({ name, type: 'image/jpeg' });
 const flush = () => new Promise(resolve => setImmediate(resolve));
+const renderedText = node => `${node.textContent || ''} ${(node.children || []).map(renderedText).join(' ')}`;
 
 test('valid selection detects automatically and BCS submits the same file as multipart', async () => {
   let readinessCalls = 0;
@@ -148,8 +159,8 @@ test('valid selection detects automatically and BCS submits the same file as mul
     requests.push({ url, options });
     if (url === '/detect') return response(200, { cow_detected: false, detections: [] });
     if (url === '/ready/bcs') return response(503, readinessCalls++ === 0
-      ? { status: 'not_loaded', message: 'configured' } : { status: 'ready', message: 'ready' });
-    return response(200, { status: 'ok', message: 'computed', bcs_category: 4, cow_detected: null });
+      ? { status: 'not_loaded', message: 'configured', model_status: 'experimental_not_approved', package_id: 'bcs-package' } : { status: 'ready', message: 'ready', model_status: 'experimental_not_approved', package_id: 'bcs-package' });
+    return response(200, { status: 'ok', message: 'computed', bcs_category: 4, cow_detected: null, model_status: 'experimental_not_approved', package_id: 'bcs-package' });
   });
   const file = image('new-cow.jpg');
   assert.equal(h.controller.selectFile(file), true);
@@ -164,7 +175,85 @@ test('valid selection detects automatically and BCS submits the same file as mul
   const result = h.events.find(event => event.type === 'bcs-result');
   assert.equal(result.data.bcs_category, 4);
   assert.equal(result.data.cow_detected, null);
+  assert.equal(h.controller.getState().modelStatus, 'experimental_not_approved');
+  assert.equal(h.controller.getState().packageId, 'bcs-package');
   assert.equal(h.controller.getState().bcsStatus, 'ready');
+});
+
+test('DOM adapter distinguishes external and disabled model status warnings', async () => {
+  const external = adapterHarness(async url => {
+    assert.equal(url, '/ready/bcs');
+    return response(200, {
+      status: 'ready', message: 'ready', model_status: 'external_unclassified', package_id: 'external-test',
+    });
+  });
+  external.elements.get('bcsTab').dispatch('click');
+  await flush();
+  assert.match(external.elements.get('bcsExperimentalWarning').textContent, /externo no clasificado/);
+  assert.match(external.elements.get('bcsExperimentalWarning').textContent, /una sola vaca/);
+});
+
+test('DOM adapter renders a successful BCS response with its localized message', async () => {
+  const h = adapterHarness(async url => {
+    if (url === '/detect') return response(200, { cow_detected: false, detections: [] });
+    if (url === '/ready/bcs') return response(200, {
+      status: 'ready', message: 'ready', model_status: 'experimental_not_approved', package_id: 'bcs-package',
+    });
+    return response(200, {
+      status: 'ok', message: 'BCS category 1..5 computed successfully.', bcs_category: 4,
+      cow_detected: null, model_status: 'experimental_not_approved', package_id: 'bcs-package',
+    });
+  });
+
+  h.elements.get('fileInput').files = [image('bcs.jpg')];
+  h.elements.get('fileInput').dispatch('change');
+  await flush();
+  h.elements.get('refreshReadiness').dispatch('click');
+  await flush();
+  await h.elements.get('calculateBcs').dispatch('click');
+  await flush();
+
+  const text = renderedText(h.elements.get('bcsResults'));
+  assert.match(text, /4/);
+  assert.match(text, /Categoría BCS calculada correctamente\./);
+  assert.doesNotMatch(text, /Error de conexión con el servicio BCS\./);
+});
+
+test('DOM adapter shows a stable BCS error for a malformed non-success payload', async () => {
+  const h = adapterHarness(async url => {
+    if (url === '/detect') return response(200, { cow_detected: false, detections: [] });
+    if (url === '/ready/bcs') return response(200, { status: 'ready', message: 'ready' });
+    return response(500, null);
+  });
+
+  h.elements.get('fileInput').files = [image('bcs-error.jpg')];
+  h.elements.get('fileInput').dispatch('change');
+  await flush();
+  h.elements.get('refreshReadiness').dispatch('click');
+  await flush();
+  await h.elements.get('calculateBcs').dispatch('click');
+
+  const text = renderedText(h.elements.get('bcsResults'));
+  assert.match(text, /Error: 500 — No se pudo calcular el BCS\./);
+  assert.doesNotMatch(text, /Error de conexión con el servicio BCS\./);
+});
+
+test('DOM adapter shows a connection error when the BCS request rejects', async () => {
+  const h = adapterHarness(async url => {
+    if (url === '/detect') return response(200, { cow_detected: false, detections: [] });
+    if (url === '/ready/bcs') return response(200, { status: 'ready', message: 'ready' });
+    throw new Error('network failure');
+  });
+
+  h.elements.get('fileInput').files = [image('bcs-network.jpg')];
+  h.elements.get('fileInput').dispatch('change');
+  await flush();
+  h.elements.get('refreshReadiness').dispatch('click');
+  await flush();
+  await h.elements.get('calculateBcs').dispatch('click');
+
+  const text = renderedText(h.elements.get('bcsResults'));
+  assert.match(text, /Error: — — Error de conexión con el servicio BCS\./);
 });
 
 test('invalid reselection invalidates and aborts all old work before showing an error', async () => {

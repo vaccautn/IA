@@ -47,7 +47,7 @@ def test_ui_is_delivered_through_the_actual_asgi_route() -> None:
     assert start["status"] == 200
     assert headers[b"content-type"] == b"text/html; charset=utf-8"
     assert b"<!DOCTYPE html>" in body
-    assert b"Calculate BCS" in body
+    assert b"Calcular BCS" in body
 
 
 def test_node_controller_behavior() -> None:
@@ -55,5 +55,7 @@ def test_node_controller_behavior() -> None:
     if node is None:
         pytest.skip("Node is unavailable; UI behavior tests were not run")
     script = Path(__file__).with_name("ui_controller.test.js")
-    result = subprocess.run([node, "--test", str(script)], capture_output=True, text=True)
+    result = subprocess.run(
+        [node, "--test", str(script)], capture_output=True, text=True, encoding="utf-8"
+    )
     assert result.returncode == 0, result.stdout + result.stderr

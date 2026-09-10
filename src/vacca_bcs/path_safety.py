@@ -65,8 +65,8 @@ def _reject_symlink_components(candidate: Path, *, allow_missing_final: bool) ->
             raise SafePathError("path component does not exist") from None
         except OSError:
             raise SafePathError("path component cannot be inspected") from None
-        if stat.S_ISLNK(info.st_mode):
-            raise SafePathError("path must not traverse a symlink")
+        if _is_link_or_reparse_point(info):
+            raise SafePathError("path must not traverse a symlink or reparse point")
         if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
             raise SafePathError("path has a non-directory ancestor")
 
@@ -77,3 +77,9 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _is_link_or_reparse_point(info: os.stat_result) -> bool:
+    """Reject POSIX links and Windows junctions/reparse points."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & reparse_flag)

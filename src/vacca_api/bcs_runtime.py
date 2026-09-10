@@ -21,18 +21,34 @@ from vacca_bcs.serving import (
     load_bcs_model,
 )
 from vacca_bcs.path_safety import SafePathError, safe_path
+from vacca_bcs.serving_package import (
+    PRIVATE_PACKAGE_ID,
+    PRIVATE_PACKAGE_ROOT,
+    ServingPackageError,
+    find_recoverable_backups,
+    load_installed_bcs_model,
+    validate_installed_package,
+)
 
 _CHECKPOINT_ENV = "VACCA_BCS_CHECKPOINT"
 _CHECKPOINT_SHA256_ENV = "VACCA_BCS_CHECKPOINT_SHA256"
 _DEVICE_ENV = "VACCA_BCS_DEVICE"
+_DISABLED_ENV = "VACCA_BCS_DISABLED"
 logger = logging.getLogger(__name__)
 
 
 class BCSRuntimeStatus(str, Enum):
     UNCONFIGURED = "unconfigured"
     NOT_LOADED = "not_loaded"
+    NOT_INSTALLED = "not_installed"
     READY = "ready"
     UNAVAILABLE = "unavailable"
+
+
+class BCSModelStatus(str, Enum):
+    NONE = "none"
+    EXPERIMENTAL_NOT_APPROVED = "experimental_not_approved"
+    EXTERNAL_UNCLASSIFIED = "external_unclassified"
 
 
 class BCSRuntimeUnavailableError(RuntimeError):
@@ -51,6 +67,16 @@ Loader = Callable[..., LoadedBCSModel]
 ServiceFactory = Callable[[LoadedBCSModel], Any]
 
 
+def _recovery_hint() -> str:
+    try:
+        available = bool(find_recoverable_backups())
+    except (OSError, ServingPackageError):
+        available = False
+    if not available:
+        return ""
+    return "; a retained recovery backup is available; run --recover-backup <backup-name> after stopping the API"
+
+
 class BCSRuntime:
     """Own one lazily initialized BCS service and its cached outcome."""
 
@@ -63,6 +89,7 @@ class BCSRuntime:
         checkpoint_root: Path | None = None,
     ) -> None:
         self._lock = threading.Lock()
+        self._custom_loader = loader is not None
         self._loader = load_bcs_model if loader is None else loader
         self._service_factory = (
             BCSInferenceService if service_factory is None else service_factory
@@ -73,6 +100,8 @@ class BCSRuntime:
         self._checkpoint: str | None = None
         self._checkpoint_sha256: str | None = None
         self._device: Any = "cpu"
+        self._model_status: BCSModelStatus = BCSModelStatus.NONE
+        self._package_id: str | None = None
         self._status = BCSRuntimeStatus.UNCONFIGURED
         self._configure(environment if environment is not None else os.environ)
 
@@ -86,6 +115,16 @@ class BCSRuntime:
         with self._lock:
             return self._failure
 
+    @property
+    def model_status(self) -> BCSModelStatus:
+        with self._lock:
+            return self._model_status
+
+    @property
+    def package_id(self) -> str | None:
+        with self._lock:
+            return self._package_id
+
     def get_service(self) -> Any:
         """Load once on demand; cache both success and failure under one lock."""
         with self._lock:
@@ -93,7 +132,10 @@ class BCSRuntime:
                 return self._service
             if self._status is BCSRuntimeStatus.UNCONFIGURED:
                 raise BCSRuntimeUnavailableError("BCS capability is unconfigured")
-            if self._status is BCSRuntimeStatus.UNAVAILABLE:
+            if self._status in {
+                BCSRuntimeStatus.NOT_INSTALLED,
+                BCSRuntimeStatus.UNAVAILABLE,
+            }:
                 raise BCSRuntimeUnavailableError("BCS capability is unavailable")
 
             try:
@@ -113,6 +155,13 @@ class BCSRuntime:
                 self._cache_failure(
                     "checkpoint_load",
                     "BCS checkpoint could not be loaded",
+                    type(exc).__name__,
+                )
+                raise BCSRuntimeUnavailableError("BCS capability is unavailable") from None
+            except ServingPackageError as exc:
+                self._cache_failure(
+                    "package_load",
+                    "BCS serving package could not be loaded",
                     type(exc).__name__,
                 )
                 raise BCSRuntimeUnavailableError("BCS capability is unavailable") from None
@@ -144,6 +193,10 @@ class BCSRuntime:
             self._checkpoint = None
             self._checkpoint_sha256 = None
             self._device = "cpu"
+            self._model_status = BCSModelStatus.NONE
+            self._package_id = None
+            if not self._custom_loader:
+                self._loader = load_bcs_model
             self._status = BCSRuntimeStatus.UNCONFIGURED
             self._configure(environment if environment is not None else os.environ)
 
@@ -152,6 +205,7 @@ class BCSRuntime:
             checkpoint = environment.get(_CHECKPOINT_ENV)
             checkpoint_sha256 = environment.get(_CHECKPOINT_SHA256_ENV)
             device = environment.get(_DEVICE_ENV, "cpu")
+            disabled = environment.get(_DISABLED_ENV)
         except Exception as exc:
             self._cache_failure(
                 "configuration",
@@ -159,11 +213,43 @@ class BCSRuntime:
                 type(exc).__name__,
             )
             return
-        if checkpoint is None or (isinstance(checkpoint, str) and not checkpoint.strip()):
-            if checkpoint_sha256 is not None and (
-                not isinstance(checkpoint_sha256, str) or checkpoint_sha256.strip()
-            ):
-                self._cache_failure("configuration", "BCS environment configuration is invalid")
+        if disabled is not None:
+            if disabled != "1":
+                self._cache_failure("configuration", "BCS disable configuration is invalid")
+                return
+            self._failure = BCSRuntimeFailure(
+                "disabled", "BCS capability is disabled by emergency configuration"
+            )
+            self._status = BCSRuntimeStatus.UNCONFIGURED
+            return
+        has_checkpoint = checkpoint is not None
+        has_digest = checkpoint_sha256 is not None
+        if not has_checkpoint and not has_digest:
+            self._model_status = BCSModelStatus.EXPERIMENTAL_NOT_APPROVED
+            self._package_id = PRIVATE_PACKAGE_ID
+            self._device = device
+            if not self._custom_loader:
+                if not PRIVATE_PACKAGE_ROOT.is_dir() or PRIVATE_PACKAGE_ROOT.is_symlink():
+                    self._cache_failure(
+                        "package_not_installed",
+                        f"BCS serving package is not installed{_recovery_hint()}",
+                        status=BCSRuntimeStatus.NOT_INSTALLED,
+                    )
+                    return
+                try:
+                    validate_installed_package()
+                except ServingPackageError as exc:
+                    self._cache_failure(
+                        "package_unavailable",
+                        f"BCS serving package is unavailable{_recovery_hint()}",
+                        type(exc).__name__,
+                    )
+                    return
+            self._status = BCSRuntimeStatus.NOT_LOADED
+            self._loader = self._loader if self._custom_loader else load_installed_bcs_model
+            return
+        if not has_checkpoint or not has_digest:
+            self._cache_failure("configuration", "BCS environment configuration is invalid")
             return
         if (
             not isinstance(checkpoint, str)
@@ -194,6 +280,8 @@ class BCSRuntime:
             )
             return
         self._device = device
+        self._model_status = BCSModelStatus.EXTERNAL_UNCLASSIFIED
+        self._package_id = None
         self._status = BCSRuntimeStatus.NOT_LOADED
 
     def _cache_failure(
@@ -201,9 +289,11 @@ class BCSRuntime:
         category: str,
         reason: str,
         exception_type: str = "BCSConfigurationError",
+        *,
+        status: BCSRuntimeStatus = BCSRuntimeStatus.UNAVAILABLE,
     ) -> None:
         self._failure = BCSRuntimeFailure(category, reason)
-        self._status = BCSRuntimeStatus.UNAVAILABLE
+        self._status = status
         logger.error("BCS %s failure: %s", category, exception_type)
 
 

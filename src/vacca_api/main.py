@@ -15,6 +15,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import logging
 from pathlib import Path
+from time import perf_counter
 from typing import AsyncIterator, NoReturn
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -28,7 +29,9 @@ from .schemas import (
     DetectResponse,
     ErrorResponse,
     HealthResponse,
+    MetricsResponse,
 )
+from .metrics import PrototypeMetrics
 from .upload_validation import (
     UploadTooLargeError,
     UploadValidationError,
@@ -40,14 +43,15 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 MODEL_IDENTIFIER = DEFAULT_MODEL.name
 logger = logging.getLogger(__name__)
 _ERROR_RESPONSE = {"model": ErrorResponse}
-INFERENCE_GATE_NAME = "shared-inference-capacity"
+DETECT_GATE_NAME = "detect-inference-capacity"
+BCS_GATE_NAME = "bcs-inference-capacity"
 INFERENCE_GATE_CAPACITY = 1
 INFERENCE_GATE_ACQUIRE_TIMEOUT_SECONDS = 0.1
 INFERENCE_CAPACITY_BUSY_DETAIL = "Inference capacity is busy; retry shortly"
 
 
 class InferenceCapacityBusyError(RuntimeError):
-    """Raised when shared inference capacity cannot be acquired promptly."""
+    """Raised when one capability's bounded inference capacity is busy."""
 
 
 class InferenceCapacityGate:
@@ -55,12 +59,13 @@ class InferenceCapacityGate:
 
     def __init__(
         self,
+        name: str = DETECT_GATE_NAME,
         capacity: int = INFERENCE_GATE_CAPACITY,
         acquisition_timeout: float = INFERENCE_GATE_ACQUIRE_TIMEOUT_SECONDS,
     ) -> None:
         if capacity < 1 or acquisition_timeout <= 0:
             raise ValueError("inference capacity and timeout must be positive")
-        self.name = INFERENCE_GATE_NAME
+        self.name = name
         self.capacity = capacity
         self.acquisition_timeout = acquisition_timeout
         self._semaphore = asyncio.BoundedSemaphore(capacity)
@@ -112,7 +117,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
-app.state.inference_capacity_gate = InferenceCapacityGate()
+app.state.detect_inference_gate = InferenceCapacityGate(DETECT_GATE_NAME)
+app.state.bcs_inference_gate = InferenceCapacityGate(BCS_GATE_NAME)
+app.state.metrics = PrototypeMetrics()
 
 
 # --- Health ---
@@ -142,16 +149,22 @@ def health(request: Request) -> HealthResponse:
 )
 async def detect(request: Request, file: UploadFile = File(...)) -> DetectResponse:
     """Receive an image and return cow detections with bounding boxes."""
+    request_started = perf_counter()
+    metrics = request.app.state.metrics
+    metrics.request("detect")
     try:
         image_bytes = await read_validated_upload(file)
     except UploadValidationError as exc:
+        metrics.client_rejection("detect", (perf_counter() - request_started) * 1000)
         _raise_upload_http_exception(exc)
 
-    gate = request.app.state.inference_capacity_gate
+    gate = request.app.state.detect_inference_gate
     try:
         await gate.acquire()
     except InferenceCapacityBusyError:
+        metrics.busy("detect", (perf_counter() - request_started) * 1000)
         raise HTTPException(status_code=503, detail=INFERENCE_CAPACITY_BUSY_DETAIL) from None
+    started = perf_counter()
     try:
         try:
             detector = request.app.state.detector
@@ -160,11 +173,21 @@ async def detect(request: Request, file: UploadFile = File(...)) -> DetectRespon
                 image_bytes,
             )
         except Exception as exc:
+            metrics.inference_failure(
+                "detect",
+                (perf_counter() - started) * 1000,
+                (perf_counter() - request_started) * 1000,
+            )
             logger.error("Detection request failed: %s", type(exc).__name__)
             raise HTTPException(
                 status_code=500,
                 detail="Detection failed — check server logs",
             ) from None
+        metrics.inference_success(
+            "detect",
+            (perf_counter() - started) * 1000,
+            (perf_counter() - request_started) * 1000,
+        )
     finally:
         gate.release()
 
@@ -194,39 +217,66 @@ async def detect(request: Request, file: UploadFile = File(...)) -> DetectRespon
 )
 async def bcs(file: UploadFile = File(...)) -> BCSResponse:
     """Estimate and expose one discrete BCS category from 1 through 5."""
+    request_started = perf_counter()
+    metrics = app.state.metrics
+    metrics.request("bcs")
     try:
         image_bytes = await read_validated_upload(file)
     except UploadValidationError as exc:
+        metrics.client_rejection("bcs", (perf_counter() - request_started) * 1000)
         _raise_upload_http_exception(exc)
 
-    gate = app.state.inference_capacity_gate
+    gate = app.state.bcs_inference_gate
     try:
         await gate.acquire()
     except InferenceCapacityBusyError:
+        metrics.busy("bcs", (perf_counter() - request_started) * 1000)
         raise HTTPException(status_code=503, detail=INFERENCE_CAPACITY_BUSY_DETAIL) from None
     try:
         try:
             runtime = await run_in_threadpool(get_bcs_runtime)
             service = await run_in_threadpool(runtime.get_service)
         except Exception as exc:
+            metrics.server_runtime_failure("bcs", (perf_counter() - request_started) * 1000)
             logger.error("BCS runtime unavailable: %s", type(exc).__name__)
             raise HTTPException(status_code=503, detail="BCS capability is unavailable") from None
 
+        started = perf_counter()
         try:
             result = await run_in_threadpool(service.infer, image_bytes)
         except Exception as exc:
-            logger.error("BCS inference failed: %s", type(exc).__name__)
             if _is_bcs_input_error(exc):
+                metrics.client_rejection("bcs", (perf_counter() - request_started) * 1000)
+                logger.info("BCS image input rejected: %s", type(exc).__name__)
                 raise HTTPException(status_code=400, detail="BCS image input is invalid") from None
+            metrics.inference_failure(
+                "bcs",
+                (perf_counter() - started) * 1000,
+                (perf_counter() - request_started) * 1000,
+            )
+            logger.error("BCS inference failed: %s", type(exc).__name__)
             raise HTTPException(status_code=500, detail="BCS inference failed") from None
+        inference_time_ms = (perf_counter() - started) * 1000
+        metrics.inference_success(
+            "bcs", inference_time_ms, (perf_counter() - request_started) * 1000
+        )
     finally:
         gate.release()
 
+    model_status = _runtime_model_status(runtime)
+    package_id = getattr(runtime, "package_id", None)
+    if model_status == "experimental_not_approved":
+        message = "Experimental BCS category 1..5 computed successfully; not approved for production."
+    else:
+        message = "BCS category 1..5 computed successfully."
     return BCSResponse(
         status="ok",
-        message="BCS category 1..5 computed successfully.",
+        message=message,
         cow_detected=None,
         bcs_category=result.bcs_category,
+        model_status=model_status,
+        package_id=package_id,
+        inference_time_ms=round(inference_time_ms, 2),
     )
 
 
@@ -245,6 +295,13 @@ def _is_bcs_input_error(error: Exception) -> bool:
     return isinstance(error, BCSInferenceInputError)
 
 
+def _runtime_model_status(runtime: object) -> str | None:
+    raw_status = getattr(runtime, "model_status", None)
+    if hasattr(raw_status, "value"):
+        raw_status = raw_status.value
+    return raw_status if raw_status in {"none", "experimental_not_approved", "external_unclassified"} else None
+
+
 @app.get(
     "/ready/bcs",
     response_model=BCSReadinessResponse,
@@ -258,16 +315,33 @@ def bcs_readiness() -> BCSReadinessResponse | JSONResponse:
     messages = {
         "unconfigured": "BCS capability is not configured.",
         "not_loaded": "BCS capability is configured but not loaded.",
+        "not_installed": "BCS private serving package is not installed.",
         "ready": "BCS capability is ready.",
         "unavailable": "BCS capability is unavailable.",
     }
     message = messages.get(status, "BCS capability is unavailable.")
+    failure = getattr(runtime, "failure", None)
+    if status == "unconfigured" and getattr(failure, "category", None) == "disabled":
+        message = "BCS capability is disabled by emergency configuration."
+    elif status in {"not_installed", "unavailable"} and failure is not None:
+        message = failure.reason
+    model_status = _runtime_model_status(runtime)
+    package_id = getattr(runtime, "package_id", None)
     response = BCSReadinessResponse(
-        status=status if status in messages else "unavailable", message=message
+        status=status if status in messages else "unavailable",
+        message=message,
+        model_status=model_status,
+        package_id=package_id,
     )
     if status != "ready":
-        return JSONResponse(status_code=503, content=response.model_dump())
+        return JSONResponse(status_code=503, content=response.model_dump(exclude_none=True))
     return response
+
+
+@app.get("/metrics", response_model=MetricsResponse, include_in_schema=False)
+def metrics() -> MetricsResponse:
+    """Expose path-free prototype counters without acquiring inference capacity."""
+    return MetricsResponse.model_validate(app.state.metrics.snapshot())
 
 
 # ============================================================

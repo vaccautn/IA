@@ -155,12 +155,13 @@ class ModelPathReadinessTests(unittest.TestCase):
 class InProcessSmokeReadinessTests(unittest.TestCase):
     def test_parser_accepts_in_process_and_live_options(self) -> None:
         args = smoke_test_api.build_parser().parse_args(
-            ["--image", "fixtures/cow.jpg", "--base-url", "http://127.0.0.1:8001", "--check-detect"]
+            ["--image", "fixtures/cow.jpg", "--base-url", "http://127.0.0.1:8001", "--check-detect", "--check-bcs"]
         )
 
         self.assertEqual(args.image, Path("fixtures/cow.jpg"))
         self.assertEqual(args.base_url, "http://127.0.0.1:8001")
         self.assertTrue(args.check_detect)
+        self.assertTrue(args.check_bcs)
 
     def test_no_image_validates_model_load_without_inference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -178,6 +179,44 @@ class InProcessSmokeReadinessTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(get_detector.call_count, 1)
         get_detector.assert_any_call()
+
+    def test_check_bcs_validates_in_process_transition_and_result(self) -> None:
+        class FakeRuntime:
+            status = "not_loaded"
+            model_status = "experimental_not_approved"
+            package_id = "bcs-category-coral-2026-09-04"
+
+            def get_service(self):
+                self.status = "ready"
+                return SimpleNamespace(infer=lambda payload: SimpleNamespace(bcs_category=3))
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "vacca-yolo26n-v1.pt"
+            model.write_bytes(b"local model fixture")
+            detector = SimpleNamespace(gpu_available=False)
+            runtime = FakeRuntime()
+            with patch.object(smoke_test_api, "DEFAULT_MODEL", model), patch.object(
+                api_main, "get_detector", return_value=detector
+            ), patch.object(api_main, "get_bcs_runtime", return_value=runtime):
+                result = smoke_test_api.run(check_bcs=True)
+
+        self.assertEqual(result, 0)
+
+    def test_check_bcs_fails_actionably_when_in_process_package_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "vacca-yolo26n-v1.pt"
+            model.write_bytes(b"local model fixture")
+            runtime = SimpleNamespace(
+                status="not_installed",
+                model_status="experimental_not_approved",
+                package_id="bcs-category-coral-2026-09-04",
+            )
+            with patch.object(smoke_test_api, "DEFAULT_MODEL", model), patch.object(
+                api_main, "get_detector", return_value=SimpleNamespace(gpu_available=False)
+            ), patch.object(api_main, "get_bcs_runtime", return_value=runtime):
+                result = smoke_test_api.run(check_bcs=True)
+
+        self.assertEqual(result, 1)
 
     def test_explicit_missing_image_fails_after_model_load(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -339,6 +378,84 @@ class LiveSmokeReadinessTests(unittest.TestCase):
         "inference_time_ms": 1.25,
     }
 
+    BCS = {
+        "status": "ok",
+        "message": "Experimental BCS category 1..5 computed successfully; not approved for production.",
+        "model_status": "experimental_not_approved",
+        "package_id": "bcs-category-coral-2026-09-04",
+        "bcs_category": 3,
+    }
+
+    READY_BEFORE = {
+        "status": "not_loaded",
+        "message": "BCS capability is configured but not loaded.",
+        "model_status": "experimental_not_approved",
+        "package_id": "bcs-category-coral-2026-09-04",
+    }
+
+    READY_AFTER = {
+        "status": "ready",
+        "message": "BCS capability is ready.",
+        "model_status": "experimental_not_approved",
+        "package_id": "bcs-category-coral-2026-09-04",
+    }
+
+    def test_live_bcs_check_validates_transition_category_and_status(self) -> None:
+        with patch.object(
+            smoke_test_api,
+            "_request_json",
+            side_effect=[
+                (200, self.HEALTH),
+                (503, self.READY_BEFORE),
+                (200, self.BCS),
+                (200, self.READY_AFTER),
+            ],
+        ) as request:
+            result = smoke_test_api.run(base_url="http://127.0.0.1:8001", check_bcs=True)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(request.call_args_list[1].args[0], "http://127.0.0.1:8001/ready/bcs")
+        self.assertEqual(request.call_args_list[2].args[0], "http://127.0.0.1:8001/bcs")
+        self.assertEqual(request.call_args_list[3].args[0], "http://127.0.0.1:8001/ready/bcs")
+
+    def test_live_bcs_check_fails_on_not_installed(self) -> None:
+        before = {**self.READY_BEFORE, "status": "not_installed"}
+        with patch.object(smoke_test_api, "_request_json", side_effect=[(200, self.HEALTH), (503, before)]):
+            self.assertEqual(smoke_test_api.run(base_url="http://127.0.0.1:8001", check_bcs=True), 1)
+
+    def test_live_bcs_check_rejects_external_runtime_mode(self) -> None:
+        external = {**self.READY_BEFORE, "model_status": "external_unclassified", "package_id": None}
+        with patch.object(
+            smoke_test_api,
+            "_request_json",
+            side_effect=[(200, self.HEALTH), (503, external)],
+        ):
+            self.assertEqual(smoke_test_api.run(base_url="http://127.0.0.1:8001", check_bcs=True), 1)
+
+    def test_live_bcs_check_fails_on_non_200_bcs(self) -> None:
+        with patch.object(
+            smoke_test_api,
+            "_request_json",
+            side_effect=[(200, self.HEALTH), (503, self.READY_BEFORE), (503, {"detail": "down"})],
+        ):
+            self.assertEqual(smoke_test_api.run(base_url="http://127.0.0.1:8001", check_bcs=True), 1)
+
+    def test_live_bcs_check_fails_on_malformed_bcs_response(self) -> None:
+        with patch.object(
+            smoke_test_api,
+            "_request_json",
+            side_effect=[(200, self.HEALTH), (503, self.READY_BEFORE), (200, {"status": "ok"})],
+        ):
+            self.assertEqual(smoke_test_api.run(base_url="http://127.0.0.1:8001", check_bcs=True), 1)
+
+    def test_live_bcs_check_fails_when_readiness_does_not_reach_ready(self) -> None:
+        with patch.object(
+            smoke_test_api,
+            "_request_json",
+            side_effect=[(200, self.HEALTH), (503, self.READY_BEFORE), (200, self.BCS), (503, self.READY_BEFORE)],
+        ):
+            self.assertEqual(smoke_test_api.run(base_url="http://127.0.0.1:8001", check_bcs=True), 1)
+
     def test_live_health_and_controlled_detect_use_mocked_http(self) -> None:
         with patch.object(
             smoke_test_api,
@@ -346,7 +463,6 @@ class LiveSmokeReadinessTests(unittest.TestCase):
             side_effect=[
                 (200, self.HEALTH),
                 (400, {"detail": smoke_test_api.LIVE_DETECT_INVALID_DETAIL}),
-                (400, {"detail": smoke_test_api.LIVE_INVALID_IMAGE_DETAIL}),
             ],
         ) as request:
             result = smoke_test_api.run(
@@ -359,8 +475,22 @@ class LiveSmokeReadinessTests(unittest.TestCase):
         self.assertEqual(request.call_args_list[0].args[0], "http://127.0.0.1:8001/health")
         self.assertEqual(request.call_args_list[1].args[0], "http://127.0.0.1:8001/detect")
         self.assertEqual(request.call_args_list[1].kwargs["timeout"], 1.5)
-        self.assertEqual(request.call_args_list[2].args[0], "http://127.0.0.1:8001/bcs")
-        self.assertEqual(request.call_args_list[2].kwargs["timeout"], 1.5)
+
+    def test_live_check_detect_does_not_call_bcs(self) -> None:
+        with patch.object(
+            smoke_test_api,
+            "_request_json",
+            side_effect=[
+                (200, self.HEALTH),
+                (400, {"detail": smoke_test_api.LIVE_DETECT_INVALID_DETAIL}),
+            ],
+        ) as request:
+            self.assertEqual(
+                smoke_test_api.run(base_url="http://127.0.0.1:8001", check_detect=True),
+                0,
+            )
+        self.assertEqual(len(request.call_args_list), 2)
+        self.assertTrue(all("/bcs" not in call.args[0] for call in request.call_args_list))
 
     def test_live_image_detect_validates_success_response_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

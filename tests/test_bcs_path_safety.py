@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -39,3 +41,22 @@ def test_safe_path_rejects_resolved_paths_outside_approved_root(tmp_path: Path) 
     outside.mkdir()
     with pytest.raises(SafePathError, match="approved"):
         safe_path(outside / "output", base=root, approved_roots=(root,))
+
+
+def test_safe_path_rejects_windows_junction_ancestor_when_available(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows junctions are not available on this platform")
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    junction = root / "junction"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("junction creation is unavailable for this Windows checkout")
+    with pytest.raises(SafePathError, match="reparse|symlink"):
+        safe_path(junction / "output", base=root, approved_roots=(root,))
