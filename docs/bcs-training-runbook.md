@@ -26,7 +26,7 @@ El origen inmutable es `data/bcs/dataset`; la migración publica la instantánea
 | Grupos | `GS/YM` por prefijo+serie; `L/R` por índice compartido |
 | División | Determinística, consciente de grupos, 80 %/10 %/10 % entrenamiento/validación/prueba |
 | Integridad | Cinco categorías en cada partición; ningún grupo o hash cruza particiones |
-| Modelo | ResNet18 + CORAL; no se agregan implementaciones CE/regresión |
+| Modelo | ResNet18 + CORAL; no se agregan implementaciones CE/regresión. Detalle del algoritmo: [algoritmos de entrenamiento](algoritmos-entrenamiento.md). |
 
 El entrenador exige cobertura completa en entrenamiento, validación y prueba. Selecciona `best.pt`
 con validación, lo recarga y valida estrictamente antes de evaluar la prueba intacta

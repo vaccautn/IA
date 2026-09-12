@@ -62,6 +62,7 @@ en los estados no cargado, listo, resultado y error.
 
 - [Estado del repositorio](docs/estado-del-repositorio.md): estado operativo, controles de aceptación, riesgos y próximos pasos.
 - [Arquitectura](docs/arquitectura.md): responsabilidades, flujos y límites entre detección, constructor BCS y servicio.
+- [Algoritmos de entrenamiento](docs/algoritmos-entrenamiento.md): YOLO26n y BCS CORAL, pérdida, optimizador y evidencia de las corridas.
 - [API](docs/api.md): servicio, contratos actuales y resolución de problemas.
 - [Guía operativa de entrenamiento BCS](docs/bcs-training-runbook.md): ejecución nueva,
   reanudación, progreso, registros y entrega a la API.
