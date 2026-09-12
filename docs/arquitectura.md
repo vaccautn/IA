@@ -4,6 +4,10 @@ La migración BCS usa únicamente la fuente local original, una frontera de
 filtración basada en grupos de captura derivados del nombre de archivo y el
 modelo CORAL como primera arquitectura de referencia.
 
+Los algoritmos de las corridas servidas están en
+[algoritmos de entrenamiento](algoritmos-entrenamiento.md): YOLO26n se ajustó
+con AdamW y pérdida de detección; BCS usa ResNet18 + CORAL con AdamW.
+
 ## Flujo
 
 ```text
