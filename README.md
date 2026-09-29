@@ -1,5 +1,12 @@
 # VACCA Vision — API de detección bovina y BCS ordinal
 
+## Prototipo de video grabado
+
+La rama de video incorpora una demo independiente con el detector existente:
+MP4 local → frames muestreados → cajas, conteo por frame, JSONL y presentación HTML.
+No necesita backend ni BCS y no modifica `/detect` ni `/bcs`.
+Consultar [ejecución, demostración y límites](docs/video-prototype.md).
+
 Microservicio de detección de bovinos con YOLO26n ajustado finamente sobre Navid HSM + BCS ScienceDB.
 **mAP50: 0.974 · mAP50-95: 0.610 · Precisión: 0.976 · Exhaustividad: 0.924**
 

@@ -38,7 +38,7 @@ jobs:
 
       - name: Run JavaScript UI tests
         shell: pwsh
-        run: node --test tests/ui_controller.test.js
+        run: node --test tests/ui_controller.test.js tests/video_report.test.js
 
       - name: Run Ruff
         shell: pwsh
