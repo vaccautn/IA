@@ -1,0 +1,125 @@
+:root {
+  /* Primarios - Verde (marca) */
+  --verde-bosque: #2e5339;
+  --verde-vacca: #4a7856;
+  --verde-pastel: #dce9de;
+
+  /* Secundarios - Ocre/Marrón (campo) */
+  --ocre-campo: #c08b3e;
+  --marron-cuero: #8a5a2b;
+
+  /* Terciarios - Azul grisáceo (datos/UI neutro) */
+  --azul-acero: #3e5c76;
+  --gris-niebla: #b8c4cc;
+
+  /* Funcionales - Alertas del sistema */
+  --rojo-alerta: #c94c4c;
+  --ambar-aviso: #e0a83e;
+  --verde-confirmacion: #4a9163;
+
+  /* Semántico - Identificación de sexo (no es alerta) */
+  --rosa-hembra: #c97a94;
+
+  --text: #59645c;
+  --text-h: #1d3527;
+  --bg: #f7f8f4;
+  --panel: #ffffff;
+  --border: #dfe4dc;
+  --input-bg: #ffffff;
+  --input-border: #c8d0c5;
+  --accent: var(--verde-vacca);
+  --accent-strong: var(--verde-bosque);
+  --focus: rgba(74, 120, 86, 0.22);
+  --danger: var(--rojo-alerta);
+  --danger-bg: #fbeceb;
+  --danger-border: #eec3c1;
+  --warning: var(--ambar-aviso);
+  --warning-bg: #fdf3e2;
+  --warning-border: #f2dcae;
+  --success: var(--verde-confirmacion);
+  --success-bg: var(--verde-pastel);
+  --success-border: #bcd8c3;
+  --orange: var(--ocre-campo);
+  --orange-bg: #fbeadd;
+  --orange-border: #edc99a;
+  --info-bg: #e4ebf1;
+  --shadow: rgba(21, 32, 25, 0.12) 0 18px 45px;
+
+  --sans: "Manrope", serif;
+  --heading: "Manrope", serif;
+
+  font: 16px/145% var(--sans);
+  letter-spacing: 0;
+  color-scheme: light;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@font-face {
+  font-family: "Manrope";
+  src: url("/fonts/Manrope-VariableFont_wght.woff2") format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+#root {
+  min-height: 100svh;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+h1 {
+  font-family: var(--heading);
+  font-size: clamp(24px, calc(17.455px + 2.045vw), 42px);
+  line-height: 1.05;
+  font-weight: 700;
+  letter-spacing: 0;
+  color: var(--text-h);
+  margin: 0 0 12px;
+}
+
+p {
+  font-size: 1rem;
+  margin: 0;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+/* Campos de fecha nativos: mismo color de texto que el resto de los inputs,
+ * placeholder atenuado cuando están vacíos e ícono de calendario con el
+ * hover de marca. */
+input[type="date"] {
+  color-scheme: light;
+  color: var(--text-h);
+  font-family: inherit;
+}
+
+input[type="date"][value=""] {
+  color: var(--text);
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+  padding: 2px;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.55;
+  transition:
+    opacity 0.15s,
+    background 0.15s;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator:hover {
+  background: var(--verde-pastel);
+  opacity: 1;
+}

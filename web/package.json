@@ -1,0 +1,17 @@
+{
+  "name": "vacca-video-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.0",
+    "playwright-core": "1.51.1"
+  }
+}

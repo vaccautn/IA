@@ -2,6 +2,11 @@
 
 ## Prototipo de video grabado
 
+**Aplicación web independiente:** abrir `Iniciar VACCA Video.cmd` y usar
+http://127.0.0.1:8010 para cargar videos, consultar el historial y explorar
+detecciones. Conserva la identidad visual del frontend VACCA y funciona sin
+modificar backend/frontend. Ver [arranque, arquitectura y contrato](docs/video-web.md).
+
 La rama de video incorpora una demo independiente con el detector existente:
 MP4 local → frames muestreados → cajas, conteo por frame, JSONL y presentación HTML.
 No necesita backend ni BCS y no modifica `/detect` ni `/bcs`.
