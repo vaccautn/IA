@@ -27,6 +27,30 @@ servidor nuevo para esta demostración local.
 
 ## Preparar el entorno
 
+### Abrir con botones en Windows
+
+En el entorno local ya preparado, hacer doble clic en **`Abrir VACCA.vbs`**
+en la raíz de `IA-video`. Se abre una ventana sin consola: elegir un video,
+presionar **Procesar video**, esperar y presionar **Abrir resultados**.
+El procesamiento se ejecuta en segundo plano y muestra su salida en la ventana.
+Cada ejecución crea su propia carpeta; no sobrescribe resultados anteriores.
+Por defecto analiza como máximo 300 frames a 5 FPS (aproximadamente 60 segundos).
+La casilla **Procesar todo el video** elimina ese límite. El visor conserva hasta
+120 imágenes; el MP4 contiene todos los frames analizados. Mientras procesa,
+la ventana debe permanecer abierta. No se requiere levantar ningún servidor.
+
+Para probar con material real, descargar un MP4 de alguna de estas fuentes:
+
+- [Vacas en una pastura, 16 segundos (Pexels)](https://www.pexels.com/video/herd-of-cows-in-a-pastureland-3769204/).
+- [Vacas caminando (Pexels)](https://www.pexels.com/video/a-herd-of-cows-walking-in-a-field-17923421/).
+- [Catálogo de videos de vacas (Pixabay)](https://pixabay.com/videos/search/cows/).
+
+Comenzar con clips cortos en 720p o 1080p, con animales completos y visibles.
+Después probar superposiciones, distancias y movimientos de cámara. Estos clips
+sirven para explorar fallos; no reemplazan una evaluación etiquetada del campo.
+El ejemplo `outputs/fixtures/synthetic-cow.mp4` está armado con fotos y no sirve
+para medir precisión sobre animales en movimiento.
+
 Desde la carpeta del worktree, utilizar **Python 3.13 en Windows x64**, que es la
 plataforma de los locks actuales del proyecto:
 

@@ -81,9 +81,9 @@ function App() {
     }
   }
   return <div className="shell">
-    <aside><div className="brand"><img src="/vacca_logo.png" alt="VACCA" /><span>Manejo de rodeos</span></div><div className="nav-active"><Icon /> Videos</div><div className="aside-note">Prototipo de video<br /><small>Espacio de trabajo local</small></div></aside>
-    <div className="workspace"><header><span>VACCA / <strong>Videos</strong></span><span className="badge">Prototipo independiente</span></header>
-    <main><div className="page-heading"><div><span className="eyebrow">ANÁLISIS VISUAL</span><h1>Detección en video</h1><p>Explorá las detecciones de tu rodeo, un frame a la vez.</p></div><span className="page-icon"><Icon size={32} /></span></div>
+    <aside><div className="brand"><img src="/vacca_logo.png" alt="VACCA" /><span>Manejo de rodeos</span></div><div className="nav-active"><Icon /> Videos</div></aside>
+    <div className="workspace"><header><span>VACCA / <strong>Videos</strong></span></header>
+    <main><div className="page-heading"><div><span className="eyebrow">ANÁLISIS VISUAL</span><h1>Detección en video</h1><p>Cargá un video de tu rodeo y consultá las detecciones.</p></div><span className="page-icon"><Icon size={32} /></span></div>
     {error && <div className="alert" role="alert">{error}<button onClick={() => setError("")} aria-label="Cerrar aviso">×</button></div>}
     <div className="columns"><section className="card upload"><h2>Nuevo análisis</h2><p>Cargá una grabación de tus animales.</p>
       <label className="drop" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
