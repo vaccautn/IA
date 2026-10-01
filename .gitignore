@@ -103,3 +103,16 @@ reports/generated-*
 # Deployment model (versioned exception for server deploys)
 !models/deploy/
 !models/deploy/vacca-yolo26n-v1.pt
+
+# Local video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4v
+*.mpeg
+*.mpg
+*.wmv
+*.mts
+*.m2ts
