@@ -70,6 +70,7 @@ OpenAPI y explorador interactivo: http://127.0.0.1:8010/docs.
 | GET /api/v1/analyses/{id}/frames?offset=0&limit=30 | items y total; máximo 100 por página |
 | GET /api/v1/analyses/{id}/frames/{index}/image | JPEG anotado del frame seleccionado |
 | GET /api/v1/analyses/{id}/results | Descarga JSONL una vez terminado, incluso si hay resultados parciales de un error |
+| GET /api/v1/analyses/{id}/frames.zip | Descarga todos los JPG anotados disponibles en un ZIP al finalizar; incluye resultados parciales de un análisis fallido |
 
 Trabajo: `schema_version=vacca-video-job-v1`, `id`, `name`, `status`, `created_at`,
 `error`, `frames_analyzed`, `summary`. Estados: pending, processing, completed,

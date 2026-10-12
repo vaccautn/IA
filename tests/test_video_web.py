@@ -2,6 +2,8 @@
 
 import json
 import asyncio
+import io
+import zipfile
 from urllib.parse import urlencode, urlsplit
 
 import pytest
@@ -193,3 +195,71 @@ def test_worker_error_is_persisted(client, monkeypatch):
     monkeypatch.setattr(webapp.subprocess, "Popen", fail)
     worker.loop()
     assert client.app.state.store.get(job_id)["status"] == "failed"
+
+
+def test_highlight_prefers_count_then_confidence_and_keeps_first_tie():
+    frames = [
+        {"frame_index": 0, "timestamp_ms": 0, "detection_count": 1,
+         "detections": [{"confidence": 0.99}]},
+        {"frame_index": 5, "timestamp_ms": 200, "detection_count": 2,
+         "detections": [{"confidence": 0.6}, {"confidence": 0.8}]},
+        {"frame_index": 10, "timestamp_ms": 400, "detection_count": 2,
+         "detections": [{"confidence": 0.8}, {"confidence": 0.9}]},
+        {"frame_index": 15, "timestamp_ms": 600, "detection_count": 2,
+         "detections": [{"confidence": 0.8}, {"confidence": 0.9}]},
+    ]
+    best = webapp.highlighted_frame(frames, "job")
+    assert best["frame_index"] == 10
+    assert best["sample_index"] == 2
+    assert best["mean_confidence"] == pytest.approx(0.85)
+    assert best["image_url"].endswith("/frames/2/image")
+    assert webapp.highlighted_frame([], "job") is None
+    empty = webapp.highlighted_frame([
+        {"frame_index": 0, "timestamp_ms": 0, "detection_count": 0,
+         "detections": []}], "job")
+    assert empty["mean_confidence"] is None
+
+
+def test_completed_job_includes_highlight_and_downloadable_image(client):
+    job_id = submit(client).json()["id"]
+    store = client.app.state.store
+    path = store.directory / job_id / "result"
+    (path / "frames").mkdir(parents=True)
+    frame = {"frame_index": 12, "timestamp_ms": 400, "detection_count": 1,
+             "detections": [{"confidence": 0.9}]}
+    (path / "detections.jsonl").write_text(json.dumps(frame), encoding="utf-8")
+    (path / "frames/000000.jpg").write_bytes(b"jpeg fixture")
+    assert client.get(f"/api/v1/analyses/{job_id}").json()["highlighted_frame"] is None
+    store.update(job_id, "completed")
+    best = client.get(f"/api/v1/analyses/{job_id}").json()["highlighted_frame"]
+    assert best["frame_index"] == 12
+    assert best["mean_confidence"] == 0.9
+    assert client.get(best["image_url"] + "?download=true").content == b"jpeg fixture"
+
+
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_download_frames_zip_contains_only_job_images(client, status):
+    job_id = submit(client).json()["id"]
+    store = client.app.state.store
+    frames = store.directory / job_id / "result/frames"
+    frames.mkdir(parents=True)
+    (frames / "000000.jpg").write_bytes(b"first jpeg")
+    (frames / "000002.jpg").write_bytes(b"third jpeg")
+    (frames / "private.txt").write_text("not a frame")
+    (frames / "000300.jpg").write_bytes(b"outside limit")
+    url = f"/api/v1/analyses/{job_id}/frames.zip"
+    assert client.get(url).status_code == 409
+    store.update(job_id, status)
+    response = client.get(url)
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert archive.namelist() == ["000000.jpg", "000002.jpg"]
+        assert archive.read("000000.jpg") == b"first jpeg"
+        assert archive.read("000002.jpg") == b"third jpeg"
+    assert client.get("/api/v1/analyses/missing/frames.zip").status_code == 404
+
+
+def test_download_frames_zip_rejects_empty_results(client):
+    job_id = submit(client).json()["id"]
+    client.app.state.store.update(job_id, "completed")
+    assert client.get(f"/api/v1/analyses/{job_id}/frames.zip").status_code == 409

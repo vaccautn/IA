@@ -486,3 +486,9 @@ footer {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.final-summary { margin: 24px 0; padding: 20px; background: var(--verde-pastel); border-radius: 6px; }
+.download-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.final-summary p { font-size: 14px; }
+.highlight-image { display: block; max-width: 100%; max-height: 360px; margin: 16px auto; border-radius: 5px; }
+.confidence-list { display: flex; flex-wrap: wrap; gap: 8px 24px; padding-left: 20px; font-size: 13px; }

@@ -14,6 +14,7 @@ function App() {
   const input = useRef(null);
   const job = jobs.find((item) => item.id === selected);
   const count = job?.frames_analyzed ?? 0;
+  const highlight = job?.highlighted_frame;
   useEffect(() => {
     let active = true, timer;
     async function refresh() {
@@ -98,11 +99,21 @@ function App() {
       <div className="job-list">{!jobs.length && <div className="empty"><Icon size={32} /><strong>Todavía no hay análisis</strong><span>Cargá tu primer video para comenzar.</span></div>}
       {jobs.map((item) => <button key={item.id} className={`job ${selected === item.id ? "selected" : ""}`} onClick={() => choose(item)}><span className="job-icon"><Icon /></span><span className="job-info"><strong>{item.name}</strong><small>{new Date(item.created_at).toLocaleString("es-AR")} · {item.frames_analyzed} frames</small></span><span className={`status ${item.status}`}>{labels[item.status]}</span></button>)}</div>
     </section></div>
-    <section className="card results"><div className="section-title"><div><h2>Resultados del análisis</h2><p>{job?.name ?? "Las detecciones aparecer\xE1n ac\xE1."}</p></div>{job && count > 0 && !["pending", "processing"].includes(job.status) && <a className="secondary" href={`/api/v1/analyses/${job.id}/results`}>Descargar detecciones</a>}</div>
+    <section className="card results"><div className="section-title"><div><h2>Resultados del análisis</h2><p>{job?.name ?? "Las detecciones aparecer\xE1n ac\xE1."}</p></div>{job && count > 0 && !["pending", "processing"].includes(job.status) && <div className="download-actions"><a className="secondary" href={`/api/v1/analyses/${job.id}/frames.zip`}>Descargar todos los frames (ZIP)</a><a className="secondary" href={`/api/v1/analyses/${job.id}/results`}>Datos técnicos (JSONL)</a></div>}</div>
     {job?.status === "pending" && <div className="notice" role="status">En espera. Los videos se procesan de a uno.</div>}
     {job?.status === "processing" && <div className="notice" role="status"><span className="spinner" /> Procesando · {count} frames analizados. La carga inicial del modelo puede tardar.</div>}
     {job?.error && <div className="alert" role="alert">{job.error}</div>}
     {job?.summary?.stop_reason === "frame_limit" && <div className="notice">Resultado parcial: se alcanzó el límite de 300 frames.</div>}
+    {highlight && <section className="final-summary" aria-label="Devolución final">
+      <h2>{job.status === "failed" || job.summary?.stop_reason === "frame_limit" ? "Devolución de los frames analizados" : "Devolución final"}</h2>
+      <p>El frame destacado tiene <strong>{highlight.detection_count} vacas detectadas</strong>, con una confianza promedio de <strong>{highlight.mean_confidence == null ? "sin detecciones para calcularla" : `${(highlight.mean_confidence * 100).toFixed(1)} %`}</strong>.</p>
+      <p>Frame de origen #{highlight.frame_index} (numeración desde 0) ? {(highlight.timestamp_ms / 1000).toFixed(2)} s ? muestra {highlight.sample_index + 1} de {count}.</p>
+      <img className="highlight-image" src={highlight.image_url} alt={`Frame destacado con ${highlight.detection_count} vacas detectadas`} />
+      {highlight.detections?.length > 0 && <ul className="confidence-list">{highlight.detections.map((detection, i) => <li key={i}>Detección {i + 1}: {(detection.confidence * 100).toFixed(1)} %</li>)}</ul>}
+      <a className="secondary" href={`${highlight.image_url}?download=true`}>Descargar frame destacado (JPG)</a>
+      <button className="secondary" onClick={() => { setPlaying(false); setIndex(highlight.sample_index); }}>Ver frame destacado en el visor</button>
+      <p className="hint">Se elige el frame con más detecciones; en caso de empate, el de mayor confianza promedio. La confianza es el puntaje del modelo, no una garantía de exactitud. La cantidad corresponde a este frame, no al total de animales únicos del video.</p>
+    </section>}
     {count > 0 ? <><div className="metrics"><div><span>Frames analizados</span><strong>{count}</strong></div><div><span>Detecciones en este frame</span><strong>{frame?.detection_count ?? "\u2014"}</strong></div><div><span>Tiempo en el video</span><strong>{frame ? `${(frame.timestamp_ms / 1e3).toFixed(2)} s` : "\u2014"}</strong></div></div><div className="viewer">{frame ? <img key={frame.image_url} src={frame.image_url} alt={`Frame a ${(frame.timestamp_ms / 1e3).toFixed(2)} segundos con ${frame.detection_count} detecciones`} /> : <span>Cargando frame…</span>}</div><div className="controls"><button className="secondary" onClick={() => setPlaying(!playing)}>{playing ? "Pausar" : "Reproducir frames"}</button><input aria-label="Frame del análisis" type="range" min="0" max={Math.max(0, count - 1)} value={index} onChange={(event) => {
     setPlaying(false);
     setIndex(Number(event.target.value));

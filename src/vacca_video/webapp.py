@@ -11,10 +11,13 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import tempfile
+import zipfile
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -165,6 +168,25 @@ def records(directory):
     return result
 
 
+def highlighted_frame(frames, job_id):
+    """Prefer more detections, then mean confidence; retain the first exact tie."""
+    best = None
+    best_rank = (-1, -1)
+    for index, frame in enumerate(frames):
+        scores = [item["confidence"] for item in frame.get("detections", [])]
+        mean = sum(scores) / len(scores) if scores else None
+        rank = (frame["detection_count"], mean if mean is not None else -1)
+        if rank > best_rank:
+            best_rank = rank
+            best = dict(
+                frame,
+                sample_index=index,
+                mean_confidence=mean,
+                image_url=f"/api/v1/analyses/{job_id}/frames/{index}/image",
+            )
+    return best
+
+
 def create_app(directory=None, start_worker=True):
     store = Store(directory or os.environ.get("VACCA_VIDEO_DATA", ROOT / "outputs/web"))
     worker = Worker(store)
@@ -211,6 +233,10 @@ def create_app(directory=None, start_worker=True):
             job,
             frames_analyzed=len(frames),
             summary=summary,
+            highlighted_frame=(
+                highlighted_frame(frames, job["id"])
+                if job["status"] in ("completed", "failed") else None
+            ),
             schema_version="vacca-video-job-v1",
         )
 
@@ -279,14 +305,50 @@ def create_app(directory=None, start_worker=True):
         }
 
     @app.get("/api/v1/analyses/{job_id}/frames/{index}/image")
-    def image(job_id: str, index: int):
+    def image(job_id: str, index: int, download: bool = False):
         store.get(job_id)
         if index < 0 or index >= MAX_FRAMES:
             raise HTTPException(404)
         path = store.directory / job_id / "result/frames" / f"{index:06d}.jpg"
         if not path.is_file():
             raise HTTPException(404, "Frame todavía no disponible")
-        return FileResponse(path, media_type="image/jpeg")
+        return FileResponse(
+            path, media_type="image/jpeg",
+            filename=f"frame-{job_id}-{index + 1}.jpg" if download else None,
+        )
+
+    @app.get("/api/v1/analyses/{job_id}/frames.zip")
+    def download_frames(job_id: str):
+        job = store.get(job_id)
+        if job["status"] not in ("completed", "failed"):
+            raise HTTPException(409, "Esperá a que termine el análisis")
+        directory = store.directory / job_id / "result/frames"
+        paths = [directory / f"{index:06d}.jpg" for index in range(MAX_FRAMES)]
+        paths = [path for path in paths if path.is_file() and not path.is_symlink()]
+        if not paths:
+            raise HTTPException(409, "No hay frames disponibles para descargar")
+        archive = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
+        try:
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as bundle:
+                for path in paths:
+                    bundle.write(path, arcname=path.name)
+            archive.seek(0)
+        except BaseException:
+            archive.close()
+            raise
+
+        def chunks():
+            try:
+                while chunk := archive.read(64 * 1024):
+                    yield chunk
+            finally:
+                archive.close()
+
+        return StreamingResponse(
+            chunks(), media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="frames-{job_id}.zip"'},
+            background=BackgroundTask(archive.close),
+        )
 
     @app.get("/api/v1/analyses/{job_id}/results")
     def download(job_id: str):
