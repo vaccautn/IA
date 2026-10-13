@@ -317,6 +317,187 @@ def test_completed_video_artifacts_preserve_paths_and_nullable_fields(client):
     assert client.get(f"/api/v1/analyses/{job_id}").json()["summary"]["custom"] is None
 
 
+def test_candidate_image_is_fixed_job_scoped_and_local_only(client, monkeypatch):
+    from vacca_video.artifacts import job_artifact
+    job_id = submit(client).json()["id"]
+    store = main.app.state.video.store
+    directory = store.directory / job_id / "result"
+    directory.mkdir()
+    (directory / "candidate.png").write_bytes(b"original candidate fixture")
+    endpoint = f"/api/v1/analyses/{job_id}/candidate/image"
+    assert client.get(endpoint).content == b"original candidate fixture"
+    assert client.get(endpoint + "?artifact=../../secret.png").content == b"original candidate fixture"
+    assert client.get("/api/v1/analyses/missing/candidate/image").status_code == 404
+    remote = TestClient(main.app, client_host="192.0.2.10", runner=client.runner)
+    assert remote.get(endpoint).status_code == 403
+    assert client.get(endpoint, headers={"origin": "http://evil.example"}).status_code == 403
+    candidate = job_artifact(store.directory, job_id, "candidate.png")
+    path_type = type(candidate)
+    original = path_type.is_symlink
+    monkeypatch.setattr(path_type, "is_symlink", lambda path: path == candidate or original(path))
+    assert client.get(endpoint).status_code == 404
+
+
+def test_failed_video_or_unsaved_bcs_never_claims_completed_bcs(client):
+    from vacca_video.artifacts import BCS_WRITE_ERROR
+    job_id = submit(client).json()["id"]
+    store = main.app.state.video.store
+    directory = store.directory / job_id / "result"
+    directory.mkdir()
+    (directory / "summary.json").write_text(json.dumps({
+        "bcs": {"status": "completed", "bcs_category": 4}, "custom": None
+    }), encoding="utf-8")
+    store.update(job_id, "failed", "Interrupción de prueba")
+    outcome = client.get(f"/api/v1/analyses/{job_id}").json()["summary"]["bcs"]
+    assert outcome == dict(status="not_evaluated", reason="video_not_completed")
+    store.update(job_id, "completed", BCS_WRITE_ERROR)
+    outcome = client.get(f"/api/v1/analyses/{job_id}").json()["summary"]["bcs"]
+    assert outcome == dict(status="failed", reason="metadata_write_failed")
+
+
+@pytest.mark.parametrize("invalid", ["artifact", "missing_fields", "confidence"])
+@pytest.mark.parametrize("publication_fails", [False, True])
+def test_invalid_candidate_cannot_break_detail_history_or_download(client, monkeypatch, invalid, publication_fails):
+    from test_video_bcs import candidate_job
+    from vacca_video.artifacts import BCS_WRITE_ERROR
+    from vacca_video.bcs import VideoBCSCoordinator
+    store = main.app.state.video.store
+    _, directory, _ = candidate_job(store.directory)
+    summary = json.loads((directory / "summary.json").read_text())
+    if invalid == "artifact":
+        summary["candidate"]["artifact"] = "../../secret.png"
+    elif invalid == "missing_fields":
+        summary["candidate"] = {"artifact": "candidate.png"}
+    else:
+        summary["candidate"]["detector_confidence"] = 2.0
+    (directory / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    store.update("fake", "completed")
+    valid_id = submit(client).json()["id"]
+
+    # Status reads must be safe even before the worker can publish a fallback.
+    response = client.get("/api/v1/analyses/fake")
+    assert response.status_code == 200
+    assert response.json()["summary"]["candidate"] is None
+    assert response.json()["summary"]["bcs"] == dict(status="invalid_input", reason="invalid_candidate")
+    assert response.json()["summary"]["custom"] is None
+    assert client.get("/api/v1/analyses").status_code == 200
+
+    if publication_fails:
+        def fail(*args):
+            raise OSError("fixture publication failure")
+        monkeypatch.setattr("vacca_video.bcs.publish_summary", fail)
+    async def never(*args, **kwargs):
+        pytest.fail("Rejected candidate must never reach BCS")
+    async def finish():
+        coordinator = VideoBCSCoordinator(asyncio.get_running_loop(), never)
+        try:
+            return await asyncio.to_thread(coordinator.finish, store.directory, "fake", threading.Event())
+        finally:
+            await coordinator.close()
+    error = client.runner.run(finish())
+    assert error == (BCS_WRITE_ERROR if publication_fails else None)
+    store.update("fake", "completed", error)
+    response = client.get("/api/v1/analyses/fake")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "completed"
+    assert data["summary"]["candidate"] is None
+    assert data["summary"]["candidate_rejection_reason"] == "invalid_candidate"
+    assert data["summary"]["bcs"] == dict(
+        status="failed" if publication_fails else "invalid_input",
+        reason="metadata_write_failed" if publication_fails else "invalid_candidate",
+    )
+    history = client.get("/api/v1/analyses")
+    assert history.status_code == 200
+    assert {item["id"] for item in history.json()} == {"fake", valid_id}
+    assert next(item for item in history.json() if item["id"] == "fake") == data
+    assert client.get("/api/v1/analyses/fake/results").content == (directory / "detections.jsonl").read_bytes()
+    persisted = json.loads((directory / "summary.json").read_text())
+    assert persisted["candidate"] == (summary["candidate"] if publication_fails else None)
+
+
+@pytest.mark.parametrize("failure", ["false", "encode", "write"])
+def test_candidate_persistence_failure_keeps_cli_worker_and_api_completed(client, monkeypatch, failure):
+    import cv2
+    from scripts.process_video import main as process_video
+    from test_video_io import FakeCapture
+    from test_video_candidate import detection
+    from vacca_video.bcs import VideoBCSCoordinator
+    from vacca_video.worker import Worker
+    job_id = submit(client).json()["id"]
+    store = main.app.state.video.store
+    original_write = cv2.imwrite
+    def write(path, image):
+        if Path(path).name != "candidate.png":
+            return original_write(path, image)
+        Path(path).write_bytes(b"partial candidate")
+        if failure == "encode":
+            raise cv2.error("fixture PNG encoding failure")
+        if failure == "write":
+            raise OSError("fixture candidate write failure")
+        return False
+    monkeypatch.setattr(cv2, "imwrite", write)
+    monkeypatch.setattr(cv2, "VideoCapture", lambda path: FakeCapture([0, 200]))
+    fake = SimpleNamespace(metadata=dict(name="fake", confidence=0.25, sha256="fake-hash"),
+                           detect=lambda image: detection() | dict(image_width=64, image_height=48))
+    monkeypatch.setattr("vacca_video.detector.ImageDetectorAdapter", lambda *args: fake)
+    exit_codes = []
+    worker = Worker(store)
+    class Process:
+        def __enter__(self):
+            self.returncode = process_video([
+                str(store.directory / job_id / "input.mp4"), "--output",
+                str(store.directory / job_id / "result"), "--no-video",
+            ])
+            exit_codes.append(self.returncode)
+            return self
+        def __exit__(self, *args): pass
+        def poll(self): return self.returncode
+    monkeypatch.setattr("vacca_video.worker.subprocess.Popen", lambda *args, **kwargs: Process())
+    update = store.update
+    def finished(identifier, status, error=None):
+        update(identifier, status, error)
+        worker.stop.set()
+    monkeypatch.setattr(store, "update", finished)
+    async def never(*args, **kwargs):
+        pytest.fail("An unsaved candidate must never reach BCS")
+    async def run():
+        coordinator = VideoBCSCoordinator(asyncio.get_running_loop(), never)
+        worker.finish_video = coordinator.finish
+        try:
+            await asyncio.wait_for(asyncio.to_thread(worker.loop), 3)
+        finally:
+            await coordinator.close()
+    client.runner.run(run())
+    assert exit_codes == [0]
+    response = client.get(f"/api/v1/analyses/{job_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == data["summary"]["status"] == "completed"
+    assert data["error"] is None
+    assert data["summary"]["candidate"] is None
+    assert data["summary"]["bcs"] == dict(status="not_evaluated", reason="candidate_write_failed")
+    assert data["frames_analyzed"] == 2
+    assert not (store.directory / job_id / "result/candidate.png").exists()
+    assert client.get("/api/v1/analyses").status_code == 200
+    assert client.get(f"/api/v1/analyses/{job_id}/results").status_code == 200
+
+
+def test_candidate_status_boundary_preserves_valid_extensions(client):
+    from test_video_bcs import candidate_job
+    store = main.app.state.video.store
+    _, directory, _ = candidate_job(store.directory)
+    summary = json.loads((directory / "summary.json").read_text())
+    summary["candidate"]["custom_candidate"] = None
+    summary["candidate"]["detector_model"]["custom_model"] = "extension"
+    (directory / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    store.update("fake", "completed")
+    detail = client.get("/api/v1/analyses/fake")
+    assert detail.status_code == 200
+    assert detail.json()["summary"] == summary
+    assert client.get("/api/v1/analyses").json()[0] == detail.json()
+
+
 def test_compatibility_launcher_delegates_to_principal(monkeypatch):
     launch = Mock()
     monkeypatch.setattr(run_api, "main", launch)

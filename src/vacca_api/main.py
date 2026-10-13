@@ -113,12 +113,17 @@ def _startup(target_app: FastAPI | None = None) -> None:
 async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
     _startup(target_app)
     video = VideoResources()
+    from vacca_video.bcs import VideoBCSCoordinator
+
+    coordinator = VideoBCSCoordinator(asyncio.get_running_loop(), evaluate_bcs)
+    video.finish_video = coordinator.finish
     target_app.state.video = video
     try:
         video.start()
         yield
     finally:
-        video.close()
+        await coordinator.close()
+        await asyncio.to_thread(video.close)
 
 
 # --- App ---

@@ -22,6 +22,7 @@ class Worker:
         self.ready = threading.Event()
         self.ready.set()
         self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.finish_video = None
 
     def loop(self):
         # Principal startup may defer claims until recovery commits successfully.
@@ -75,6 +76,11 @@ class Worker:
                             raise RuntimeError(
                                 "No se pudo analizar el archivo. Verificá que sea un video MP4 válido y que haya espacio disponible."
                             )
-                self.store.update(job_id, "completed")
+                optional_error = None
+                if self.finish_video is not None:
+                    optional_error = self.finish_video(self.store.directory, job_id, self.stop)
+                    if self.stop.is_set():
+                        raise RuntimeError("El servicio se interrumpió antes de publicar el resultado.")
+                self.store.update(job_id, "completed", optional_error)
             except Exception as exc:
                 self.store.update(job_id, "failed", str(exc))

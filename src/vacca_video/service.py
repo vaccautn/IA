@@ -29,6 +29,7 @@ class VideoResources:
         self.started = False
         self.available = False
         self.upload_lock = asyncio.Lock()
+        self.finish_video = None
 
     def prepare(self):
         self.store = Store(self.directory)
@@ -39,6 +40,7 @@ class VideoResources:
             check_runtime()
             if self.store is None:
                 self.prepare()
+            self.worker.finish_video = self.finish_video
             if start_worker:
                 # Startup and recovery must both succeed before any job is claimed.
                 self.worker.ready.clear()

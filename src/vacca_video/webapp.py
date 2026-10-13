@@ -21,8 +21,10 @@ from .policies import (
 )
 from .store import JobNotFound, Store
 from .worker import Worker as Worker
-from .schemas import VideoErrorResponse, FramePageResponse, JobResponse
+from .schemas import VideoErrorResponse, FramePageResponse, JobResponse, sanitize_optional_candidate
 from .service import UNAVAILABLE_DETAIL, VideoResources
+from .artifacts import BCS_WRITE_ERROR, job_artifact
+from .candidate import CANDIDATE_ARTIFACT
 
 
 def records(directory):
@@ -55,7 +57,11 @@ def create_router():
         summary_path = directory / "result/summary.json"
         summary = None
         if job["status"] in ("completed", "failed") and summary_path.exists():
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary = sanitize_optional_candidate(json.loads(summary_path.read_text(encoding="utf-8")))
+            if "bcs" in summary and job["status"] != "completed":
+                summary["bcs"] = dict(status="not_evaluated", reason="video_not_completed")
+            elif job.get("error") == BCS_WRITE_ERROR:
+                summary["bcs"] = dict(status="failed", reason="metadata_write_failed")
         return dict(
             job,
             frames_analyzed=len(frames),
@@ -151,6 +157,17 @@ def create_router():
         if not path.is_file():
             raise HTTPException(404, "Frame todavía no disponible")
         return FileResponse(path, media_type="image/jpeg")
+
+    @router.get("/api/v1/analyses/{job_id}/candidate/image")
+    def candidate_image(job_id: str, store: Store = Depends(video_store)):
+        store.get(job_id)
+        try:
+            path = job_artifact(store.directory, job_id, CANDIDATE_ARTIFACT)
+            if not path.is_file():
+                raise ValueError("Missing candidate")
+        except ValueError:
+            raise HTTPException(404, "Imagen candidata no disponible") from None
+        return FileResponse(path, media_type="image/png")
 
     @router.get("/api/v1/analyses/{job_id}/results")
     def download(job_id: str, store: Store = Depends(video_store)):

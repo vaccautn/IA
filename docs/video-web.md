@@ -1,5 +1,71 @@
 # VACCA Video en la API principal de IA
 
+## Candidato y categoría BCS experimental
+
+La selección compara solo los frames analizados (hasta 300 a 5 FPS), no todos
+los frames del video. Descarta cero o varias detecciones; un empate de confianza
+conserva el primer frame decodificado elegible. No agrega inferencias, tracking ni
+identificadores de animales. Una sola detección **no garantiza** una sola vaca
+real: el detector puede omitir otros animales o producir cajas duplicadas.
+
+`candidate.png` conserva las dimensiones y píxeles del frame decodificado en PNG
+sin pérdida, sin cajas, texto, recortes ni reducción. Es independiente del límite
+de vistas previas (120 en CLI/escritorio). Si excede los límites BCS existentes
+(10 MiB, 12 000 píxeles por dimensión, 50 millones de píxeles), se informa entrada
+inválida; no se transforma para forzar su aceptación.
+
+Tras finalizar el CLI por `frame_limit` o `end_of_source`, el worker solicita una
+evaluación al loop de la API principal. Reutiliza su runtime BCS y el **mismo
+gate de capacidad 1 que `/bcs`**, sin un tercer modelo ni solicitudes HTTP al
+propio servicio. La adquisición tiene el límite existente de 0,1 segundos;
+la espera del worker para BCS tiene un máximo de 60 segundos adicional al CLI.
+Si vence, se publica `not_evaluated/evaluation_timeout`, no una categoría tardía.
+Cancelar la espera o cerrar el servicio no cancela una operación nativa ya
+iniciada ni libera su permiso antes de que termine. El cierre no espera
+indefinidamente esa operación: puede finalizar después del ciclo de vida, con
+su permiso retenido. El worker se une fuera del loop con el límite existente de
+10 segundos. No se promete detener código ML nativo bloqueado.
+
+BCS es opcional: `busy`, `unavailable`, `invalid_input` y `failed` no convierten
+un video procesado correctamente en un fallo de detección. Estos son los resultados
+relevantes de `summary.bcs` (no códigos HTTP del trabajo de video):
+
+| Estado / motivo | Significado |
+| --- | --- |
+| `completed` / `null` | Categoría experimental `1..5` guardada, con procedencia del servicio. |
+| `not_evaluated` / `no_eligible_frame` | Ninguna muestra elegible; no se solicita BCS. |
+| `not_evaluated` / `candidate_write_failed` | Falló la escritura del PNG opcional; se descarta el candidato y se conservan los resultados del video. |
+| `not_evaluated` / `web_api_only` | CLI/escritorio: candidato conservado, sin evaluación BCS. |
+| `not_evaluated` / `video_not_completed` | Video fallido o interrumpido; no se presenta BCS como completado. |
+| `not_evaluated` / `evaluation_timeout` | Terminó la espera; no se publica una categoría tardía. |
+| `busy` / `capacity_busy` | El permiso compartido con `/bcs` está ocupado; sin reintento automático. |
+| `unavailable` / `capability_unavailable` | Runtime/paquete BCS no disponible; sin categoría simulada. |
+| `invalid_input` / `invalid_candidate` | Metadatos, archivo, dimensiones o límites del candidato rechazados antes de evaluar; se sanea el candidato a `null`. |
+| `invalid_input` / `image_rejected` | El servicio BCS rechazó la imagen. |
+| `failed` / `inference_failed` | Falló la inferencia opcional. |
+| `failed` / `metadata_write_failed` | No se confirmó la publicación del resultado; la API no afirma una categoría guardada. |
+
+Sin candidato se informa `not_evaluated/no_eligible_frame`. Trabajos antiguos sin estos campos
+siguen siendo legibles y no se evalúan retroactivamente. Videos fallidos o
+interrumpidos no exponen BCS como completado.
+
+El resumen incluye procedencia del detector, caja en coordenadas originales,
+timestamp/fuente e índice decodificado; `sample_ordinal` es base cero y no es
+el índice original. BCS conserva `model_status`, `package_id` y la lineage
+devuelta por el servicio, sin rutas de checkpoints. La confianza porcentual es
+**del detector**, nunca de BCS. La categoría ordinal 1..5 no debe reinterpretarse
+como puntaje clínico estándar ni como los rótulos físicos de origen 3.25..4.25.
+El modelo es experimental, no aprobado para producción; la validación de esta
+función con proveedores simulados no prueba disponibilidad real ni precisión.
+
+Los resúmenes JSON y JS se publican por reemplazo atómico de archivos temporales,
+sin modificar SQLite. Cada archivo evita JSON incompleto; no constituyen una
+transacción de dos archivos ante una falla del sistema de archivos. Se intenta
+restaurar el JS anterior si falla la publicación del JSON. Si la
+publicación falla, el trabajo conserva las detecciones y un error explícito;
+la API no presenta la categoría como guardada. Consultar ese error antes de
+usar artefactos offline que pudieran haber quedado desincronizados.
+
 ## Abrir en esta computadora
 
 Desde el checkout `IA`, iniciar preferentemente la API principal con
@@ -71,6 +137,7 @@ pueden incorporarse al build y al AppLayout del frontend oficial.
 | src/vacca_video/service.py | Recursos de video: disponibilidad, inicio, recuperación transaccional y cierre |
 | src/vacca_video/store.py | Persistencia SQLite, recuperación y reclamación transaccional |
 | src/vacca_video/worker.py | Un trabajo a la vez, subproceso CLI y cierre por interrupción o tiempo límite |
+| src/vacca_video/candidate.py, bcs.py y artifacts.py | Selección acotada, puente al BCS principal y publicación segura de artefactos |
 | src/vacca_api/owned_inference.py | Trabajo BCS nativo con permiso retenido hasta su finalización |
 | src/vacca_video/schemas.py y policies.py | DTOs de respuesta y políticas explícitas del módulo de video |
 | scripts/run_api.py | Arranque recomendado; --open abre /videos en el puerto elegido (8001 predeterminado) |
@@ -114,6 +181,7 @@ OpenAPI y explorador interactivo: http://127.0.0.1:8001/docs.
 | GET /api/v1/analyses/{id} | Trabajo y resumen final si está disponible |
 | GET /api/v1/analyses/{id}/frames?offset=0&limit=30 | items y total; máximo 100 por página |
 | GET /api/v1/analyses/{id}/frames/{index}/image | JPEG anotado del frame seleccionado |
+| GET /api/v1/analyses/{id}/candidate/image | PNG original del candidato BCS, ruta fija local del trabajo; nunca una ruta recibida en el resumen |
 | GET /api/v1/analyses/{id}/results | Descarga JSONL una vez terminado, incluso si hay resultados parciales de un error |
 
 Trabajo: `schema_version=vacca-video-job-v1`, `id`, `name`, `status`, `created_at`,
@@ -140,9 +208,9 @@ El nombre recibido es solo una etiqueta; las rutas se generan desde UUIDs.
   del soporte de mp4v del navegador y reduce el uso de disco.
 - El visor reproduce muestras a una velocidad fija; muestra los timestamps
   reales, pero no representa la velocidad original del video.
-- Historial local sin usuarios ni permisos multiusuario, sin R2 ni BCS.
+- Historial local sin usuarios ni permisos multiusuario, sin R2; BCS opcional experimental en la web.
 - El detector puede generar cajas duplicadas u omitir vacas. No hay tracking,
-  identificación individual, estimación BCS ni conteo de animales únicos.
+  identificación individual ni conteo de animales únicos. BCS no verifica cuántos animales hay realmente.
 - Antes de una carga se exige espacio para 50 MiB más una reserva de 50 MiB.
   Es una comprobación inicial, no una garantía de espacio para cualquier salida.
   No hay borrado automático de resultados. Administrar outputs/web cuando el

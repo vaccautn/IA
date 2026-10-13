@@ -48,8 +48,9 @@ if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne $catalog.archiv
 ```
 
 La API usa `http://127.0.0.1:8001`. El detector YOLO se carga durante el arranque; el
-paquete BCS se carga **una sola vez y de forma lazy** en la primera solicitud `POST
-/bcs`. Sin instalación, `GET /ready/bcs` devuelve `503` con `status: not_installed` y
+paquete BCS se carga **una sola vez y de forma lazy** en la primera evaluación
+(por `POST /bcs` o por un nuevo video elegible en la web). Sin instalación,
+`GET /ready/bcs` devuelve `503` con `status: not_installed` y
 mantiene `/health` y `/detect` operativos. Después de instalar, devuelve primero
 `not_loaded` y luego `ready`, pero continúa indicando que el modelo es experimental y no
 aprobado. La presencia del paquete **no es aprobación de producción ni de uso clínico**.

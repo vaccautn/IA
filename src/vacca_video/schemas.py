@@ -4,7 +4,9 @@ Partial artifacts may omit fields and retain extension fields. Response routes
 exclude unset defaults so reading those artifacts never invents JSON keys.
 """
 
-from pydantic import BaseModel, ConfigDict, JsonValue
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 
 class ArtifactResponse(BaseModel):
@@ -30,7 +32,51 @@ class SamplingResponse(ArtifactResponse):
     max_frames: int | None = None
 
 
+class CandidateResponse(ArtifactResponse):
+    artifact: Literal["candidate.png"]
+    encoding: Literal["PNG"]
+    frame_index: int = Field(ge=0)
+    sample_ordinal: int = Field(ge=0)
+    timestamp_ms: int | float = Field(ge=0, allow_inf_nan=False)
+    timestamp_source: str
+    detector_confidence: int | float = Field(ge=0, le=1, allow_inf_nan=False)
+    target_index: Literal[0]
+    original_bbox: dict[str, JsonValue]
+    image_width: int = Field(gt=0)
+    image_height: int = Field(gt=0)
+    detector_model: VideoModelResponse
+
+
+def reject_candidate(summary):
+    """Discard rejected optional metadata, without loosening its DTO or paths."""
+    return dict(summary, candidate=None, candidate_rejection_reason="invalid_candidate",
+                bcs=dict(status="invalid_input", reason="invalid_candidate"))
+
+
+def sanitize_optional_candidate(summary):
+    """Protect status serialization even when fallback publication failed."""
+    if summary.get("candidate") is not None:
+        try:
+            CandidateResponse.model_validate(summary["candidate"])
+        except ValidationError:
+            return reject_candidate(summary)
+    return summary  # Preserve valid/old summaries, including unset and extra fields.
+
+
+class VideoBCSResponse(ArtifactResponse):
+    status: Literal["not_evaluated", "completed", "busy", "unavailable", "invalid_input", "failed"]
+    reason: str | None = None
+    bcs_category: int | None = Field(default=None, ge=1, le=5)
+    model_status: str | None = None
+    package_id: str | None = None
+    inference_time_ms: int | float | None = None
+    lineage: dict[str, JsonValue] | None = None
+
+
 class AnalysisSummaryResponse(ArtifactResponse):
+    selection_policy: str | None = None
+    candidate: CandidateResponse | None = None
+    bcs: VideoBCSResponse | None = None
     schema_version: str | None = None
     processing_id: str | None = None
     started_at_utc: str | None = None

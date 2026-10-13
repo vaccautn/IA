@@ -13,7 +13,8 @@ worktree separado. El checkout actual es `IA`. La base original usada es
 y `/bcs` conservan sus contratos públicos. No hay tracking ni identificación
 individual: el número indica **vacas visibles en un frame**, no animales únicos.
 El CLI/escritorio selecciona y conserva un candidato original, pero no calcula
-BCS.
+BCS. Solo la [web local](video-web.md#candidato-y-categoría-bcs-experimental)
+intenta una categoría BCS experimental después de completar la detección.
 
 ## Por qué esta opción
 
@@ -214,6 +215,7 @@ incluida su primera inferencia; no equivale a latencia de cámara ni a un SLA.
 
 ```powershell
 .venv\Scripts\python -m pytest tests/test_video_candidate.py tests/test_video_pipeline.py tests/test_video_io.py -q
+.venv\Scripts\python -m pytest tests/test_video_bcs.py -q
 .venv\Scripts\python -m pytest tests/test_video_api_integration.py tests/test_video_web.py -q
 .venv\Scripts\python -m pytest --disable-warnings --strict-config --strict-markers -W error::DeprecationWarning -q
 node --test tests/ui_controller.test.js tests/video_report.test.js
