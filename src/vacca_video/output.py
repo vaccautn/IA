@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from importlib.resources import files
 from pathlib import Path
 
 from .pipeline import Frame
 from .policies import CLI_PREVIEW_LIMIT
+from .candidate import CANDIDATE_ARTIFACT, POLICY, CandidateSelector
+
+logger = logging.getLogger(__name__)
 
 
 def json_text(value) -> str:
@@ -34,6 +38,8 @@ class PresentationSink:
         self.video = None
         self.records = None
         self.preview = None
+        self.candidate = CandidateSelector()
+        self.sample_ordinal = 0
         scale = min(1.0, 960 / source["width"])
         # MPEG-4 codecs generally need even dimensions.
         self.size = (
@@ -86,6 +92,8 @@ class PresentationSink:
     def write(self, frame: Frame, result: dict) -> None:
         import cv2
 
+        self.candidate.consider(frame, result, self.sample_ordinal)
+        self.sample_ordinal += 1
         annotated = cv2.resize(frame.image, self.size)
         scale_x = self.size[0] / result["image_width"]
         scale_y = self.size[1] / result["image_height"]
@@ -158,6 +166,40 @@ class PresentationSink:
     def finalize(self, summary: dict) -> None:
         """Close the MP4/JS before publishing a report, including partial failures."""
         self.close()
+        selected = self.candidate.metadata
+        candidate_write_failed = False
+        if selected is not None:
+            import cv2
+
+            path = self.output / CANDIDATE_ARTIFACT
+            try:
+                if not cv2.imwrite(str(path), self.candidate.image):
+                    raise OSError("Could not save original candidate image")
+            except (cv2.error, OSError, TypeError, ValueError) as exc:
+                logger.warning("Original candidate persistence failed: %s", type(exc).__name__)
+                selected = None
+                candidate_write_failed = True
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    logger.warning("Partial candidate cleanup failed: %s", type(cleanup_error).__name__)
+            else:
+                selected = dict(
+                    selected, artifact=CANDIDATE_ARTIFACT, encoding="PNG",
+                    image_width=self.candidate.image.shape[1],
+                    image_height=self.candidate.image.shape[0],
+                    detector_model=summary.get("model"),
+                )
+        if candidate_write_failed:
+            summary["candidate_rejection_reason"] = "candidate_write_failed"
+        summary.update(
+            selection_policy=POLICY, candidate=selected,
+            bcs=dict(status="not_evaluated", reason=(
+                "video_not_completed" if summary.get("status") != "completed" else
+                "candidate_write_failed" if candidate_write_failed else
+                "web_api_only" if selected else "no_eligible_frame"
+            )),
+        )
         summary.update(
             preview_frames=self.preview_count,
             preview_limit=self.preview_limit,

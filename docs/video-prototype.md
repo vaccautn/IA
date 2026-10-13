@@ -10,8 +10,10 @@ PostgreSQL, R2, frontend, cámara, conexión a Internet durante la inferencia ni
 La primera entrega se creó en `feature/deteccion-video` desde `develop` en un
 worktree separado. El checkout actual es `IA`. La base original usada es
 `2024ec951c3d54995d6c3147773066b517232199`. Los contratos y el código de `/detect`
-y `/bcs` no cambian. No hay tracking, identificación individual ni condición
-corporal: el número indica **vacas visibles en un frame**, no animales únicos.
+y `/bcs` conservan sus contratos públicos. No hay tracking ni identificación
+individual: el número indica **vacas visibles en un frame**, no animales únicos.
+El CLI/escritorio selecciona y conserva un candidato original, pero no calcula
+BCS.
 
 ## Por qué esta opción
 
@@ -133,6 +135,7 @@ outputs/video/<ejecución>/
 ├── detections.jsonl   Una línea JSON por frame analizado
 ├── frames.js          Índice acotado de la vista previa
 ├── frames/            JPEG anotados, hasta preview-limit
+├── candidate.png      Mejor frame original con una detección de vaca (si existe)
 └── annotated.mp4      Todos los frames analizados, sin audio (opcional)
 ```
 
@@ -181,7 +184,16 @@ flowchart LR
   diferencias frente a la imagen original; una entrada directa en memoria sería
   una optimización posterior, con pruebas de equivalencia.
 - `output.py` escribe JSONL y MP4 incrementalmente. Conserva como archivos solo
-  los primeros `preview_limit` JPEGs y no retiene todo el historial en Python.
+  los primeros `preview_limit` JPEGs y un candidato original independiente en PNG.
+  La selección conserva una sola imagen en memoria, con máxima confianza entre
+  frames muestreados de exactamente una detección de vaca; empates conservan el
+  primero. No usa previews anotados ni recorta la imagen. `summary.json` registra
+  `candidate`, `selection_policy` y BCS `not_evaluated` en CLI/escritorio.
+  Si falla la escritura opcional de `candidate.png`, descarta el candidato e
+  informa `candidate_write_failed` sin invalidar detecciones o informes válidos.
+  Las fallas de artefactos obligatorios siguen siendo fallas de video; no se oculta
+  un error previo de detección. La confianza y el timestamp son del detector y del
+  frame seleccionado, no una confianza BCS ni una identificación del animal.
 - `policies.py` define los valores predeterminados de video. El CLI y el escritorio
   conservan 120 imágenes de vista previa; la web conserva los 300 frames analizados
   y omite el MP4. Las opciones de detector siguen siendo propias del adaptador.
@@ -201,7 +213,7 @@ incluida su primera inferencia; no equivale a latencia de cámara ni a un SLA.
 ## Pruebas y regresión
 
 ```powershell
-.venv\Scripts\python -m pytest tests/test_video_pipeline.py tests/test_video_io.py -q
+.venv\Scripts\python -m pytest tests/test_video_candidate.py tests/test_video_pipeline.py tests/test_video_io.py -q
 .venv\Scripts\python -m pytest tests/test_video_api_integration.py tests/test_video_web.py -q
 .venv\Scripts\python -m pytest --disable-warnings --strict-config --strict-markers -W error::DeprecationWarning -q
 node --test tests/ui_controller.test.js tests/video_report.test.js
