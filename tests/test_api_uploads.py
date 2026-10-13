@@ -25,6 +25,7 @@ class APIRouteContractTests(unittest.TestCase):
         routes = {
             (route.path, frozenset(route.methods))
             for route in api_main.app.routes
+            if hasattr(route, "path") and hasattr(route, "methods")
         }
 
         for expected in (

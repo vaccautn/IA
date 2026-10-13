@@ -1,17 +1,36 @@
-# VACCA Video: aplicación web independiente
+# VACCA Video en la API principal de IA
 
 ## Abrir en esta computadora
 
-Hacer doble clic en **Iniciar VACCA Video.cmd**, en la raíz de IA-video.
-Se inicia el servicio y se abre http://127.0.0.1:8010. Mantener la ventana del
+Desde el checkout `IA`, iniciar preferentemente la API principal con
+`.venv\Scripts\python.exe scripts/run_api.py --open`. También se puede hacer
+doble clic en **Iniciar VACCA Video.cmd**, en la raíz de `IA`.
+Se inicia un único servicio y se abre http://127.0.0.1:8001/videos/. Mantener la ventana del
 servicio abierta; toda la interacción con videos se hace en el navegador.
 Si ya está encendido, entrar directamente a esa dirección. Para detenerlo,
 presionar Ctrl+C en la ventana del servicio.
 
 No requiere VBS, abrir un reporte HTML, PostgreSQL, R2, login ni levantar los
 repositorios backend/frontend de VACCA. Es una aplicación local de un usuario;
-no publicarla en Internet ni cambiar su binding a 0.0.0.0 sin implementar
-autenticación, autorización y cuotas. El servicio valida Host y Origin.
+no publicar las rutas de video en Internet sin implementar autenticación,
+autorización y cuotas. La API principal conserva sus opciones `--host`/`--port`:
+si se vincula a `0.0.0.0`, las rutas de video siguen rechazando clientes remotos.
+Solo video exige Host local, cliente de loopback y Origin del mismo origen;
+rechaza cabeceras de proxy. No publicar video mediante un proxy local que oculte
+el cliente remoto. Estas restricciones no se aplican a `/detect`, `/bcs`, `/ui`
+ni `/health`; su comportamiento anterior se conserva.
+
+En el mismo servicio están `/ui` para imágenes, `/docs`, `/detect` y `/bcs`.
+`/videos` redirige a `/videos/`; no reemplaza `/ui` ni añade una página raíz.
+Ya no se necesita el servicio independiente en el puerto 8010.
+
+`--open` espera a que la instancia de Uvicorn haya completado el inicio y abierto
+los sockets, no un tiempo fijo de precarga. La espera automática del navegador
+tiene un máximo de 120 segundos; si vence o falla el navegador, el registro indica
+la URL para abrir manualmente, sin detener la API. Un fallo de inicio o el cierre
+cancela la espera; el modo `--reload` no abre otra ventana en cada reinicio.
+Con `--port 0`, el navegador utiliza el puerto asignado al socket de esa instancia
+después del inicio; también funciona con el socket heredado por el hijo de reload.
 
 El video real descargado está en:
 `outputs/fixtures/vacas-pastura-pexels-3769204.mp4`.
@@ -21,9 +40,9 @@ el deslizador o reproducir la secuencia y descargar las detecciones JSONL.
 
 ## Aislamiento y estética
 
-Todo está en la rama `feature/deteccion-video`, worktree IA-video. Backend,
-frontend e IA/main no requieren cambios para usarlo. IA-video comparte el
-repositorio Git de IA, pero tiene su propio checkout y dependencias locales.
+El trabajo está en `feature/deteccion-video`, en el checkout `IA`. La interfaz y
+sus rutas se integran en `vacca_api`; los repositorios backend/frontend del equipo
+no requieren cambios. No es una integración productiva con usuarios o permisos.
 
 La interfaz es React. Se copiaron como snapshot la paleta CSS de
 `frontend/src/index.css`, Manrope y los recursos de marca de `frontend/public`
@@ -42,25 +61,50 @@ pueden incorporarse al build y al AppLayout del frontend oficial.
 
 | Archivo/directorio | Responsabilidad |
 | --- | --- |
-| web/src/main.jsx | Interfaz, carga, historial, estados y exploración de frames |
+| web/src/main.jsx, App.jsx y components.jsx | Arranque, composición visual, carga, historial y visor |
+| web/src/useVideoAnalysis.js y requests.js | Estado, polling sin solapamiento y descarte de respuestas obsoletas al cambiar selección o cerrar la vista |
+| web/src/policy.js | Políticas de carga y presentación, verificadas contra Python por una prueba de contrato |
 | web/src/api.js | Adaptador HTTP reemplazable al integrar con el backend |
 | web/src/brand.css y public/ | Snapshot de identidad visual de VACCA |
-| src/vacca_video/webapp.py | API local, repositorio SQLite y worker de un trabajo a la vez |
-| scripts/run_video_web.py | Arranque en loopback, un único proceso de servicio |
+| src/vacca_api/main.py | API principal y único ciclo de vida de imagen/video |
+| src/vacca_video/webapp.py | Router reutilizable, UI en /videos, controles locales y mapeo HTTP de errores |
+| src/vacca_video/service.py | Recursos de video: disponibilidad, inicio, recuperación transaccional y cierre |
+| src/vacca_video/store.py | Persistencia SQLite, recuperación y reclamación transaccional |
+| src/vacca_video/worker.py | Un trabajo a la vez, subproceso CLI y cierre por interrupción o tiempo límite |
+| src/vacca_video/schemas.py y policies.py | DTOs de respuesta y políticas explícitas del módulo de video |
+| scripts/run_api.py | Arranque recomendado; --open abre /videos en el puerto elegido (8001 predeterminado) |
+| scripts/run_video_web.py | Entrada compatible que delega al mismo arranque principal, no otro servidor |
 | scripts/process_video.py | Procesador existente, ejecutado en un proceso aislado |
 | outputs/web/jobs.sqlite3 | Historial persistente, no versionado |
 | outputs/web/<id>/ | Video recibido, log y resultados del trabajo |
 | tests/test_video_web.py | Contrato ASGI, límites, persistencia y recuperación |
+| web/ui.test.mjs | Interacciones renderizadas con React/Edge, API simulada y limpieza del hook |
 
 El navegador y la API se sirven desde el mismo origen. El worker utiliza el CLI
-existente sin cambiar `/detect`, `/bcs`, los pesos o las dependencias de IA.
-No carga YOLO dentro del proceso que atiende HTTP. Los trabajos pendientes se
+existente sin cambiar los contratos de `/detect` y `/bcs`, los pesos o las dependencias.
+La API principal sigue precargando su detector de imágenes. Video mantiene ejecución
+aislada: su subproceso carga un segundo detector, sin compartir modelos ni bloquear
+durante todo el trabajo la inferencia de imagen o BCS. Esta elección permite uso
+concurrente y puede consumir más RAM/GPU; no garantiza capacidad de hardware.
+Los trabajos pendientes se
 retoman al arrancar; los que estaban procesando pasan a ERROR con explicación,
 para que el usuario pueda volver a cargar el archivo. No hay reintento silencioso.
 
+Los recursos de video se crean durante el inicio, no al importar la API. Si faltan
+dependencias de video, el almacenamiento no está disponible o no se puede iniciar
+el worker, sus rutas de análisis devuelven 503 sin impedir la API de imágenes.
+La recuperación y el inicio del worker comparten una transacción: un fallo de
+inicio no marca como fallidos trabajos anteriores. Un build ausente solo provoca
+503 en la UI `/videos/`; no impide usar el CLI, `/ui` ni las rutas de imágenes.
+
+Las tres interfaces siguen soportadas: CLI con informes offline, lanzador de
+escritorio y web local. Comparten el procesador, no el ciclo de vida del servidor.
+Los DTOs conservan campos adicionales y artefactos parciales sin agregar claves
+ausentes; `error` y `summary` del trabajo mantienen sus valores nulos explícitos.
+
 ## Contrato v1
 
-OpenAPI y explorador interactivo: http://127.0.0.1:8010/docs.
+OpenAPI y explorador interactivo: http://127.0.0.1:8001/docs.
 
 | Método/ruta | Contrato |
 | --- | --- |
@@ -79,7 +123,8 @@ es relativo al video, en milisegundos; cajas en coordenadas originales, con las
 dimensiones de origen. Las imágenes anotadas ya tienen las cajas escaladas.
 
 Errores relevantes: 413 tamaño, 415 formato/cabecera, 429 cola llena, 507 espacio,
-404 recurso inexistente, 409 descarga antes de finalizar. Una cabecera MP4 válida
+404 recurso inexistente, 409 descarga antes de finalizar y 503 capacidad de video
+no disponible. Una cabecera MP4 válida
 solo es una validación inicial: si el decoder no puede leerlo, el trabajo falla.
 El nombre recibido es solo una etiqueta; las rutas se generan desde UUIDs.
 
@@ -103,8 +148,13 @@ El nombre recibido es solo una etiqueta; las rutas se generan desde UUIDs.
   servicio esté detenido; conservar juntos base de datos y archivos.
 - Lectura paginada sobre resultados acotados a 300 frames; videos ilimitados
   requerirán índice o almacenamiento de resultados por bloques.
-- Un solo proceso del servidor: no usar múltiples workers ni dos instancias
+- Un solo proceso de la API principal: no usar múltiples workers ni dos instancias
   sobre la misma base. Escalar requiere leases y reclamación distribuida.
+  Los launchers rechazan más de un worker efectivo de Uvicorn antes de abrir
+  sockets, precargar modelos o recuperar trabajos, con y sin `--open` e incluso
+  con `--reload`. Si `WEB_CONCURRENCY` está configurado, quitarlo o establecerlo
+  en `1`; no se ignora ni se reduce silenciosamente. El error indica el número
+  efectivo de workers y exige un único proceso principal.
 
 ## Instalación reproducible en Windows
 
@@ -117,7 +167,7 @@ cd web
 npm ci
 npm run build
 cd ..
-.\.venv\Scripts\python.exe scripts/run_video_web.py
+.\.venv\Scripts\python.exe scripts/run_api.py --open
 ```
 
 `package-lock.json` fija las dependencias del prototipo. Los builds y los datos
@@ -145,8 +195,10 @@ anterior es el camino validado para esta entrega.
 
 Es una base aislada para integrar, no la integración productiva ya terminada.
 
-## Validación de esta entrega
+## Validación histórica del servicio independiente
 
+La verificación original siguiente corresponde al servicio independiente anterior
+a la integración en `vacca_api`; no demuestra inferencia del servicio unificado.
 25 pruebas de API web y procesador: aprobadas, además de 13 subtests.
 Build React: aprobado. El flujo HTTP real procesó el MP4 de Pexels 3769204:
 412 frames leídos, 83 analizados, 83 previews, finalización end_of_source,
@@ -160,3 +212,25 @@ desbordamiento aprobados; sin excepciones JavaScript. Con el servicio encendido
 y al menos un análisis completado, repetir con `cd web` y `node smoke.mjs`.
 Requiere Edge instalado; playwright-core no descarga otro navegador.
 Capturas locales: `outputs/video-web-desktop.png` y `outputs/video-web-mobile.png`.
+
+### Regresión de la interfaz sin modelos
+
+Desde `IA/web`, ejecutar `npm run build` y `npm test` en el entorno preparado con
+`npm ci`. La prueba requiere Edge instalado y las dependencias del lock existente
+(`react`, `react-dom`, `esbuild` y `playwright-core`); no descarga un navegador ni
+agrega librerías. Si falta Edge o alguna dependencia, falla: no omite la cobertura.
+
+La prueba ejecuta `App` y `useVideoAnalysis` reales con respuestas HTTP simuladas
+y un servidor estático temporal en loopback en `/videos/`, incluidos los prefijos
+de recursos. El bundle de prueba permanece en
+memoria. No requiere el servicio Python, un trabajo completado ni pesos de IA.
+Cubre historial tardío después de una carga y reanudación del polling, frames
+obsoletos al cambiar análisis o índice, error de carga, reinicio de reproducción
+al seleccionar otro análisis y desmontaje con solicitudes pendientes. Controla
+los timers de polling/reproducción; React y las interacciones del navegador son
+reales. Complementa las pruebas de helpers y no verifica inferencia ni precisión.
+
+Las pruebas de integración de `tests/test_video_api_integration.py` ejecutan la API
+principal con detectores/runtime/worker simulados y almacenamiento temporal. Cubren
+convivencia de rutas, recuperación y cierre, fallos aislados, seguridad local y
+ausencia de bloqueo global de imagen/BCS. No cargan pesos ni procesan videos reales.

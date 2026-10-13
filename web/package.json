@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build.mjs",
+    "test": "node --test ui.test.mjs"
   },
   "dependencies": {
     "react": "19.2.6",

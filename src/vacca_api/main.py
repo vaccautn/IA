@@ -22,6 +22,9 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+from vacca_video.service import VideoResources
+from vacca_video.webapp import configure_video
+
 from .detection import DEFAULT_MODEL, get_detector
 from .schemas import (
     BCSReadinessResponse,
@@ -107,7 +110,13 @@ def _startup(target_app: FastAPI | None = None) -> None:
 @asynccontextmanager
 async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
     _startup(target_app)
-    yield
+    video = VideoResources()
+    target_app.state.video = video
+    try:
+        video.start()
+        yield
+    finally:
+        video.close()
 
 
 # --- App ---
@@ -120,6 +129,7 @@ app = FastAPI(
 app.state.detect_inference_gate = InferenceCapacityGate(DETECT_GATE_NAME)
 app.state.bcs_inference_gate = InferenceCapacityGate(BCS_GATE_NAME)
 app.state.metrics = PrototypeMetrics()
+configure_video(app)
 
 
 # --- Health ---

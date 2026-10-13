@@ -6,7 +6,7 @@ try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.goto("http://127.0.0.1:8010");
+  await page.goto("http://127.0.0.1:8001/videos/");
   await page.getByRole("heading", { name: "Detecci\xF3n en video" }).waitFor();
   await page.locator(".viewer img").waitFor({ timeout: 15e3 });
   await page.evaluate(() => document.fonts.ready);

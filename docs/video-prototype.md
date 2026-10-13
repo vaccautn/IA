@@ -22,8 +22,11 @@ resultados sin trasladar reglas del dominio a la IA.
 
 No conviene comenzar enviando una solicitud HTTP por cada frame del navegador:
 eso sumaría transporte, sincronización y cambios en tres repositorios antes de
-validar el detector sobre video. Tampoco se incorpora un sistema de colas o un
-servidor nuevo para esta demostración local.
+validar el detector sobre video. El CLI y el lanzador de escritorio no incorporan
+una cola ni requieren servidor. La [interfaz web local](video-web.md) es otra
+interfaz soportada: ahora usa la API principal `vacca_api` en `/videos/` y las rutas
+`/api/v1/analyses`. Utiliza SQLite y un worker que ejecuta este mismo CLI en un
+subproceso; no reemplaza los informes offline ni integra el backend del equipo.
 
 ## Preparar el entorno
 
@@ -199,6 +202,7 @@ incluida su primera inferencia; no equivale a latencia de cámara ni a un SLA.
 
 ```powershell
 .venv\Scripts\python -m pytest tests/test_video_pipeline.py tests/test_video_io.py -q
+.venv\Scripts\python -m pytest tests/test_video_api_integration.py tests/test_video_web.py -q
 .venv\Scripts\python -m pytest --disable-warnings --strict-config --strict-markers -W error::DeprecationWarning -q
 node --test tests/ui_controller.test.js tests/video_report.test.js
 .venv\Scripts\python -m ruff check src scripts tests

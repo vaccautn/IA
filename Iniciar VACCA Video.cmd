@@ -5,6 +5,6 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-echo VACCA Video - Mantene esta ventana abierta mientras procesas videos.
-".venv\Scripts\python.exe" "scripts\run_video_web.py" --open
+echo VACCA API - Video en http://127.0.0.1:8001/videos/ - Mantener esta ventana abierta.
+".venv\Scripts\python.exe" "scripts\run_api.py" --open
 pause

@@ -1,154 +1,28 @@
-"""Standalone, single-user video service. Run on loopback with one worker only."""
+"""Reusable local video routes/UI; the principal API owns runtime resources."""
 
-from contextlib import asynccontextmanager, contextmanager
-import asyncio
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from ipaddress import ip_address
 import json
-import os
-from pathlib import Path
 import shutil
-import sqlite3
-import subprocess
-import sys
-import threading
+import subprocess as subprocess  # Compatibility for existing worker callers.
+from urllib.parse import urlsplit
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-ROOT = Path(__file__).resolve().parents[2]
-MAX_UPLOAD = 50 * 1024 * 1024
-MAX_FRAMES = 300
-RESERVE = 50 * 1024 * 1024
-
-
-class Store:
-    def __init__(self, directory):
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.db = self.directory / "jobs.sqlite3"
-        with self.connect() as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, error TEXT)"
-            )
-
-    @contextmanager
-    def connect(self):
-        conn = sqlite3.connect(self.db, timeout=10)
-        conn.row_factory = sqlite3.Row
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
-
-    def list(self):
-        with self.connect() as conn:
-            return [
-                dict(row)
-                for row in conn.execute(
-                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT 100"
-                )
-            ]
-
-    def get(self, job_id):
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-        if row is None:
-            raise HTTPException(404, "Análisis no encontrado")
-        return dict(row)
-
-    def add(self, job_id, name):
-        with self.connect() as conn:
-            conn.execute(
-                "INSERT INTO jobs VALUES (?, ?, 'pending', ?, NULL)",
-                (job_id, name, datetime.now(timezone.utc).isoformat()),
-            )
-
-    def update(self, job_id, status, error=None):
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE jobs SET status=?, error=? WHERE id=?", (status, error, job_id)
-            )
-
-    def recover(self):
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE jobs SET status='failed', error='El servicio se interrumpió. Volvé a cargar el video para reintentar.' WHERE status='processing'"
-            )
-
-    def claim(self):
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT id FROM jobs WHERE status='pending' ORDER BY created_at LIMIT 1"
-            ).fetchone()
-            if row:
-                conn.execute(
-                    "UPDATE jobs SET status='processing' WHERE id=?", (row["id"],)
-                )
-                return row["id"]
-
-
-class Worker:
-    def __init__(self, store):
-        self.store = store
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self.loop, daemon=True)
-
-    def loop(self):
-        while not self.stop.is_set():
-            job_id = self.store.claim()
-            if job_id is None:
-                self.stop.wait(0.5)
-                continue
-            directory = self.store.directory / job_id
-            try:
-                command = [
-                    sys.executable,
-                    "-u",
-                    str(ROOT / "scripts/process_video.py"),
-                    str(directory / "input.mp4"),
-                    "--output",
-                    str(directory / "result"),
-                    "--max-frames",
-                    str(MAX_FRAMES),
-                    "--preview-limit",
-                    str(MAX_FRAMES),
-                    "--no-video",
-                ]
-                with (directory / "worker.log").open("w", encoding="utf-8") as log:
-                    with subprocess.Popen(
-                        command,
-                        cwd=ROOT,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        env=dict(os.environ, PYTHONIOENCODING="utf-8"),
-                    ) as proc:
-                        for _ in range(1200):
-                            if proc.poll() is not None:
-                                break
-                            if self.stop.wait(0.5):
-                                break
-                        if proc.poll() is None:
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                                proc.wait()
-                            raise RuntimeError(
-                                "Procesamiento interrumpido o límite de 10 minutos alcanzado."
-                            )
-                        if proc.returncode:
-                            raise RuntimeError(
-                                "No se pudo analizar el archivo. Verificá que sea un video MP4 válido y que haya espacio disponible."
-                            )
-                self.store.update(job_id, "completed")
-            except Exception as exc:
-                self.store.update(job_id, "failed", str(exc))
+from .policies import (
+    DEFAULT_MAX_FRAMES as MAX_FRAMES,
+    ROOT,
+    WEB_DISK_RESERVE_BYTES as RESERVE,
+    WEB_MAX_ACTIVE_JOBS,
+    WEB_MAX_UPLOAD_BYTES as MAX_UPLOAD,
+)
+from .store import JobNotFound, Store
+from .worker import Worker as Worker
+from .schemas import VideoErrorResponse, FramePageResponse, JobResponse
+from .service import UNAVAILABLE_DETAIL, VideoResources
 
 
 def records(directory):
@@ -165,42 +39,17 @@ def records(directory):
     return result
 
 
-def create_app(directory=None, start_worker=True):
-    store = Store(directory or os.environ.get("VACCA_VIDEO_DATA", ROOT / "outputs/web"))
-    worker = Worker(store)
+def video_store(request: Request) -> Store:
+    resources = getattr(request.app.state, "video", None)
+    if resources is None or not resources.available:
+        raise HTTPException(503, UNAVAILABLE_DETAIL)
+    return resources.store
 
-    @asynccontextmanager
-    async def lifespan(app):
-        if start_worker:
-            store.recover()
-            worker.thread.start()
-        yield
-        worker.stop.set()
-        if start_worker:
-            worker.thread.join(timeout=10)
 
-    app = FastAPI(
-        title="VACCA Video · prototipo independiente",
-        version="1.0.0",
-        lifespan=lifespan,
-    )
-    app.state.store = store
-    upload_lock = asyncio.Lock()
-    app.add_middleware(
-        TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "testserver"]
-    )
+def create_router():
+    router = APIRouter(responses={503: {"model": VideoErrorResponse}})
 
-    @app.middleware("http")
-    async def local_origin(request, call_next):
-        origin = request.headers.get("origin")
-        if origin and origin != str(request.base_url).rstrip("/"):
-            return JSONResponse({"detail": "Origen no permitido"}, status_code=403)
-        if request.method == "POST":
-            async with upload_lock:
-                return await call_next(request)
-        return await call_next(request)
-
-    def detail(job):
+    def detail(store, job):
         directory = store.directory / job["id"]
         frames = records(directory)
         summary_path = directory / "result/summary.json"
@@ -214,13 +63,21 @@ def create_app(directory=None, start_worker=True):
             schema_version="vacca-video-job-v1",
         )
 
-    @app.get("/api/v1/analyses")
-    def list_jobs():
-        return [detail(job) for job in store.list()]
+    @router.get(
+        "/api/v1/analyses", response_model=list[JobResponse],
+        response_model_exclude_unset=True,
+    )
+    def list_jobs(store: Store = Depends(video_store)):
+        return [detail(store, job) for job in store.list()]
 
-    @app.post("/api/v1/analyses", status_code=202)
+    @router.post(
+        "/api/v1/analyses", status_code=202, response_model=JobResponse,
+        response_model_exclude_unset=True,
+        responses={code: {"model": VideoErrorResponse} for code in (413, 415, 429, 507)},
+    )
     async def upload(
-        request: Request, filename: str = Query(min_length=1, max_length=200)
+        request: Request, filename: str = Query(min_length=1, max_length=200),
+        store: Store = Depends(video_store),
     ):
         if not filename.lower().endswith(".mp4"):
             raise HTTPException(415, "Elegí un video MP4.")
@@ -228,7 +85,7 @@ def create_app(directory=None, start_worker=True):
             active = conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
             ).fetchone()[0]
-        if active >= 3:
+        if active >= WEB_MAX_ACTIVE_JOBS:
             raise HTTPException(
                 429, "Hay tres videos en espera. Esperá a que terminen."
             )
@@ -258,15 +115,22 @@ def create_app(directory=None, start_worker=True):
             target.unlink(missing_ok=True)
             directory.rmdir()
             raise
-        return detail(store.get(job_id))
+        return detail(store, store.get(job_id))
 
-    @app.get("/api/v1/analyses/{job_id}")
-    def get_job(job_id: str):
-        return detail(store.get(job_id))
+    @router.get(
+        "/api/v1/analyses/{job_id}", response_model=JobResponse,
+        response_model_exclude_unset=True, responses={404: {"model": VideoErrorResponse}},
+    )
+    def get_job(job_id: str, store: Store = Depends(video_store)):
+        return detail(store, store.get(job_id))
 
-    @app.get("/api/v1/analyses/{job_id}/frames")
+    @router.get(
+        "/api/v1/analyses/{job_id}/frames", response_model=FramePageResponse,
+        response_model_exclude_unset=True, responses={404: {"model": VideoErrorResponse}},
+    )
     def get_frames(
-        job_id: str, offset: int = Query(0, ge=0), limit: int = Query(30, ge=1, le=100)
+        job_id: str, offset: int = Query(0, ge=0), limit: int = Query(30, ge=1, le=100),
+        store: Store = Depends(video_store),
     ):
         store.get(job_id)
         frames = records(store.directory / job_id)
@@ -278,8 +142,8 @@ def create_app(directory=None, start_worker=True):
             "total": len(frames),
         }
 
-    @app.get("/api/v1/analyses/{job_id}/frames/{index}/image")
-    def image(job_id: str, index: int):
+    @router.get("/api/v1/analyses/{job_id}/frames/{index}/image")
+    def image(job_id: str, index: int, store: Store = Depends(video_store)):
         store.get(job_id)
         if index < 0 or index >= MAX_FRAMES:
             raise HTTPException(404)
@@ -288,8 +152,8 @@ def create_app(directory=None, start_worker=True):
             raise HTTPException(404, "Frame todavía no disponible")
         return FileResponse(path, media_type="image/jpeg")
 
-    @app.get("/api/v1/analyses/{job_id}/results")
-    def download(job_id: str):
+    @router.get("/api/v1/analyses/{job_id}/results")
+    def download(job_id: str, store: Store = Depends(video_store)):
         job = store.get(job_id)
         path = store.directory / job_id / "result/detections.jsonl"
         if job["status"] not in ("completed", "failed") or not path.exists():
@@ -298,7 +162,102 @@ def create_app(directory=None, start_worker=True):
             path, filename=f"{job_id}.jsonl", media_type="application/x-ndjson"
         )
 
-    web = ROOT / "web/dist"
-    if web.is_dir():
-        app.mount("/", StaticFiles(directory=web, html=True), name="web")
+    return router
+
+
+def is_loopback(host):
+    try:
+        address = ip_address(host)
+        return address.is_loopback or (
+            address.version == 6 and address.ipv4_mapped is not None
+            and address.ipv4_mapped.is_loopback
+        )
+    except ValueError:
+        return False
+
+
+class VideoLocalMiddleware:
+    """Restrict only video data/UI; never gate image or BCS inference."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        root_path = scope.get("root_path", "")
+        if root_path and (path == root_path or path.startswith(root_path + "/")):
+            path = path[len(root_path):]
+        protected = any(path == prefix or path.startswith(prefix + "/")
+                        for prefix in ("/api/v1/analyses", "/videos"))
+        if scope["type"] != "http" or not protected:
+            return await self.app(scope, receive, send)
+        request = Request(scope)
+        try:
+            host = urlsplit("http://" + request.headers.get("host", "")).hostname
+        except ValueError:
+            host = None
+        if not host or not (host == "localhost" or is_loopback(host)):
+            return await PlainTextResponse("Invalid host header", status_code=400)(scope, receive, send)
+        if not request.client or not is_loopback(request.client.host):
+            return await JSONResponse({"detail": "Acceso permitido solo desde esta computadora"}, status_code=403)(scope, receive, send)
+        if any(name in request.headers for name in (
+            "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"
+        )):
+            return await JSONResponse({"detail": "El acceso a video no admite proxies"}, status_code=403)(scope, receive, send)
+        origin = request.headers.get("origin")
+        base = urlsplit(str(request.base_url))
+        if origin and origin != f"{base.scheme}://{base.netloc}":
+            return await JSONResponse({"detail": "Origen no permitido"}, status_code=403)(scope, receive, send)
+        resources = getattr(request.app.state, "video", None)
+        if request.method == "POST" and path.startswith("/api/v1/analyses") and resources:
+            async with resources.upload_lock:
+                return await self.app(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
+class VideoUI:
+    def __init__(self, directory):
+        self.directory = directory
+        self.static = StaticFiles(directory=directory, html=True, check_dir=False)
+
+    async def __call__(self, scope, receive, send):
+        if not (self.directory / "index.html").is_file():
+            return await JSONResponse({"detail": "La interfaz de video no está compilada. Ejecutar npm run build desde IA/web."}, status_code=503)(scope, receive, send)
+        return await self.static(scope, receive, send)
+
+
+def configure_video(app, web_directory=None):
+    app.include_router(create_router())
+    app.add_middleware(VideoLocalMiddleware)
+
+    @app.exception_handler(JobNotFound)
+    async def job_not_found(request, exc):
+        return JSONResponse({"detail": "Análisis no encontrado"}, status_code=404)
+
+    @app.get("/videos", include_in_schema=False)
+    def videos_redirect():
+        return RedirectResponse("/videos/", status_code=307)
+
+    app.mount("/videos", VideoUI(web_directory or ROOT / "web/dist"), name="videos")
+
+
+def create_app(directory=None, start_worker=True):
+    """Small contract-test composition; production starts vacca_api.main only."""
+    resources = VideoResources(directory, worker_factory=Worker)
+    resources.prepare()
+    if not start_worker:
+        resources.available = True
+
+    @asynccontextmanager
+    async def lifespan(app):
+        resources.start(start_worker=start_worker)
+        try:
+            yield
+        finally:
+            resources.close()
+
+    app = FastAPI(lifespan=lifespan)
+    app.state.video = resources
+    app.state.store = resources.store  # Existing contract-test compatibility.
+    configure_video(app)
     return app

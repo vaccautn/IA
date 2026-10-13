@@ -1,0 +1,337 @@
+"""Principal API + video integration, using fake runtimes and no inference."""
+
+import asyncio
+import json
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from scripts import run_api, run_video_web
+from scripts.smoke_test_api import _BOUNDARY, _multipart_body
+from vacca_api import main
+from vacca_api.metrics import PrototypeMetrics
+from vacca_video import service, webapp
+from vacca_video.store import Store
+from test_video_web import TestClient, submit
+
+
+class FakeWorker:
+    instances = []
+
+    def __init__(self, store):
+        self.store = store
+        self.ready = threading.Event()
+        self.stop = SimpleNamespace(set=Mock())
+        self.thread = self
+        self.start = Mock()
+        self.join = Mock()
+        self.instances.append(self)
+
+
+@pytest.fixture
+def runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(FakeWorker, "instances", [])
+    monkeypatch.setattr(service, "Worker", FakeWorker)
+    monkeypatch.setattr(service, "check_runtime", lambda: None)
+    monkeypatch.setattr(main, "get_detector", lambda: SimpleNamespace(
+        gpu_available=False, detect=lambda payload: ([], 8, 6, 1.25)
+    ))
+    bcs_service = SimpleNamespace(infer=lambda payload: SimpleNamespace(bcs_category=3))
+    monkeypatch.setattr(main, "get_bcs_runtime", lambda: SimpleNamespace(
+        status="ready", get_service=lambda: bcs_service, model_status=None
+    ))
+    monkeypatch.setattr(main.app.state, "metrics", PrototypeMetrics())
+    monkeypatch.setattr(main.app.state, "detect_inference_gate", main.InferenceCapacityGate())
+    monkeypatch.setattr(main.app.state, "bcs_inference_gate", main.InferenceCapacityGate())
+    monkeypatch.setattr(webapp.shutil, "disk_usage", lambda path: SimpleNamespace(free=1024**3))
+    return Path(service.os.environ["VACCA_VIDEO_DATA"])
+
+
+@pytest.fixture
+def client(runtime):
+    with asyncio.Runner() as runner:
+        lifecycle = main.app.router.lifespan_context(main.app)
+        runner.run(lifecycle.__aenter__())
+        try:
+            yield TestClient(main.app, runner=runner)
+        finally:
+            runner.run(lifecycle.__aexit__(None, None, None))
+
+
+def image_upload():
+    from io import BytesIO
+    from PIL import Image
+
+    image = BytesIO()
+    Image.new("RGB", (8, 6)).save(image, format="JPEG")
+    return _multipart_body("image.jpg", image.getvalue(), "image/jpeg")
+
+
+IMAGE_HEADERS = {"content-type": f"multipart/form-data; boundary={_BOUNDARY.decode()}"}
+
+
+def test_principal_routes_and_video_contract_coexist(client):
+    for path in ("/health", "/ui", "/docs", "/openapi.json", "/metrics", "/ready/bcs"):
+        assert client.get(path).status_code == 200
+    assert client.get("/").status_code == 404
+    assert client.get("/videos").status_code == 307
+    schema = client.get("/openapi.json").json()
+    assert {"/detect", "/bcs", "/api/v1/analyses"} <= schema["paths"].keys()
+    for endpoint in ("/detect", "/bcs"):
+        response = client.post(endpoint, content=image_upload(), headers=IMAGE_HEADERS)
+        assert response.status_code == 200
+        if endpoint == "/detect":
+            assert response.json()["detection_count"] == 0
+        else:
+            assert response.json()["bcs_category"] == 3
+    response = submit(client)
+    assert response.status_code == 202
+    job = response.json()
+    assert job["error"] is None and job["summary"] is None
+    assert job["schema_version"] == "vacca-video-job-v1"
+    assert client.get(f"/api/v1/analyses/{job['id']}").json() == job
+    assert client.get("/api/v1/analyses/missing").json() == {"detail": "Análisis no encontrado"}
+
+
+def test_primary_lifespan_recovery_persistence_and_finally_shutdown(runtime):
+    store = Store(runtime)
+    store.add("interrupted", "one.mp4")
+    store.add("pending", "two.mp4")
+    store.claim()
+    with asyncio.Runner() as runner:
+        async def run():
+            with pytest.raises(RuntimeError, match="fixture shutdown"):
+                async with main.app.router.lifespan_context(main.app):
+                    assert main.app.state.video.available
+                    assert Store(runtime).get("interrupted")["status"] == "failed"
+                    assert Store(runtime).get("pending")["status"] == "pending"
+                    response = await TestClient(main.app).arequest("GET", "/api/v1/analyses")
+                    assert len(response.json()) == 2
+                    raise RuntimeError("fixture shutdown")
+        runner.run(run())
+    worker = FakeWorker.instances[0]
+    worker.start.assert_called_once()
+    worker.stop.set.assert_called_once()
+    worker.join.assert_called_once_with(timeout=10)
+    assert not main.app.state.video.available
+    assert Store(runtime).get("pending")["status"] == "pending"
+    with asyncio.Runner() as runner:
+        async def restart():
+            async with main.app.router.lifespan_context(main.app):
+                response = await TestClient(main.app).arequest("GET", "/api/v1/analyses")
+                assert {job["id"] for job in response.json()} == {"interrupted", "pending"}
+                assert main.app.state.video.store.get("pending")["status"] == "pending"
+        runner.run(restart())
+    assert len(FakeWorker.instances) == 2
+    FakeWorker.instances[1].start.assert_called_once()
+    FakeWorker.instances[1].join.assert_called_once_with(timeout=10)
+
+
+@pytest.mark.parametrize("package", ["cv2", "ultralytics"])
+def test_video_runtime_probe_identifies_missing_optional_packages(monkeypatch, package):
+    monkeypatch.setattr(service, "find_spec", lambda name: None if name == package else object())
+    with pytest.raises(ImportError, match=f"Missing video runtime: {package}"):
+        service.check_runtime()
+
+
+def test_failed_recovery_commit_cannot_claim_jobs_and_stops_started_thread(runtime, monkeypatch):
+    from contextlib import contextmanager
+    from vacca_video.worker import Worker
+
+    resources = service.VideoResources(runtime, worker_factory=Worker)
+    resources.prepare()
+    resources.store.add("interrupted", "one.mp4")
+    resources.store.add("pending", "two.mp4")
+    resources.store.claim()
+    original_connect = resources.store.connect
+    claim = Mock(side_effect=AssertionError("Startup must not claim jobs before commit"))
+    monkeypatch.setattr(resources.store, "claim", claim)
+
+    @contextmanager
+    def failing_commit():
+        with original_connect() as conn:
+            yield conn
+            raise OSError("fixture recovery commit failed")
+
+    monkeypatch.setattr(resources.store, "connect", failing_commit)
+    monkeypatch.setattr(main, "VideoResources", lambda: resources)
+    with asyncio.Runner() as runner:
+        async def run():
+            async with main.app.router.lifespan_context(main.app):
+                assert not resources.available
+                assert (await TestClient(main.app).arequest("GET", "/health")).status_code == 200
+        runner.run(run())
+    claim.assert_not_called()
+    assert not resources.worker.thread.is_alive()
+    assert Store(runtime).get("interrupted")["status"] == "processing"
+    assert Store(runtime).get("pending")["status"] == "pending"
+
+
+@pytest.mark.parametrize("failure", ["runtime", "storage", "worker"])
+def test_video_startup_failure_is_503_without_breaking_legacy(runtime, monkeypatch, failure):
+    if failure == "storage":
+        runtime.write_text("existing unrelated file", encoding="utf-8")
+    else:
+        store = Store(runtime)
+        store.add("interrupted", "one.mp4")
+        store.claim()
+        if failure == "runtime":
+            def unavailable():
+                raise ImportError("optional video dependency missing")
+            monkeypatch.setattr(service, "check_runtime", unavailable)
+        else:
+            class FailingWorker(FakeWorker):
+                def __init__(self, store):
+                    super().__init__(store)
+                    self.start.side_effect = OSError("thread unavailable")
+            monkeypatch.setattr(service, "Worker", FailingWorker)
+    with asyncio.Runner() as runner:
+        async def run():
+            async with main.app.router.lifespan_context(main.app):
+                client = TestClient(main.app)
+                response = await client.arequest("GET", "/api/v1/analyses")
+                assert response.status_code == 503
+                assert response.json() == {"detail": service.UNAVAILABLE_DETAIL}
+                assert (await client.arequest("GET", "/health")).status_code == 200
+                for path in ("/detect", "/bcs"):
+                    assert (await client.arequest("POST", path, image_upload(), IMAGE_HEADERS)).status_code == 200
+        runner.run(run())
+    if failure != "storage":
+        assert Store(runtime).get("interrupted")["status"] == "processing"
+    else:
+        assert runtime.read_text(encoding="utf-8") == "existing unrelated file"
+
+
+def test_missing_build_is_only_a_video_ui_failure(client, tmp_path, monkeypatch):
+    mount = next(route for route in main.app.routes if isinstance(getattr(route, "app", None), webapp.VideoUI))
+    monkeypatch.setattr(mount.app, "directory", tmp_path / "missing-build")
+    assert client.get("/videos/").status_code == 503
+    assert client.get("/api/v1/analyses").status_code == 200
+    assert client.get("/ui").status_code == 200
+    assert client.get("/health").status_code == 200
+
+
+def test_video_static_assets_use_prefix_without_overriding_legacy(client, tmp_path, monkeypatch):
+    # A tiny build fixture keeps Python tests independent of installed npm packages.
+    directory = tmp_path / "dist"
+    (directory / "assets").mkdir(parents=True)
+    (directory / "fonts").mkdir()
+    index = (webapp.ROOT / "web/index.html").read_text(encoding="utf-8")
+    (directory / "index.html").write_text(index, encoding="utf-8")
+    (directory / "assets/main.js").write_text("fixture", encoding="utf-8")
+    (directory / "assets/main.css").write_text("fixture", encoding="utf-8")
+    (directory / "fonts/Manrope-VariableFont_wght.woff2").write_bytes(b"font fixture")
+    (directory / "favicon.svg").write_text("fixture", encoding="utf-8")
+    (directory / "vacca_logo.png").write_bytes(b"logo fixture")
+    mount = next(route for route in main.app.routes if isinstance(getattr(route, "app", None), webapp.VideoUI))
+    monkeypatch.setattr(mount, "app", webapp.VideoUI(directory))
+    assert client.get("/videos/").content == (directory / "index.html").read_bytes()
+    for asset in ("assets/main.js", "assets/main.css", "favicon.svg", "vacca_logo.png", "fonts/Manrope-VariableFont_wght.woff2"):
+        assert client.get(f"/videos/{asset}").status_code == 200
+    assert 'src="/videos/assets/main.js"' in index
+    assert 'href="/videos/assets/main.css"' in index
+    assert client.get("/assets/main.js").status_code == 404
+
+
+@pytest.mark.parametrize("path", ["/api/v1/analyses", "/videos/", "/api/v1/analyses/missing/results"])
+def test_remote_peer_cannot_spoof_local_headers_but_legacy_routes_stay_available(client, path):
+    remote = TestClient(main.app, client_host="192.0.2.10", runner=client.runner)
+    assert remote.get(path, headers={"host": "localhost"}).status_code == 403
+    assert remote.get(path, headers={"host": "127.0.0.1", "x-forwarded-for": "127.0.0.1"}).status_code == 403
+    headers = {"host": "public.example", "origin": "http://elsewhere.example"}
+    for legacy in ("/health", "/ui", "/docs", "/metrics", "/ready/bcs"):
+        assert remote.get(legacy, headers=headers).status_code == 200
+    for legacy in ("/detect", "/bcs"):
+        assert remote.post(legacy, content=image_upload(), headers=dict(IMAGE_HEADERS, **headers)).status_code == 200
+
+
+@pytest.mark.parametrize("peer,host", [
+    ("127.0.0.1", "localhost"), ("127.0.0.2", "127.0.0.2:8001"),
+    ("::1", "[::1]:8001"), ("::ffff:127.0.0.1", "localhost"),
+])
+def test_loopback_clients_and_same_origin_upload(client, peer, host):
+    local = TestClient(main.app, client_host=peer, runner=client.runner)
+    assert local.get("/api/v1/analyses", headers={"host": host}).status_code == 200
+    assert local.post("/api/v1/analyses?filename=cow.mp4", content=b"0000ftypisom0000",
+                      headers={"host": host, "origin": f"http://{host}"}).status_code == 202
+
+
+def test_video_host_origin_and_proxy_rejection_are_scoped(client):
+    assert client.get("/api/v1/analyses", headers={"host": "public.example"}).status_code == 400
+    assert client.post("/api/v1/analyses?filename=cow.mp4", headers={"origin": "http://evil.example"}).status_code == 403
+    assert client.get("/videos/", headers={"x-forwarded-for": "127.0.0.1"}).status_code == 403
+    assert client.get("/api/v1/analyses", headers={"host": "testserver"}).status_code == 400
+    unknown = TestClient(main.app, client_host="testclient", runner=client.runner)
+    assert unknown.get("/api/v1/analyses").status_code == 403
+
+
+def test_asgi_root_path_cannot_bypass_video_local_security(client):
+    remote = TestClient(main.app, client_host="192.0.2.10", runner=client.runner, root_path="/prefix")
+    assert remote.get("/prefix/api/v1/analyses").status_code == 403
+    assert remote.get("/prefix/videos/").status_code == 403
+    assert remote.get("/prefix/health").status_code == 200
+    local = TestClient(main.app, runner=client.runner, root_path="/prefix")
+    assert local.get("/prefix/api/v1/analyses", headers={"origin": "http://localhost"}).status_code == 200
+
+
+def test_video_upload_lock_and_processing_job_do_not_gate_image_or_bcs(client):
+    async def run():
+        video = main.app.state.video
+        video.store.add("processing", "existing.mp4")
+        video.store.update("processing", "processing")
+        await video.upload_lock.acquire()
+        upload = asyncio.create_task(client.arequest(
+            "POST", "/api/v1/analyses?filename=cow.mp4", b"0000ftypisom0000"
+        ))
+        try:
+            await asyncio.sleep(0)
+            assert not upload.done()
+            for path in ("/detect", "/bcs"):
+                response = await asyncio.wait_for(client.arequest("POST", path, image_upload(), IMAGE_HEADERS), 3)
+                assert response.status_code == 200
+            assert (await client.arequest("GET", "/health")).status_code == 200
+            assert not upload.done()
+        finally:
+            video.upload_lock.release()
+        assert (await asyncio.wait_for(upload, 3)).status_code == 202
+    client.runner.run(run())
+
+
+def test_completed_video_artifacts_preserve_paths_and_nullable_fields(client):
+    job_id = submit(client).json()["id"]
+    store = main.app.state.video.store
+    path = store.directory / job_id / "result"
+    (path / "frames").mkdir(parents=True)
+    frame = {"frame_index": 0, "timestamp_ms": 0, "detection_count": 0, "extra": None}
+    (path / "detections.jsonl").write_text(json.dumps(frame) + "\n", encoding="utf-8")
+    (path / "summary.json").write_text('{"schema_version":"vacca-video-summary-v1","custom":null}', encoding="utf-8")
+    (path / "frames/000000.jpg").write_bytes(b"fixture")
+    store.update(job_id, "completed")
+    data = client.get(f"/api/v1/analyses/{job_id}/frames").json()
+    assert data["items"][0] == dict(frame, image_url=f"/api/v1/analyses/{job_id}/frames/0/image")
+    assert client.get(data["items"][0]["image_url"]).content == b"fixture"
+    assert client.get(f"/api/v1/analyses/{job_id}/results").status_code == 200
+    assert client.get(f"/api/v1/analyses/{job_id}").json()["summary"]["custom"] is None
+
+
+def test_compatibility_launcher_delegates_to_principal(monkeypatch):
+    launch = Mock()
+    monkeypatch.setattr(run_api, "main", launch)
+    run_video_web.main(["--open", "--port", "8001"])
+    launch.assert_called_once_with(["--open", "--port", "8001"])
+
+
+@pytest.mark.parametrize("host,browser_host", [
+    ("127.0.0.1", "127.0.0.1"), ("0.0.0.0", "127.0.0.1"), ("::", "[::1]"),
+])
+def test_primary_open_preserves_existing_flags_and_opens_videos(monkeypatch, host, browser_host):
+    from vacca_api import browser
+
+    launch = Mock()
+    monkeypatch.setattr(browser, "run_with_browser", launch)
+    run_api.main(["--open", "--host", host, "--port", "8123", "--reload"])
+    launch.assert_called_once_with(host=host, port=8123, reload=True,
+                                   url=f"http://{browser_host}:8123/videos/")

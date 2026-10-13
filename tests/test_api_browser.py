@@ -9,6 +9,7 @@ import pytest
 import uvicorn
 
 from vacca_api import browser
+from scripts import run_api
 
 
 def server(opened=None):
@@ -224,6 +225,41 @@ def test_reload_uses_serving_child_and_does_not_open_again(monkeypatch):
     assert len(supervised) == 1
     launch.assert_called_once_with("http://127.0.0.1:8123/videos/")
     socket.close.assert_called_once()
+
+
+@pytest.mark.parametrize("open_browser", [False, True])
+@pytest.mark.parametrize("reload", [False, True])
+def test_launcher_rejects_real_env_multiworker_config_before_startup(monkeypatch, open_browser, reload):
+    from vacca_video import service
+    from vacca_video.store import Store
+
+    monkeypatch.setenv("WEB_CONCURRENCY", "2")
+    real_config = uvicorn.Config
+    configs = []
+
+    def configure(*args, **kwargs):
+        config = real_config(*args, **kwargs)
+        configs.append(config)
+        return config
+
+    launch = Mock(side_effect=AssertionError("No server may run"))
+    bind = Mock(side_effect=AssertionError("No socket may bind"))
+    load = Mock(side_effect=AssertionError("No app may load"))
+    recover = Mock(side_effect=AssertionError("No history may recover"))
+    prepare = Mock(side_effect=AssertionError("No video storage may initialize"))
+    monkeypatch.setattr(uvicorn, "Config", configure)
+    monkeypatch.setattr(uvicorn, "run", launch)
+    monkeypatch.setattr(real_config, "bind_socket", bind)
+    monkeypatch.setattr(real_config, "load_app", load)
+    monkeypatch.setattr(Store, "recover", recover)
+    monkeypatch.setattr(service.VideoResources, "prepare", prepare)
+    args = (["--open"] if open_browser else []) + (["--reload"] if reload else [])
+    with pytest.raises(SystemExit, match="effective Uvicorn workers=2") as failure:
+        run_api.main(args)
+    assert "WEB_CONCURRENCY=1" in str(failure.value)
+    assert len(configs) == 1 and configs[0].workers == 2 and not configs[0].loaded
+    for operation in (launch, bind, load, recover, prepare):
+        operation.assert_not_called()
 
 
 @pytest.mark.parametrize("reload", [False, True])
