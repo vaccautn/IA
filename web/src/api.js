@@ -6,7 +6,7 @@ async function request(path, options) {
   return data;
 }
 export const videoApi = {
-  list: () => request("/analyses"),
-  upload: (file) => request(`/analyses?filename=${encodeURIComponent(file.name)}`, { method: "POST", body: file, headers: { "Content-Type": "video/mp4" } }),
-  frames: (id, offset) => request(`/analyses/${id}/frames?offset=${offset}&limit=1`)
+  list: (signal) => request("/analyses", { signal }),
+  upload: (file, signal) => request(`/analyses?filename=${encodeURIComponent(file.name)}`, { method: "POST", body: file, headers: { "Content-Type": "video/mp4" }, signal }),
+  frames: (id, offset, signal) => request(`/analyses/${id}/frames?offset=${offset}&limit=1`, { signal })
 };

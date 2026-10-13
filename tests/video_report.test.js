@@ -80,3 +80,78 @@ test('no-video mode hides video download and no frames disables playback', () =>
   // The script deliberately leaves the disabled markup unchanged.
   assert.equal(get('play').disabled, true);
 });
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+test('web frame owner aborts reselection and ignores stale results and errors', async () => {
+  const { createRequestOwner } = await import('../web/src/requests.js');
+  const owner = createRequestOwner(), first = deferred(), second = deferred();
+  const values = [], errors = [];
+  let signal;
+  const old = owner.run((value) => { signal = value; return first.promise; },
+    (value) => values.push(value), (error) => errors.push(error));
+  const latest = owner.run(() => second.promise,
+    (value) => values.push(value), (error) => errors.push(error));
+  assert.equal(signal.aborted, true);
+  second.resolve({ image_url: 'new.jpg', detection_count: 2 });
+  await latest;
+  first.reject(new Error('late failure'));
+  await old;
+  assert.deepEqual(values, [{ image_url: 'new.jpg', detection_count: 2 }]);
+  assert.deepEqual(errors, []);
+});
+
+test('web request cleanup suppresses late upload and list results', async () => {
+  const { createRequestOwner } = await import('../web/src/requests.js');
+  for (const result of [{ id: 'uploaded' }, [{ id: 'old-list' }]]) {
+    const owner = createRequestOwner(), request = deferred(), values = [];
+    const pending = owner.run(() => request.promise,
+      (value) => values.push(value), (error) => values.push(error));
+    owner.cancel();
+    request.resolve(result);
+    await pending;
+    assert.deepEqual(values, []);
+  }
+});
+
+test('web polling waits for settlement and cleanup cannot schedule another poll', async () => {
+  const { startPolling } = await import('../web/src/requests.js');
+  const request = deferred(), timers = new Map(), delays = [];
+  let calls = 0;
+  const clock = {
+    setTimeout(callback, delay) { timers.set(1, callback); delays.push(delay); return 1; },
+    clearTimeout(id) { timers.delete(id); }
+  };
+  const stop = startPolling(() => { calls++; return request.promise; }, 2000, clock);
+  assert.equal(calls, 1);
+  assert.equal(timers.size, 0);
+  request.resolve();
+  await Promise.resolve();
+  assert.deepEqual(delays, [2000]);
+  assert.equal(calls, 1);
+  stop();
+  assert.equal(timers.size, 0);
+
+  const late = deferred();
+  const stopBeforeSettlement = startPolling(() => late.promise, 2000, clock);
+  stopBeforeSettlement();
+  late.resolve();
+  await Promise.resolve();
+  assert.equal(timers.size, 0);
+  assert.deepEqual(delays, [2000]);
+});
+
+test('web current request failure is reported without stopping the next poll', async () => {
+  const { createRequestOwner } = await import('../web/src/requests.js');
+  const owner = createRequestOwner(), errors = [], values = [];
+  await owner.run(() => Promise.reject(new Error('offline')),
+    (value) => values.push(value), (error) => errors.push(error.message));
+  await owner.run(() => Promise.resolve([]),
+    (value) => values.push(value), (error) => errors.push(error.message));
+  assert.deepEqual(errors, ['offline']);
+  assert.deepEqual(values, [[]]);
+});
