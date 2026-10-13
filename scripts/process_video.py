@@ -15,24 +15,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from vacca_video.pipeline import SamplingConfig, process_frames  # noqa: E402
+from vacca_video.policies import (  # noqa: E402
+    CLI_PREVIEW_LIMIT,
+    DEFAULT_MAX_FRAMES,
+    DEFAULT_SAMPLE_FPS,
+)
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="VACCA: detección en video grabado")
     result.add_argument("input", type=Path, help="Video local; no webcam ni URL")
     result.add_argument("--output", type=Path, help="Carpeta nueva para los resultados")
-    result.add_argument("--sample-fps", type=float, default=5.0)
+    result.add_argument("--sample-fps", type=float, default=DEFAULT_SAMPLE_FPS)
     result.add_argument(
         "--max-frames",
         type=int,
-        default=300,
+        default=DEFAULT_MAX_FRAMES,
         help="Frames analizados; 0 = todo el video",
     )
     result.add_argument("--confidence", type=float, default=0.25)
     result.add_argument(
         "--preview-limit",
         type=int,
-        default=120,
+        default=CLI_PREVIEW_LIMIT,
         help="Imágenes del HTML, entre 1 y 1000",
     )
     result.add_argument(
@@ -48,7 +53,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         config = SamplingConfig(
-            args.sample_fps, None if args.max_frames == 0 else args.max_frames
+            sample_fps=args.sample_fps,
+            max_frames=None if args.max_frames == 0 else args.max_frames,
         )
         if not 1 <= args.preview_limit <= 1000:
             raise ValueError("preview-limit debe estar entre 1 y 1000")
@@ -99,11 +105,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
             with PresentationSink(
-                output,
-                source.metadata,
-                config.sample_fps,
-                args.preview_limit,
-                not args.no_video,
+                output=output,
+                source=source.metadata,
+                sample_fps=config.sample_fps,
+                preview_limit=args.preview_limit,
+                write_video=not args.no_video,
             ) as sink:
                 try:
                     process_frames(source, detector, sink, config, summary, progress)

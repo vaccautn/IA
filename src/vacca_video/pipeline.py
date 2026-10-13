@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 from time import perf_counter
 from typing import Any, Callable, Iterable, Protocol
 
+from .policies import DEFAULT_MAX_FRAMES, DEFAULT_SAMPLE_FPS
+
 
 @dataclass(frozen=True)
 class Frame:
@@ -18,8 +20,8 @@ class Frame:
 
 @dataclass(frozen=True)
 class SamplingConfig:
-    sample_fps: float = 5.0
-    max_frames: int | None = 300
+    sample_fps: float = DEFAULT_SAMPLE_FPS
+    max_frames: int | None = DEFAULT_MAX_FRAMES
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.sample_fps) or not 0 < self.sample_fps <= 120:

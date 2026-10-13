@@ -7,8 +7,8 @@ YOLO de VACCA devuelve cajas y confianza. El comando genera una presentación HT
 local, un MP4 anotado y resultados JSONL por frame. No necesita backend,
 PostgreSQL, R2, frontend, cámara, conexión a Internet durante la inferencia ni BCS.
 
-La primera entrega está aislada en `feature/deteccion-video`, creada desde
-`develop` en un worktree `IA-video`. La base usada es
+La primera entrega se creó en `feature/deteccion-video` desde `develop` en un
+worktree separado. El checkout actual es `IA`. La base original usada es
 `2024ec951c3d54995d6c3147773066b517232199`. Los contratos y el código de `/detect`
 y `/bcs` no cambian. No hay tracking, identificación individual ni condición
 corporal: el número indica **vacas visibles en un frame**, no animales únicos.
@@ -30,7 +30,7 @@ servidor nuevo para esta demostración local.
 ### Abrir con botones en Windows
 
 En el entorno local ya preparado, hacer doble clic en **`Abrir VACCA.vbs`**
-en la raíz de `IA-video`. Se abre una ventana sin consola: elegir un video,
+en la raíz de `IA`. Se abre una ventana sin consola: elegir un video,
 presionar **Procesar video**, esperar y presionar **Abrir resultados**.
 El procesamiento se ejecuta en segundo plano y muestra su salida en la ventana.
 Cada ejecución crea su propia carpeta; no sobrescribe resultados anteriores.
@@ -51,7 +51,7 @@ sirven para explorar fallos; no reemplazan una evaluación etiquetada del campo.
 El ejemplo `outputs/fixtures/synthetic-cow.mp4` está armado con fotos y no sirve
 para medir precisión sobre animales en movimiento.
 
-Desde la carpeta del worktree, utilizar **Python 3.13 en Windows x64**, que es la
+Desde la carpeta `IA`, utilizar **Python 3.13 en Windows x64**, que es la
 plataforma de los locks actuales del proyecto:
 
 ```powershell
@@ -179,6 +179,9 @@ flowchart LR
   una optimización posterior, con pruebas de equivalencia.
 - `output.py` escribe JSONL y MP4 incrementalmente. Conserva como archivos solo
   los primeros `preview_limit` JPEGs y no retiene todo el historial en Python.
+- `policies.py` define los valores predeterminados de video. El CLI y el escritorio
+  conservan 120 imágenes de vista previa; la web conserva los 300 frames analizados
+  y omite el MP4. Las opciones de detector siguen siendo propias del adaptador.
 - El proceso es secuencial: no comparte el singleton de la API ni incorpora
   concurrencia sobre el modelo. Usa un proceso separado y no necesita puertos.
 

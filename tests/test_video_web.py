@@ -193,3 +193,21 @@ def test_worker_error_is_persisted(client, monkeypatch):
     monkeypatch.setattr(webapp.subprocess, "Popen", fail)
     worker.loop()
     assert client.app.state.store.get(job_id)["status"] == "failed"
+
+
+def test_video_policy_matches_ui_and_cli():
+    import re
+
+    from scripts.process_video import parser
+    from vacca_video.pipeline import SamplingConfig
+    from vacca_video import policies
+
+    policy = (webapp.ROOT / "web/src/policy.js").read_text(encoding="utf-8")
+    upload = re.search(r"MAX_UPLOAD_BYTES = (\d+) \* 1024 \* 1024", policy)
+    assert int(upload[1]) * 1024 * 1024 == policies.WEB_MAX_UPLOAD_BYTES
+    assert f"SAMPLE_FPS = {policies.DEFAULT_SAMPLE_FPS:g};" in policy
+    assert f"MAX_FRAMES = {policies.DEFAULT_MAX_FRAMES};" in policy
+    args = parser().parse_args(["fixture.mp4"])
+    assert args.sample_fps == SamplingConfig().sample_fps
+    assert args.max_frames == SamplingConfig().max_frames
+    assert args.preview_limit == policies.CLI_PREVIEW_LIMIT == 120

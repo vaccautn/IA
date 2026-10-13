@@ -15,6 +15,9 @@ from uuid import uuid4
 import webbrowser
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from vacca_video.policies import DEFAULT_MAX_FRAMES  # noqa: E402
 
 
 class VideoApp:
@@ -107,7 +110,7 @@ class VideoApp:
             "--output",
             str(self.output),
             "--max-frames",
-            "0" if self.full.get() else "300",
+            "0" if self.full.get() else str(DEFAULT_MAX_FRAMES),
         ]
         self.busy = True
         for widget in (self.run, self.choose, self.check, self.open_button):

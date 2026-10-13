@@ -7,6 +7,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from .pipeline import Frame
+from .policies import CLI_PREVIEW_LIMIT
 
 
 def json_text(value) -> str:
@@ -19,7 +20,7 @@ class PresentationSink:
         output: Path,
         source: dict,
         sample_fps: float,
-        preview_limit: int = 120,
+        preview_limit: int = CLI_PREVIEW_LIMIT,
         write_video: bool = True,
     ) -> None:
         if not 1 <= preview_limit <= 1000:

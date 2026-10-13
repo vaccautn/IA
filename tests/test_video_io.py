@@ -196,6 +196,34 @@ class VideoIOTests(unittest.TestCase):
             capture.release()
         self.assertEqual(decoded, 5)
 
+    def test_desktop_launcher_preserves_default_and_unlimited_cli_modes(self):
+        from types import SimpleNamespace
+
+        from scripts.video_gui import VideoApp
+
+        widget = SimpleNamespace(configure=lambda **kwargs: None)
+        for full, expected in ((False, "300"), (True, "0")):
+            with self.subTest(full=full):
+                app = VideoApp.__new__(VideoApp)
+                app.busy = False
+                app.path = SimpleNamespace(get=lambda: str(self.input))
+                app.full = SimpleNamespace(get=lambda: full)
+                app.run = app.choose = app.check = app.open_button = widget
+                app.log = SimpleNamespace(
+                    configure=lambda **kwargs: None, delete=lambda *args: None
+                )
+                app.status = SimpleNamespace(set=lambda value: None)
+                app.bar = SimpleNamespace(start=lambda: None)
+                with patch("scripts.video_gui.threading.Thread") as thread:
+                    app.start()
+                command = thread.call_args.kwargs["args"][0]
+                self.assertEqual(command[command.index("--max-frames") + 1], expected)
+                self.assertEqual(Path(command[3]), self.input.resolve())
+                self.assertNotIn("--no-video", command)
+                self.assertNotIn("--preview-limit", command)
+                self.assertEqual(app.output.parent.name, "video")
+                thread.return_value.start.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
