@@ -71,6 +71,7 @@ pueden incorporarse al build y al AppLayout del frontend oficial.
 | src/vacca_video/service.py | Recursos de video: disponibilidad, inicio, recuperación transaccional y cierre |
 | src/vacca_video/store.py | Persistencia SQLite, recuperación y reclamación transaccional |
 | src/vacca_video/worker.py | Un trabajo a la vez, subproceso CLI y cierre por interrupción o tiempo límite |
+| src/vacca_api/owned_inference.py | Trabajo BCS nativo con permiso retenido hasta su finalización |
 | src/vacca_video/schemas.py y policies.py | DTOs de respuesta y políticas explícitas del módulo de video |
 | scripts/run_api.py | Arranque recomendado; --open abre /videos en el puerto elegido (8001 predeterminado) |
 | scripts/run_video_web.py | Entrada compatible que delega al mismo arranque principal, no otro servidor |

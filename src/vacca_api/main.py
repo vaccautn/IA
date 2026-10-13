@@ -35,6 +35,7 @@ from .schemas import (
     MetricsResponse,
 )
 from .metrics import PrototypeMetrics
+from .owned_inference import run_owned
 from .upload_validation import (
     UploadTooLargeError,
     UploadValidationError,
@@ -72,6 +73,7 @@ class InferenceCapacityGate:
         self.capacity = capacity
         self.acquisition_timeout = acquisition_timeout
         self._semaphore = asyncio.BoundedSemaphore(capacity)
+        self._work_threads = set()
 
     async def acquire(self) -> None:
         try:
@@ -236,16 +238,29 @@ async def bcs(file: UploadFile = File(...)) -> BCSResponse:
         metrics.client_rejection("bcs", (perf_counter() - request_started) * 1000)
         _raise_upload_http_exception(exc)
 
+    return await evaluate_bcs(image_bytes, request_started=request_started, counted=True)
+
+
+async def evaluate_bcs(image_bytes: bytes, *, internal=False, request_started=None, counted=False):
+    """Shared parent-runtime application operation for HTTP and video callers."""
+    request_started = perf_counter() if request_started is None else request_started
+    metrics = app.state.metrics
+    if not counted:
+        metrics.request("bcs")
     gate = app.state.bcs_inference_gate
     try:
         await gate.acquire()
     except InferenceCapacityBusyError:
         metrics.busy("bcs", (perf_counter() - request_started) * 1000)
         raise HTTPException(status_code=503, detail=INFERENCE_CAPACITY_BUSY_DETAIL) from None
+    return await run_owned(gate, lambda: _execute_bcs(image_bytes, metrics, request_started, internal))
+
+
+def _execute_bcs(image_bytes, metrics, request_started, internal):
     try:
         try:
-            runtime = await run_in_threadpool(get_bcs_runtime)
-            service = await run_in_threadpool(runtime.get_service)
+            runtime = get_bcs_runtime()
+            service = runtime.get_service()
         except Exception as exc:
             metrics.server_runtime_failure("bcs", (perf_counter() - request_started) * 1000)
             logger.error("BCS runtime unavailable: %s", type(exc).__name__)
@@ -253,10 +268,15 @@ async def bcs(file: UploadFile = File(...)) -> BCSResponse:
 
         started = perf_counter()
         try:
-            result = await run_in_threadpool(service.infer, image_bytes)
+            result = service.infer(image_bytes)
+            if type(result.bcs_category) is not int or not 1 <= result.bcs_category <= 5:
+                raise ValueError("BCS service returned an invalid category")
         except Exception as exc:
             if _is_bcs_input_error(exc):
-                metrics.client_rejection("bcs", (perf_counter() - request_started) * 1000)
+                if internal:
+                    metrics.server_runtime_failure("bcs", (perf_counter() - request_started) * 1000)
+                else:
+                    metrics.client_rejection("bcs", (perf_counter() - request_started) * 1000)
                 logger.info("BCS image input rejected: %s", type(exc).__name__)
                 raise HTTPException(status_code=400, detail="BCS image input is invalid") from None
             metrics.inference_failure(
@@ -270,8 +290,8 @@ async def bcs(file: UploadFile = File(...)) -> BCSResponse:
         metrics.inference_success(
             "bcs", inference_time_ms, (perf_counter() - request_started) * 1000
         )
-    finally:
-        gate.release()
+    except HTTPException:
+        raise
 
     model_status = _runtime_model_status(runtime)
     package_id = getattr(runtime, "package_id", None)
@@ -279,7 +299,9 @@ async def bcs(file: UploadFile = File(...)) -> BCSResponse:
         message = "Experimental BCS category 1..5 computed successfully; not approved for production."
     else:
         message = "BCS category 1..5 computed successfully."
-    return BCSResponse(
+    response_type = _BCSApplicationResponse if internal else BCSResponse
+    provenance = {"lineage": _bcs_lineage(result)} if internal else {}
+    return response_type(
         status="ok",
         message=message,
         cow_detected=None,
@@ -287,7 +309,28 @@ async def bcs(file: UploadFile = File(...)) -> BCSResponse:
         model_status=model_status,
         package_id=package_id,
         inference_time_ms=round(inference_time_ms, 2),
+        **provenance,
     )
+
+
+class _BCSApplicationResponse(BCSResponse):
+    """Internal extension; the public /bcs response schema remains unchanged."""
+
+    lineage: dict | None = None
+
+
+def _bcs_lineage(result):
+    lineage = getattr(result, "lineage", None)
+    if lineage is None:
+        return None
+    fields = (
+        "checkpoint_schema_version", "domain_id", "snapshot_schema", "snapshot_identity",
+        "dataset_manifest_digest", "run_id", "source_schema", "source_identity_scheme",
+        "observed_classes", "missing_classes", "source_mapping",
+    )
+    return {field: dict(getattr(lineage, field)) if field == "source_mapping"
+            else list(getattr(lineage, field)) if field in {"observed_classes", "missing_classes"}
+            else getattr(lineage, field) for field in fields}
 
 
 def get_bcs_runtime():
