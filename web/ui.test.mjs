@@ -132,7 +132,7 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     };
     await page.route("**/api/v1/**", async (route) => {
       const request = route.request(), endpoint = new URL(request.url());
-      if (/\/frames\/\d+\/image$/.test(endpoint.pathname)) {
+      if (/\/frames\/\d+\/image$/.test(endpoint.pathname) || endpoint.pathname.endsWith("/candidate/image")) {
         return route.fulfill({ contentType: "image/svg+xml", body: svg });
       }
       let result;
@@ -225,6 +225,50 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     assert.equal(await page.getByRole("slider").inputValue(), "2");
     assert.equal(await page.locator(".viewer img").getAttribute("src"), "/api/v1/analyses/b/frames/2/image");
     assert.match(await page.locator(".viewer img").getAttribute("alt"), /2\.40 segundos con 3 detecciones/);
+  });
+
+  await t.test("BCS belongs to its selected original frame, not the current preview", async (t) => {
+    const { page, mock } = await fixture(t);
+    const selected = { frame_index: 97, sample_ordinal: 2, timestamp_ms: 19400,
+      timestamp_source: "decoder", detector_confidence: 0.9123, target_index: 0,
+      original_bbox: { x1: 10, y1: 8, x2: 30, y2: 24 },
+      artifact: "candidate.png", encoding: "PNG", image_width: 1920, image_height: 1080,
+      detector_model: { name: "fake", sha256: "fake-hash", confidence: 0.25 } };
+    const update = async (bcs, candidate = selected) => {
+      mock.history = () => reply([{ ...job("a"), summary: {
+        candidate, bcs, selection_policy: "exactly_one_detected_cow_highest_confidence_first_tie"
+      } }, job("b")]);
+      await page.waitForFunction(() => window.timerCounts().poll === 1);
+      await page.evaluate(() => window.advanceVideoTimers(false));
+    };
+    await update({ status: "completed", bcs_category: 4, model_status: "experimental_not_approved", package_id: "fake-package", reason: null });
+    const result = page.getByRole("region", { name: "BCS del frame seleccionado" });
+    await result.getByText("Categoría experimental BCS: 4 / 5", { exact: true }).waitFor();
+    assert.match(await result.textContent(), /19\.40 s.*97/);
+    assert.match(await result.textContent(), /91\.23 %/);
+    assert.match(await result.textContent(), /fake-package/);
+    assert.match(await result.textContent(), /No aprobado para producción/);
+    assert.equal(await result.locator("img").getAttribute("src"), "/api/v1/analyses/a/candidate/image");
+    assert.match(await result.locator("img").getAttribute("alt"), /original.*19\.40/);
+    assert.equal(await page.locator(".viewer img").getAttribute("src"), "/api/v1/analyses/a/frames/0/image");
+    await page.getByRole("slider").fill("1");
+    await page.locator('.viewer img[src="/api/v1/analyses/a/frames/1/image"]').waitFor();
+    assert.match(await result.textContent(), /19\.40 s/);
+    for (const [status, reason, text] of [
+      ["busy", "capacity_busy", "capacidad BCS está ocupada"],
+      ["unavailable", "capability_unavailable", "no está disponible"],
+      ["failed", "inference_failed", "Falló la evaluación"],
+      ["invalid_input", "image_rejected", "imagen original no cumple"],
+      ["not_evaluated", "no_eligible_frame", "No se puede evaluar"]
+    ]) {
+      await update({ status, reason }, reason === "no_eligible_frame" ? null : selected);
+      await result.getByText(new RegExp(text)).waitFor();
+      assert.equal(await result.getByText(/Categoría experimental BCS:/).count(), 0);
+    }
+    assert.equal(await result.locator("img").count(), 0);
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await page.locator('.viewer img[src="/api/v1/analyses/b/frames/0/image"]').waitFor();
+    assert.equal(await result.count(), 0, "Old jobs without BCS still work");
   });
 
   await t.test("failed upload clears busy and renders the API error", async (t) => {

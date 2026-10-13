@@ -33,9 +33,38 @@ export function Results({ job, count, frame, index, playing, setPlaying, setInde
     {job?.status === "processing" && <div className="notice" role="status"><span className="spinner" /> Procesando · {count} frames analizados. La carga inicial del modelo puede tardar.</div>}
     {job?.error && <div className="alert" role="alert">{job.error}</div>}
     {job?.summary?.stop_reason === "frame_limit" && <div className="notice">Resultado parcial: se alcanzó el límite de {MAX_FRAMES} frames.</div>}
+    <CandidateBCS job={job} />
     {count > 0 ? <><div className="metrics"><div><span>Frames analizados</span><strong>{count}</strong></div><div><span>Detecciones en este frame</span><strong>{frame?.detection_count ?? "\u2014"}</strong></div><div><span>Tiempo en el video</span><strong>{frame ? `${(frame.timestamp_ms / 1e3).toFixed(2)} s` : "\u2014"}</strong></div></div><div className="viewer">{frame ? <img key={frame.image_url} src={frame.image_url} alt={`Frame a ${(frame.timestamp_ms / 1e3).toFixed(2)} segundos con ${frame.detection_count} detecciones`} /> : <span>Cargando frame…</span>}</div><div className="controls"><button className="secondary" onClick={() => setPlaying(!playing)}>{playing ? "Pausar" : "Reproducir frames"}</button><input aria-label="Frame del análisis" type="range" min="0" max={Math.max(0, count - 1)} value={index} onChange={(event) => {
       setPlaying(false);
       setIndex(Number(event.target.value));
     }} /><span>{index + 1} / {count}</span></div><p className="hint">Vista de frames muestreados. La reproducción del visor no representa la velocidad original del video.</p></> : <div className="empty result-empty"><Icon size={42} /><strong>{job ? "Preparando las detecciones" : "Tu video, con m\xE1s informaci\xF3n"}</strong><span>Vas a ver cajas, cantidades y el momento de cada detección.</span></div>}
+  </section>;
+}
+
+function CandidateBCS({ job }) {
+  const candidate = job?.summary?.candidate, bcs = job?.summary?.bcs;
+  if (!bcs || job.status !== "completed") return null;
+  const explanations = {
+    no_eligible_frame: "No se puede evaluar: ningún frame muestreado tiene exactamente una detección de vaca.",
+    capacity_busy: "No evaluado: la capacidad BCS está ocupada. No se reintenta automáticamente.",
+    capability_unavailable: "La capacidad BCS no está disponible en este servicio.",
+    inference_failed: "Falló la evaluación BCS. Las detecciones del video se conservaron.",
+    image_rejected: "La imagen original no cumple los límites de entrada BCS. No se recorta ni se reduce.",
+    invalid_candidate: "La imagen original no cumple el contrato del candidato. No se evaluó BCS.",
+    metadata_write_failed: "No se pudo guardar el resultado BCS. No hay un resultado confirmado disponible.",
+    evaluation_timeout: "No evaluado: se alcanzó el tiempo máximo de espera BCS.",
+    web_api_only: "BCS no evaluado: el CLI y el escritorio solo seleccionan el candidato.",
+  };
+  return <section className="candidate-bcs" aria-label="BCS del frame seleccionado">
+    <h3>BCS del frame seleccionado</h3>
+    {candidate && <><p>Frame seleccionado: {(candidate.timestamp_ms / 1000).toFixed(2)} s · índice original {candidate.frame_index}</p>
+      <p>Confianza del detector: {(candidate.detector_confidence * 100).toFixed(2)} % · una detección de vaca</p>
+      <img src={`/api/v1/analyses/${encodeURIComponent(job.id)}/candidate/image`} alt={`Imagen original para BCS a ${(candidate.timestamp_ms / 1000).toFixed(2)} segundos, sin anotaciones`} />
+      <p className="hint">Imagen original completa para BCS, sin cajas ni recortes. Es independiente del frame actual del visor.</p></>}
+    {bcs.status === "completed" ? <><strong>Categoría experimental BCS: {bcs.bcs_category} / 5</strong>
+      <p>No aprobado para producción. Es una categoría ordinal del modelo, no un puntaje clínico estándar ni un diagnóstico.</p>
+      <p>Procedencia: {bcs.package_id ?? "paquete no informado"} · estado del modelo: {bcs.model_status ?? "no informado"}</p></>
+      : <p role="status">{explanations[bcs.reason] ?? "BCS no evaluado para este video."}</p>}
+    <p className="hint">Mejor confianza individual solo entre frames muestreados elegibles (hasta {MAX_FRAMES}), no entre todos los frames del video. El detector puede omitir otros animales; una detección no garantiza una sola vaca real. No hay identificación ni tracking.</p>
   </section>;
 }

@@ -1,6 +1,39 @@
 # VACCA Video en la API principal de IA
 
+Los nuevos análisis seleccionan el frame muestreado con **exactamente una
+detección de vaca** y mayor confianza individual del detector. Solo la web intenta
+evaluar BCS automáticamente con la imagen original completa. El CLI y el
+escritorio conservan el candidato, pero no ejecutan BCS.
+
+## Camino rápido
+
+En el entorno preparado, desde `IA`:
+
+```powershell
+.venv\Scripts\python.exe scripts/run_api.py --open
+```
+
+1. Abrir http://127.0.0.1:8001/videos/ si el navegador no se abre automáticamente.
+2. Cargar un **MP4 nuevo** y presionar **Procesar video**; esperar a que termine.
+3. Consultar **BCS del frame seleccionado**. Los trabajos del historial no reciben
+   una evaluación automática nueva; para probar el flujo, volver a cargar el video.
+
+La aplicación usa el **servicio BCS real existente** cuando está disponible, con
+carga diferida del paquete. Para instalarlo, seguir el
+[camino autorizado del README](../README.md#camino-rápido-desde-un-clon-limpio-sin-entrenamiento)
+con el paquete privado del equipo; no se requiere entrenar ni descargar otro modelo.
+Sin instalación o con capacidad no disponible, se conservan las detecciones y se
+informa que BCS no pudo evaluarse: **no hay una categoría ficticia de respaldo**.
+Las pruebas inyectan un servicio falso para verificar la integración de forma
+determinista; ese proveedor de prueba no es el runtime de la aplicación.
+
 ## Candidato y categoría BCS experimental
+
+1. Procesar el MP4 y consultar el panel **BCS del frame seleccionado**.
+2. Verificar su timestamp e índice original: no corresponde necesariamente al
+   frame que está mostrando el visor de detecciones.
+3. Leer el resultado o la explicación de por qué no pudo evaluarse. No se realiza
+   un reintento automático.
 
 La selección compara solo los frames analizados (hasta 300 a 5 FPS), no todos
 los frames del video. Descarta cero o varias detecciones; un empate de confianza
@@ -264,6 +297,39 @@ anterior es el camino validado para esta entrega.
 
 Es una base aislada para integrar, no la integración productiva ya terminada.
 
+## Validación registrada de video y BCS
+
+La última evidencia recibida para este cambio registra **655 pruebas Python
+aprobadas, 43 omitidas y 103 subtests** en la suite completa; la selección enfocada
+registra **175 aprobadas y 15 subtests**. También registra **19 pruebas Node**,
+Ruff y `git diff --check` sin errores. La última validación de la interfaz con Edge
+registra **7 escenarios y build aprobado**, anterior al último ajuste de seguridad
+Python; la interfaz no cambió después de esa validación. Estos resultados son
+evidencia de pruebas, no métricas de precisión; no se ejecutaron nuevamente para
+esta actualización de documentación.
+
+Para repetir la cobertura sin instalar dependencias ni ejecutar inferencia real,
+en el entorno ya preparado, desde `IA`:
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_video_candidate.py tests/test_video_bcs.py tests/test_video_api_integration.py tests/test_video_web.py tests/test_video_pipeline.py tests/test_video_io.py tests/test_api_uploads.py tests/test_vacca_api_contract.py -q
+.venv\Scripts\python.exe -m pytest --disable-warnings --strict-config --strict-markers -W error::DeprecationWarning -q
+node --test tests/ui_controller.test.js tests/video_report.test.js
+.venv\Scripts\python.exe -m ruff check src scripts tests
+git diff --check
+# Desde IA/web, con las dependencias ya instaladas:
+npm run build
+npm test
+```
+
+La selección propuesta sirve para regresión; su conteo puede diferir del registro
+enfocado anterior. Los comandos no habilitan las pruebas privadas opt-in ni
+instalan el paquete BCS. **No se validaron aquí la carga de pesos privados, la
+disponibilidad del runtime real ni un recorrido real video → BCS.** Las pruebas
+simulan el servicio y las fallas para verificar contratos, admisión compartida,
+cancelación, PNG original, saneamiento de metadatos y conservación de detecciones.
+La cobertura renderizada de Edge usa la API simulada; no valida inferencia.
+
 ## Validación histórica del servicio independiente
 
 La verificación original siguiente corresponde al servicio independiente anterior
@@ -273,7 +339,8 @@ Build React: aprobado. El flujo HTTP real procesó el MP4 de Pexels 3769204:
 412 frames leídos, 83 analizados, 83 previews, finalización end_of_source,
 sin fallback temporal. Procesamiento de frames: 23.301 s, más carga del modelo.
 Esto demuestra el recorrido de archivos y resultados, no precisión de conteo
-ni capacidad de tiempo real. La suite completa de IA no se volvió a ejecutar.
+ni capacidad de tiempo real. La suite completa de IA no se volvió a ejecutar en
+esa verificación histórica; la evidencia posterior se detalla en la sección anterior.
 
 Prueba automatizada con Edge: carga de Manrope, resultados, selección de frame,
 reproducción, archivo inválido, recuperación al recargar y diseño móvil sin

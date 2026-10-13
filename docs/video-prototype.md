@@ -229,13 +229,14 @@ cancelación, fallas parciales, liberación del decodificador, no sobrescritura,
 vista previa acotada y un recorrido de codec real con detector de prueba.
 Ese recorrido no sustituye la ejecución explícita con los pesos reales.
 
-La ejecución realizada, las limitaciones de la suite completa y las
-sobredetecciones observadas están en el
+La ejecución histórica del 29 de septiembre, las limitaciones de la suite de
+esa revisión y las sobredetecciones observadas están en el
 [reporte de verificación](../reports/video-prototype-2026-09-29.md).
-La suite BCS escribe numerosos checkpoints temporales: en la máquina de esta
-revisión agotó el espacio disponible. Para verificar primero la detección sin
-esos escenarios, usar la selección acotada documentada en el reporte; no
-confundirla con una aprobación de todos los tests del repositorio.
+La suite BCS escribe numerosos checkpoints temporales: en aquella revisión
+agotó el espacio disponible. Ese incidente no describe el resultado actual:
+la [última validación registrada del cambio video → BCS](video-web.md#validación-registrada-de-video-y-bcs)
+incluye la suite pública completa. Los benchmarks históricos no son una ejecución
+nueva ni una validación del BCS real sobre video.
 
 ## Escalar sin mezclar el trabajo del equipo
 

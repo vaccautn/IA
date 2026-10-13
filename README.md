@@ -2,14 +2,18 @@
 
 ## Prototipo de video grabado
 
-**Aplicación web independiente:** abrir `Iniciar VACCA Video.cmd` y usar
-http://127.0.0.1:8010 para cargar videos, consultar el historial y explorar
-detecciones. Conserva la identidad visual del frontend VACCA y funciona sin
-modificar backend/frontend. Ver [arranque, arquitectura y contrato](docs/video-web.md).
+**Web local en la API principal:** desde `IA`, ejecutar
+`.venv\Scripts\python.exe scripts/run_api.py --open` y cargar un MP4 nuevo en
+http://127.0.0.1:8001/videos/. Permite consultar el historial y explorar detecciones;
+los trabajos antiguos no se evalúan automáticamente. Ver
+[arranque, candidato y categoría BCS experimental](docs/video-web.md).
 
 La rama de video incorpora una demo independiente con el detector existente:
 MP4 local → frames muestreados → cajas, conteo por frame, JSONL y presentación HTML.
-No necesita backend ni BCS y no modifica `/detect` ni `/bcs`.
+El CLI/escritorio no necesita backend ni BCS: conserva un candidato original sin
+evaluarlo. La web intenta BCS una sola vez con el runtime real existente cuando
+está disponible; no genera categorías simuladas si falta el paquete. Conserva los
+contratos públicos de `/detect` y `/bcs`.
 Consultar [ejecución, demostración y límites](docs/video-prototype.md).
 
 Microservicio de detección de bovinos con YOLO26n ajustado finamente sobre Navid HSM + BCS ScienceDB.
