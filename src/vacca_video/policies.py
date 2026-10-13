@@ -13,3 +13,12 @@ WORKER_TIMEOUT_SECONDS = 10 * 60
 WORKER_POLL_SECONDS = 0.5
 WORKER_TERMINATE_GRACE_SECONDS = 5
 WORKER_SHUTDOWN_JOIN_SECONDS = 10
+
+
+def require_single_server_process(workers: int) -> None:
+    if workers > 1:
+        raise SystemExit(
+            f"VACCA video requires one principal server process; effective Uvicorn workers={workers}. "
+            "Multiple workers are unsupported, including with --reload. "
+            "Unset WEB_CONCURRENCY or set WEB_CONCURRENCY=1."
+        )
