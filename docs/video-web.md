@@ -219,6 +219,10 @@ Desde `IA/web`, ejecutar `npm run build` y `npm test` en el entorno preparado co
 `npm ci`. La prueba requiere Edge instalado y las dependencias del lock existente
 (`react`, `react-dom`, `esbuild` y `playwright-core`); no descarga un navegador ni
 agrega librerías. Si falta Edge o alguna dependencia, falla: no omite la cobertura.
+El workflow [Public quality](../.github/workflows/public-quality.yml) ejecuta
+`npm ci`, `npm run build` y `npm test` desde `web` en el job Windows existente.
+Utiliza Node/npm y Edge incluidos en la imagen hospedada, sin descargar otro
+navegador. Un runner propio debe disponer también de esas herramientas.
 
 La prueba ejecuta `App` y `useVideoAnalysis` reales con respuestas HTTP simuladas
 y un servidor estático temporal en loopback en `/videos/`, incluidos los prefijos

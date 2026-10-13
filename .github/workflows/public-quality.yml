@@ -40,6 +40,21 @@ jobs:
         shell: pwsh
         run: node --test tests/ui_controller.test.js tests/video_report.test.js
 
+      - name: Install locked video web dependencies
+        shell: pwsh
+        working-directory: web
+        run: npm ci
+
+      - name: Build video web
+        shell: pwsh
+        working-directory: web
+        run: npm run build
+
+      - name: Run rendered video UI tests with installed Edge
+        shell: pwsh
+        working-directory: web
+        run: npm test
+
       - name: Run Ruff
         shell: pwsh
         run: python -m ruff check src scripts tests
