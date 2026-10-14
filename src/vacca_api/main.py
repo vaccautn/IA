@@ -20,7 +20,6 @@ from typing import AsyncIterator, NoReturn
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
-from starlette.concurrency import run_in_threadpool
 
 from vacca_video.service import VideoResources
 from vacca_video.webapp import configure_video
@@ -183,30 +182,26 @@ async def detect(request: Request, file: UploadFile = File(...)) -> DetectRespon
         raise HTTPException(status_code=503, detail=INFERENCE_CAPACITY_BUSY_DETAIL) from None
     started = perf_counter()
     try:
-        try:
-            detector = request.app.state.detector
-            detections, img_w, img_h, elapsed_ms = await run_in_threadpool(
-                detector.detect,
-                image_bytes,
-            )
-        except Exception as exc:
-            metrics.inference_failure(
-                "detect",
-                (perf_counter() - started) * 1000,
-                (perf_counter() - request_started) * 1000,
-            )
-            logger.error("Detection request failed: %s", type(exc).__name__)
-            raise HTTPException(
-                status_code=500,
-                detail="Detection failed — check server logs",
-            ) from None
-        metrics.inference_success(
+        detector = request.app.state.detector
+        detections, img_w, img_h, elapsed_ms = await run_owned(
+            gate,
+            lambda: _execute_detect(image_bytes, detector, metrics, request_started),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # A native-thread startup failure occurs before _execute_detect can own
+        # metrics; run_owned has already released the permit in that case.
+        metrics.inference_failure(
             "detect",
             (perf_counter() - started) * 1000,
             (perf_counter() - request_started) * 1000,
         )
-    finally:
-        gate.release()
+        logger.error("Detection request failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail="Detection failed — check server logs",
+        ) from None
 
     return DetectResponse(
         cow_detected=len(detections) > 0,
@@ -216,6 +211,29 @@ async def detect(request: Request, file: UploadFile = File(...)) -> DetectRespon
         image_height=img_h,
         inference_time_ms=round(elapsed_ms, 2),
     )
+
+
+def _execute_detect(image_bytes, detector, metrics, request_started):
+    started = perf_counter()
+    try:
+        detections, img_w, img_h, elapsed_ms = detector.detect(image_bytes)
+    except Exception as exc:
+        metrics.inference_failure(
+            "detect",
+            (perf_counter() - started) * 1000,
+            (perf_counter() - request_started) * 1000,
+        )
+        logger.error("Detection request failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail="Detection failed — check server logs",
+        ) from None
+    metrics.inference_success(
+        "detect",
+        (perf_counter() - started) * 1000,
+        (perf_counter() - request_started) * 1000,
+    )
+    return detections, img_w, img_h, elapsed_ms
 
 
 # --- BCS ---

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from io import BytesIO
 import sys
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -150,6 +151,168 @@ class DetectorOwnershipTests(unittest.TestCase):
                     self.assertEqual(bcs.bcs_category, 3)
 
         asyncio.run(exercise())
+
+
+class DetectNativeOwnershipTests(unittest.TestCase):
+    def test_cancelled_request_keeps_capacity_until_native_work_finishes(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        second_entered = threading.Event()
+        calls = 0
+        gate = api_main.InferenceCapacityGate("detect", acquisition_timeout=0.02)
+        metrics = api_main.PrototypeMetrics()
+
+        def detect(_: bytes) -> tuple[list[object], int, int, float]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("fake detector was not released")
+            else:
+                second_entered.set()
+            return [], 8, 6, 1.0
+
+        detector = SimpleNamespace(detect=detect, gpu_available=False)
+        request = Request({"type": "http", "app": api_main.app})
+
+        async def exercise() -> None:
+            first = asyncio.create_task(
+                api_main.detect(request, UploadSafetyTests.upload(UploadSafetyTests.image_bytes()))
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                first.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+
+                second = asyncio.create_task(
+                    api_main.detect(request, UploadSafetyTests.upload(UploadSafetyTests.image_bytes()))
+                )
+                with self.assertRaises(HTTPException) as busy:
+                    await asyncio.wait_for(second, 0.5)
+                self.assertEqual(busy.exception.status_code, 503)
+                self.assertFalse(second_entered.is_set())
+                before_native_completion = metrics.snapshot()["detect"]
+                self.assertEqual(before_native_completion["inference_attempts"], 0)
+                self.assertEqual(before_native_completion["inference_successes"], 0)
+
+                release.set()
+                response = await api_main.detect(
+                    request, UploadSafetyTests.upload(UploadSafetyTests.image_bytes())
+                )
+                self.assertEqual(response.detection_count, 0)
+                self.assertTrue(second_entered.is_set())
+                snapshot = metrics.snapshot()["detect"]
+                self.assertEqual(snapshot["inference_attempts"], 2)
+                self.assertEqual(snapshot["inference_successes"], 2)
+                self.assertEqual(snapshot["inference_failures"], 0)
+                self.assertEqual(snapshot["busy_rejections"], 1)
+            finally:
+                release.set()
+                if not first.done():
+                    first.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await first
+
+        with (
+            patch.object(api_main.app.state, "detect_inference_gate", gate),
+            patch.object(api_main.app.state, "metrics", metrics),
+            patch.object(api_main.app.state, "detector", detector, create=True),
+        ):
+            asyncio.run(exercise())
+
+    def test_native_thread_start_failure_releases_capacity_once(self) -> None:
+        gate = api_main.InferenceCapacityGate("detect")
+        metrics = api_main.PrototypeMetrics()
+        detector = SimpleNamespace(
+            detect=Mock(return_value=([], 8, 6, 1.0)),
+            gpu_available=False,
+        )
+        request = Request({"type": "http", "app": api_main.app})
+        original_start = threading.Thread.start
+
+        def fail_owned_thread(thread: threading.Thread) -> None:
+            if thread.name == "vacca-bcs":
+                raise RuntimeError("thread start failed")
+            original_start(thread)
+
+        with (
+            patch.object(api_main.app.state, "detect_inference_gate", gate),
+            patch.object(api_main.app.state, "metrics", metrics),
+            patch.object(api_main.app.state, "detector", detector, create=True),
+            patch.object(threading.Thread, "start", fail_owned_thread),
+        ):
+            with self.assertRaises(HTTPException) as failure:
+                asyncio.run(
+                    api_main.detect(
+                        request,
+                        UploadSafetyTests.upload(UploadSafetyTests.image_bytes()),
+                    )
+                )
+
+            self.assertEqual(failure.exception.status_code, 500)
+            detector.detect.assert_not_called()
+            asyncio.run(gate.acquire())
+            gate.release()
+            self.assertEqual(metrics.snapshot()["detect"]["inference_failures"], 1)
+
+    def test_cancelled_request_records_native_failure_after_it_finishes(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+        gate = api_main.InferenceCapacityGate("detect", acquisition_timeout=0.02)
+        metrics = api_main.PrototypeMetrics()
+
+        def detect(_: bytes) -> tuple[list[object], int, int, float]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("fake detector was not released")
+                raise RuntimeError("synthetic inference failure")
+            return [], 8, 6, 1.0
+
+        detector = SimpleNamespace(detect=detect, gpu_available=False)
+        request = Request({"type": "http", "app": api_main.app})
+
+        async def exercise() -> None:
+            first = asyncio.create_task(
+                api_main.detect(request, UploadSafetyTests.upload(UploadSafetyTests.image_bytes()))
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                first.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+
+                before_native_completion = metrics.snapshot()["detect"]
+                self.assertEqual(before_native_completion["inference_attempts"], 0)
+                self.assertEqual(before_native_completion["inference_failures"], 0)
+
+                release.set()
+                response = await api_main.detect(
+                    request, UploadSafetyTests.upload(UploadSafetyTests.image_bytes())
+                )
+                self.assertEqual(response.detection_count, 0)
+                snapshot = metrics.snapshot()["detect"]
+                self.assertEqual(snapshot["inference_attempts"], 2)
+                self.assertEqual(snapshot["inference_failures"], 1)
+                self.assertEqual(snapshot["inference_successes"], 1)
+            finally:
+                release.set()
+                if not first.done():
+                    first.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await first
+
+        with (
+            patch.object(api_main.app.state, "detect_inference_gate", gate),
+            patch.object(api_main.app.state, "metrics", metrics),
+            patch.object(api_main.app.state, "detector", detector, create=True),
+        ):
+            asyncio.run(exercise())
 
 
 class UploadSafetyTests(unittest.TestCase):
