@@ -4,6 +4,7 @@ import asyncio
 from importlib.util import find_spec
 import logging
 import os
+import threading
 
 from .policies import ROOT, WORKER_SHUTDOWN_JOIN_SECONDS
 from .store import Store
@@ -27,9 +28,43 @@ class VideoResources:
         self.store = None
         self.worker = None
         self.started = False
-        self.available = False
+        self._admission_lock = threading.Lock()
+        self._available = False
+        self._worker_faulted = False
         self.upload_lock = asyncio.Lock()
         self.finish_video = None
+
+    @property
+    def available(self):
+        with self._admission_lock:
+            return self._available
+
+    @available.setter
+    def available(self, value):
+        with self._admission_lock:
+            self._available = value
+
+    @property
+    def worker_faulted(self):
+        with self._admission_lock:
+            return self._worker_faulted
+
+    @property
+    def history_available(self):
+        with self._admission_lock:
+            return self.store is not None and (self._available or self._worker_faulted)
+
+    def _on_worker_fault(self):
+        with self._admission_lock:
+            self._worker_faulted = True
+            self._available = False
+
+    def add_job_if_available(self, job_id, filename):
+        with self._admission_lock:
+            if not self._available:
+                return False
+            self.store.add(job_id, filename)
+            return True
 
     def prepare(self):
         self.store = Store(self.directory)
@@ -41,6 +76,7 @@ class VideoResources:
             if self.store is None:
                 self.prepare()
             self.worker.finish_video = self.finish_video
+            self.worker.on_fault = self._on_worker_fault
             if start_worker:
                 # Startup and recovery must both succeed before any job is claimed.
                 self.worker.ready.clear()
@@ -48,8 +84,10 @@ class VideoResources:
                     self.store.recover(conn)
                     self.worker.thread.start()
                     self.started = True
+                self.available = True
                 self.worker.ready.set()
-            self.available = True
+            else:
+                self.available = True
         except Exception as exc:
             logger.error("Video startup unavailable: %s", type(exc).__name__)
             self.close()

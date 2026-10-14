@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+import logging
 
 from .policies import (
     DEFAULT_MAX_FRAMES,
@@ -14,6 +15,8 @@ from .policies import (
     WORKER_TIMEOUT_SECONDS,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class Worker:
     def __init__(self, store):
@@ -21,18 +24,56 @@ class Worker:
         self.stop = threading.Event()
         self.ready = threading.Event()
         self.ready.set()
+        self._health_lock = threading.Lock()
+        self._health = "starting"
+        self.on_fault = None
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.finish_video = None
 
+    @property
+    def health(self):
+        with self._health_lock:
+            return self._health
+
+    def _set_health(self, health):
+        with self._health_lock:
+            self._health = health
+
+    def _fault(self, error):
+        with self._health_lock:
+            if self._health == "faulted":
+                return
+            self._health = "faulted"
+        logger.error("Video worker stopped after storage failure: %s", type(error).__name__)
+        if self.on_fault is not None:
+            self.on_fault()
+
     def loop(self):
+        try:
+            self._run_loop()
+        except Exception as exc:
+            self._fault(exc)
+        if self.health != "faulted":
+            self._set_health("stopped")
+
+    def _run_loop(self):
         # Principal startup may defer claims until recovery commits successfully.
         self.ready.wait()
+        if self.stop.is_set():
+            return
+        self._set_health("healthy")
         while not self.stop.is_set():
-            job_id = self.store.claim()
+            try:
+                job_id = self.store.claim()
+            except Exception as exc:
+                self._fault(exc)
+                return
             if job_id is None:
                 self.stop.wait(WORKER_POLL_SECONDS)
                 continue
             directory = self.store.directory / job_id
+            status = "completed"
+            error = None
             try:
                 command = [
                     sys.executable,
@@ -76,11 +117,15 @@ class Worker:
                             raise RuntimeError(
                                 "No se pudo analizar el archivo. Verificá que sea un video MP4 válido y que haya espacio disponible."
                             )
-                optional_error = None
                 if self.finish_video is not None:
-                    optional_error = self.finish_video(self.store.directory, job_id, self.stop)
+                    error = self.finish_video(self.store.directory, job_id, self.stop)
                     if self.stop.is_set():
                         raise RuntimeError("El servicio se interrumpió antes de publicar el resultado.")
-                self.store.update(job_id, "completed", optional_error)
             except Exception as exc:
-                self.store.update(job_id, "failed", str(exc))
+                status = "failed"
+                error = str(exc)
+            try:
+                self.store.update(job_id, status, error)
+            except Exception as exc:
+                self._fault(exc)
+                return

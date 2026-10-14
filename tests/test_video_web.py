@@ -2,6 +2,8 @@
 
 import json
 import asyncio
+import logging
+import threading
 from urllib.parse import urlencode, urlsplit
 
 import pytest
@@ -200,6 +202,130 @@ def test_worker_error_is_persisted(client, monkeypatch):
     monkeypatch.setattr(webapp.subprocess, "Popen", fail)
     worker.loop()
     assert client.app.state.store.get(job_id)["status"] == "failed"
+
+
+@pytest.mark.parametrize("fault", ["claim", "update"])
+def test_worker_storage_fault_is_terminal_and_does_not_retry(client, monkeypatch, caplog, fault):
+    job_id = submit(client).json()["id"]
+    store = client.app.state.store
+    worker = webapp.Worker(store)
+    faults = []
+    fault_notified = threading.Event()
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+
+    def notify_fault():
+        faults.append("faulted")
+        fault_notified.set()
+
+    worker.on_fault = notify_fault
+    claims = 0
+    updates = []
+
+    if fault == "claim":
+        def failed_claim():
+            nonlocal claims
+            claims += 1
+            claim_entered.set()
+            if not release_claim.wait(2):
+                raise TimeoutError("claim fault barrier was not released")
+            raise OSError("private database path")
+
+        monkeypatch.setattr(store, "claim", failed_claim)
+    else:
+        claim = store.claim
+
+        def counted_claim():
+            nonlocal claims
+            claims += 1
+            claim_entered.set()
+            if not release_claim.wait(2):
+                raise TimeoutError("update fault barrier was not released")
+            return claim()
+
+        def failed_update(identifier, status, error=None):
+            updates.append(status)
+            raise OSError("private database path")
+
+        def failed_process(*args, **kwargs):
+            raise RuntimeError("synthetic subprocess failure")
+
+        monkeypatch.setattr(store, "claim", counted_claim)
+        monkeypatch.setattr(store, "update", failed_update)
+        monkeypatch.setattr(webapp.subprocess, "Popen", failed_process)
+
+    worker.ready.clear()
+    with caplog.at_level(logging.ERROR, logger="vacca_video.worker"):
+        worker.thread.start()
+        assert worker.health == "starting"
+        worker.ready.set()
+        assert claim_entered.wait(2)
+        assert worker.health == "healthy"
+        release_claim.set()
+        assert fault_notified.wait(2)
+        worker.thread.join(2)
+
+    assert worker.health == "faulted"
+    assert not worker.thread.is_alive()
+    assert claims == 1
+    assert faults == ["faulted"]
+    assert "private database path" not in caplog.text
+    if fault == "claim":
+        assert store.get(job_id)["status"] == "pending"
+    else:
+        assert updates == ["failed"]
+        assert store.get(job_id)["status"] == "processing"
+
+
+def test_ordinary_job_failure_is_persisted_and_worker_continues(client, monkeypatch):
+    failed_id = submit(client).json()["id"]
+    completed_id = submit(client).json()["id"]
+    store = client.app.state.store
+    worker = webapp.Worker(store)
+    original_update = store.update
+    updates = []
+    starts = 0
+    faults = []
+
+    def record_update(job_id, status, error=None):
+        updates.append((job_id, status))
+        original_update(job_id, status, error)
+        if status == "failed":
+            assert worker.health == "healthy"
+        if job_id == completed_id:
+            worker.stop.set()
+
+    class CompletedProcess:
+        returncode = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def poll(self):
+            return 0
+
+    def process(*args, **kwargs):
+        nonlocal starts
+        starts += 1
+        if starts == 1:
+            raise RuntimeError("synthetic process failure")
+        return CompletedProcess()
+
+    monkeypatch.setattr(store, "update", record_update)
+    monkeypatch.setattr(webapp.subprocess, "Popen", process)
+    worker.on_fault = lambda: faults.append("faulted")
+
+    worker.loop()
+
+    assert updates == [(failed_id, "failed"), (completed_id, "completed")]
+    assert starts == 2
+    assert store.get(failed_id)["status"] == "failed"
+    assert store.get(completed_id)["status"] == "completed"
+    assert worker.health == "stopped"
+    assert faults == []
 
 
 def test_job_json_contract_and_nullable_summary(client):

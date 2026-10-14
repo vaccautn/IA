@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -298,6 +299,168 @@ def test_video_upload_lock_and_processing_job_do_not_gate_image_or_bcs(client):
             video.upload_lock.release()
         assert (await asyncio.wait_for(upload, 3)).status_code == 202
     client.runner.run(run())
+
+
+def test_worker_claim_fault_preserves_history_and_rejects_racing_upload(runtime, monkeypatch):
+    from vacca_video.worker import Worker
+
+    resources = service.VideoResources(runtime, worker_factory=Worker)
+    resources.prepare()
+    store = resources.store
+    store.add("history", "older.mp4")
+    store.update("history", "completed")
+    history_result = store.directory / "history/result"
+    history_result.mkdir(parents=True)
+    (history_result / "detections.jsonl").write_bytes(b'{"frame_index":0}\n')
+
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+    upload_waiting = threading.Event()
+
+    def fail_claim():
+        claim_entered.set()
+        if not release_claim.wait(3):
+            raise TimeoutError("claim fault barrier was not released")
+        raise OSError("private database path")
+
+    monkeypatch.setattr(store, "claim", fail_claim)
+    monkeypatch.setattr(main, "VideoResources", lambda: resources)
+
+    async def streamed_upload():
+        messages = []
+        part = 0
+
+        async def receive():
+            nonlocal part
+            if part == 0:
+                part += 1
+                return {
+                    "type": "http.request",
+                    "body": b"\x00\x00\x00\x18ftypisom",
+                    "more_body": True,
+                }
+            if part == 1:
+                part += 1
+                upload_waiting.set()
+                assert await asyncio.to_thread(release_claim.wait, 2)
+                for _ in range(100):
+                    if not resources.available:
+                        break
+                    await asyncio.sleep(0.01)
+                assert not resources.available
+                return {"type": "http.request", "body": b"00000000", "more_body": False}
+            await asyncio.Event().wait()
+
+        async def send(message):
+            messages.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/v1/analyses",
+            "raw_path": b"/api/v1/analyses",
+            "query_string": b"filename=racing.mp4",
+            "root_path": "",
+            "server": ("localhost", 80),
+            "client": ("127.0.0.1", 1),
+            "headers": [(b"host", b"localhost")],
+        }
+        await main.app(scope, receive, send)
+        status = next(message["status"] for message in messages if message["type"] == "http.response.start")
+        body = b"".join(message.get("body", b"") for message in messages)
+        return status, json.loads(body)
+
+    async def exercise():
+        async with main.app.router.lifespan_context(main.app):
+            assert await asyncio.to_thread(claim_entered.wait, 2)
+            request = TestClient(main.app)
+            upload = asyncio.create_task(streamed_upload())
+            assert await asyncio.to_thread(upload_waiting.wait, 2)
+            release_claim.set()
+            status, payload = await asyncio.wait_for(upload, 3)
+            assert status == 503
+            assert payload == {"detail": service.UNAVAILABLE_DETAIL}
+
+            history = await request.arequest("GET", "/api/v1/analyses")
+            assert history.status_code == 200
+            assert [job["id"] for job in history.json()] == ["history"]
+            result = await request.arequest("GET", "/api/v1/analyses/history/results")
+            assert result.status_code == 200
+            assert result.content == b'{"frame_index":0}\n'
+            assert (await request.arequest("GET", "/health")).status_code == 200
+            for path in ("/detect", "/bcs"):
+                response = await request.arequest("POST", path, image_upload(), IMAGE_HEADERS)
+                assert response.status_code == 200
+
+            files = list(store.directory.glob("*/input.mp4"))
+            assert files == []
+            assert [job["id"] for job in store.list()] == ["history"]
+
+    with asyncio.Runner() as runner:
+        runner.run(exercise())
+
+
+def test_unhandled_worker_loop_exception_faults_resources_without_retry(runtime, monkeypatch, caplog):
+    from vacca_video.worker import Worker
+
+    resources = service.VideoResources(runtime, worker_factory=Worker)
+    resources.prepare()
+    store = resources.store
+    store.add("history", "older.mp4")
+    store.update("history", "completed")
+    result_dir = store.directory / "history/result"
+    result_dir.mkdir(parents=True)
+    (result_dir / "detections.jsonl").write_bytes(b'{"frame_index":0}\n')
+
+    claim_returned = threading.Event()
+    claims = []
+
+    def claim_malformed_legacy_id():
+        claims.append("claim")
+        claim_returned.set()
+        return b"legacy-id"
+
+    monkeypatch.setattr(store, "claim", claim_malformed_legacy_id)
+    monkeypatch.setattr(main, "VideoResources", lambda: resources)
+    process_start = Mock(side_effect=AssertionError("faulted claim must not start processing"))
+    monkeypatch.setattr(webapp.subprocess, "Popen", process_start)
+
+    async def exercise():
+        async with main.app.router.lifespan_context(main.app):
+            assert await asyncio.to_thread(claim_returned.wait, 2)
+            for _ in range(100):
+                if not resources.worker.thread.is_alive():
+                    break
+                await asyncio.sleep(0.01)
+
+            assert not resources.worker.thread.is_alive()
+            assert resources.worker.health == "faulted"
+            assert not resources.available
+            assert resources.worker_faulted
+            assert claims == ["claim"]
+            process_start.assert_not_called()
+
+            client = TestClient(main.app)
+            history = await client.arequest("GET", "/api/v1/analyses")
+            assert history.status_code == 200
+            assert [job["id"] for job in history.json()] == ["history"]
+            artifact = await client.arequest("GET", "/api/v1/analyses/history/results")
+            assert artifact.status_code == 200
+            assert artifact.content == b'{"frame_index":0}\n'
+            rejected = await client.arequest(
+                "POST", "/api/v1/analyses?filename=new.mp4", b"\x00\x00\x00\x18ftypisom"
+            )
+            assert rejected.status_code == 503
+            assert [job["id"] for job in store.list()] == ["history"]
+
+    with caplog.at_level(logging.ERROR, logger="vacca_video.worker"):
+        with asyncio.Runner() as runner:
+            runner.run(exercise())
+    assert any("TypeError" in record.message for record in caplog.records)
+    assert "legacy-id" not in caplog.text
 
 
 def test_completed_video_artifacts_preserve_paths_and_nullable_fields(client):

@@ -43,6 +43,13 @@ def records(directory):
 
 def video_store(request: Request) -> Store:
     resources = getattr(request.app.state, "video", None)
+    if resources is None or not resources.history_available:
+        raise HTTPException(503, UNAVAILABLE_DETAIL)
+    return resources.store
+
+
+def video_admission_store(request: Request) -> Store:
+    resources = getattr(request.app.state, "video", None)
     if resources is None or not resources.available:
         raise HTTPException(503, UNAVAILABLE_DETAIL)
     return resources.store
@@ -83,7 +90,7 @@ def create_router():
     )
     async def upload(
         request: Request, filename: str = Query(min_length=1, max_length=200),
-        store: Store = Depends(video_store),
+        store: Store = Depends(video_admission_store),
     ):
         if not filename.lower().endswith(".mp4"):
             raise HTTPException(415, "Elegí un video MP4.")
@@ -116,7 +123,8 @@ def create_router():
                 header = stream.read(32)
             if size < 12 or b"ftyp" not in header:
                 raise HTTPException(415, "El archivo no tiene una cabecera MP4 válida.")
-            store.add(job_id, filename)
+            if not request.app.state.video.add_job_if_available(job_id, filename):
+                raise HTTPException(503, UNAVAILABLE_DETAIL)
         except BaseException:
             target.unlink(missing_ok=True)
             directory.rmdir()
