@@ -91,13 +91,20 @@ como puntaje clínico estándar ni como los rótulos físicos de origen 3.25..4.
 El modelo es experimental, no aprobado para producción; la validación de esta
 función con proveedores simulados no prueba disponibilidad real ni precisión.
 
-Los resúmenes JSON y JS se publican por reemplazo atómico de archivos temporales,
-sin modificar SQLite. Cada archivo evita JSON incompleto; no constituyen una
-transacción de dos archivos ante una falla del sistema de archivos. Se intenta
-restaurar el JS anterior si falla la publicación del JSON. Si la
-publicación falla, el trabajo conserva las detecciones y un error explícito;
-la API no presenta la categoría como guardada. Consultar ese error antes de
-usar artefactos offline que pudieran haber quedado desincronizados.
+Los resúmenes JSON y JS requeridos se escriben primero en temporales y luego se
+reemplazan por archivo, sin modificar SQLite. Ante un error de escritura o
+reemplazo durante esa publicación, se intenta restaurar el par previo (o retirar
+los archivos nuevos); si falla el rollback, el error también se propaga. No es
+una transacción atómica de dos archivos ni una garantía ante pérdida de energía.
+El HTML del reporte se escribe antes del par de resúmenes y tampoco forma parte
+de una transacción conjunta. Si falla una salida requerida, el procesamiento
+reporta error en vez de declarar una finalización exitosa. La lectura del
+historial aísla resúmenes ausentes, ilegibles, estructuralmente inválidos o que
+no se puedan serializar con el contrato JSON vigente por trabajo: muestra una
+advertencia fija y conserva accesibles los demás trabajos, sus detecciones y el
+error original guardado. Los reemplazos BCS ya definidos para trabajos fallidos
+o errores de escritura se aplican antes de validar ese metadato. No interpreta
+un resumen corrupto como “sin frame elegible” ni como un resultado BCS.
 
 ## Abrir en esta computadora
 

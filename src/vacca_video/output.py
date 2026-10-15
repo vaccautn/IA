@@ -10,6 +10,7 @@ from pathlib import Path
 from .pipeline import Frame
 from .policies import CLI_PREVIEW_LIMIT
 from .candidate import CANDIDATE_ARTIFACT, POLICY, CandidateSelector
+from .artifacts import publish_initial_summary
 
 logger = logging.getLogger(__name__)
 
@@ -208,12 +209,6 @@ class PresentationSink:
             annotated_video_fps=self.sample_fps if self.write_video else None,
             count_semantics="visible_cows_per_frame_not_unique_animals",
         )
-        payload = json_text(summary)
-        (self.output / "summary.json").write_text(payload + "\n", encoding="utf-8")
-        (self.output / "summary.js").write_text(
-            "window.VACCA_SUMMARY = " + payload + ";\n", encoding="utf-8"
-        )
-        (self.output / "report.html").write_text(
-            files("vacca_video").joinpath("report.html").read_text(encoding="utf-8"),
-            encoding="utf-8",
-        )
+        report = files("vacca_video").joinpath("report.html").read_text(encoding="utf-8")
+        (self.output / "report.html").write_text(report, encoding="utf-8")
+        publish_initial_summary(self.output, summary)

@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from scripts.process_video import main  # noqa: E402
+from vacca_video.artifacts import publish_initial_summary  # noqa: E402
 from vacca_video.output import PresentationSink  # noqa: E402
 from vacca_video.pipeline import SamplingConfig, process_frames  # noqa: E402
 from vacca_video.source import OpenCVFileSource  # noqa: E402
@@ -137,6 +138,60 @@ class VideoIOTests(unittest.TestCase):
         with self.assertRaises(FileExistsError), PresentationSink(output, source, 5):
             pass
         self.assertEqual(marker.read_text(), "existing")
+
+    def test_initial_summary_pair_rolls_back_when_second_replace_fails(self):
+        from vacca_video import artifacts
+
+        output = self.root / "summary-pair"
+        output.mkdir()
+        summary_path = output / "summary.json"
+        script_path = output / "summary.js"
+        summary_path.write_text('{"status":"previous"}\n', encoding="utf-8")
+        script_path.write_text('window.VACCA_SUMMARY = {"status":"previous"};\n', encoding="utf-8")
+        original_replace = artifacts.os.replace
+
+        def fail_script_replace(source, destination):
+            if Path(destination) == script_path:
+                raise OSError("synthetic summary.js replace failure")
+            return original_replace(source, destination)
+
+        with patch.object(artifacts.os, "replace", side_effect=fail_script_replace):
+            with self.assertRaisesRegex(OSError, "synthetic summary.js replace failure"):
+                publish_initial_summary(output, {"status": "new"})
+
+        self.assertEqual(summary_path.read_text(encoding="utf-8"), '{"status":"previous"}\n')
+        self.assertEqual(
+            script_path.read_text(encoding="utf-8"),
+            'window.VACCA_SUMMARY = {"status":"previous"};\n',
+        )
+        self.assertEqual(list(output.glob(".summary-*")), [])
+
+    def test_finalize_surfaces_required_summary_publication_failure(self):
+        from vacca_video import artifacts
+
+        output = self.root / "failed-publication"
+        output.mkdir()
+        previous = '{"status":"previous"}\n'
+        (output / "summary.json").write_text(previous, encoding="utf-8")
+        sink = PresentationSink.__new__(PresentationSink)
+        sink.output = output
+        sink.video = None
+        sink.records = None
+        sink.preview = None
+        sink.candidate = type("Candidate", (), {"metadata": None})()
+        sink.preview_count = 0
+        sink.preview_limit = 120
+        sink.write_video = False
+        sink.sample_fps = 5
+
+        def fail_replace(source, destination):
+            raise OSError("synthetic required summary failure")
+
+        with patch.object(artifacts.os, "replace", side_effect=fail_replace):
+            with self.assertRaisesRegex(OSError, "synthetic required summary failure"):
+                sink.finalize({"status": "completed", "frames_analyzed": 0})
+
+        self.assertEqual((output / "summary.json").read_text(encoding="utf-8"), previous)
 
     def test_cli_failure_publishes_partial_report_and_releases_source(self):
         capture = FakeCapture([0, 100, 200], declared=100)

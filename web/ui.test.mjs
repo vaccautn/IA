@@ -271,6 +271,21 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     assert.equal(await result.count(), 0, "Old jobs without BCS still work");
   });
 
+  await t.test("corrupt summaries display an unavailable diagnostic, not a BCS fallback", async (t) => {
+    const { page, mock } = await fixture(t);
+    mock.history = () => reply([
+      { ...job("a"), summary: null,
+        summary_error: "No se pudo leer el resumen guardado; las detecciones y el historial siguen disponibles." },
+      job("b")
+    ]);
+    await page.evaluate(() => window.advanceVideoTimers(false));
+    const alert = page.getByRole("alert");
+    await alert.getByText(/No se pudo leer el resumen guardado/).waitFor();
+    assert.equal(await page.getByRole("region", { name: "BCS del frame seleccionado" }).count(), 0);
+    assert.equal(await page.getByText(/No se puede evaluar: ningún frame muestreado/).count(), 0);
+    assert.equal(await page.getByRole("button", { name: /b\.mp4/ }).count(), 1);
+  });
+
   await t.test("failed upload clears busy and renders the API error", async (t) => {
     const { page, mock, selectFile } = await fixture(t);
     const failed = deferred(), started = deferred();

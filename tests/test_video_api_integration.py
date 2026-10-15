@@ -518,6 +518,67 @@ def test_failed_video_or_unsaved_bcs_never_claims_completed_bcs(client):
     assert outcome == dict(status="failed", reason="metadata_write_failed")
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    ["metadata_write_failure", "failed_job", "ordinary_completed"],
+)
+def test_corrupt_bcs_metadata_uses_existing_job_fallbacks_before_validation(client, scenario):
+    from vacca_video.artifacts import BCS_WRITE_ERROR
+
+    store = main.app.state.video.store
+    affected_id = submit(client, f"{scenario}.mp4").json()["id"]
+    neighbor_id = submit(client, "valid-neighbor.mp4").json()["id"]
+    affected_dir = store.directory / affected_id / "result"
+    neighbor_dir = store.directory / neighbor_id / "result"
+    affected_dir.mkdir()
+    neighbor_dir.mkdir()
+    original_error = {
+        "metadata_write_failure": BCS_WRITE_ERROR,
+        "failed_job": "original worker error",
+        "ordinary_completed": None,
+    }[scenario]
+    status = "failed" if scenario == "failed_job" else "completed"
+    expected_bcs = {
+        "metadata_write_failure": dict(status="failed", reason="metadata_write_failed"),
+        "failed_job": dict(status="not_evaluated", reason="video_not_completed"),
+        "ordinary_completed": None,
+    }[scenario]
+    (affected_dir / "summary.json").write_text(
+        json.dumps({"bcs": {"status": "broken"}, "custom": None}), encoding="utf-8"
+    )
+    detections = b'{"frame_index":0,"detection_count":1}\n'
+    (affected_dir / "detections.jsonl").write_bytes(detections)
+    neighbor_summary = {"status": "completed", "custom": None}
+    (neighbor_dir / "summary.json").write_text(json.dumps(neighbor_summary), encoding="utf-8")
+    store.update(affected_id, status, original_error)
+    store.update(neighbor_id, "completed")
+
+    history = client.get("/api/v1/analyses")
+
+    assert history.status_code == 200
+    jobs = {job["id"]: job for job in history.json()}
+    affected = jobs[affected_id]
+    neighbor = jobs[neighbor_id]
+    assert affected["status"] == status
+    assert affected["error"] == original_error
+    assert affected["frames_analyzed"] == 1
+    if expected_bcs is None:
+        assert affected["summary"] is None
+        assert affected["summary_error"] == webapp.SUMMARY_UNAVAILABLE_DETAIL
+    else:
+        assert affected["summary"] == {"bcs": expected_bcs, "custom": None}
+        assert "summary_error" not in affected
+    assert neighbor["summary"] == neighbor_summary
+    assert "summary_error" not in neighbor
+
+    detail = client.get(f"/api/v1/analyses/{affected_id}")
+    assert detail.status_code == 200
+    assert detail.json() == affected
+    downloaded = client.get(f"/api/v1/analyses/{affected_id}/results")
+    assert downloaded.status_code == 200
+    assert downloaded.content == detections
+
+
 @pytest.mark.parametrize("invalid", ["artifact", "missing_fields", "confidence"])
 @pytest.mark.parametrize("publication_fails", [False, True])
 def test_invalid_candidate_cannot_break_detail_history_or_download(client, monkeypatch, invalid, publication_fails):

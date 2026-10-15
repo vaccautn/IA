@@ -11,6 +11,8 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import TypeAdapter, ValidationError
+from pydantic_core import PydanticSerializationError
 
 from .policies import (
     DEFAULT_MAX_FRAMES as MAX_FRAMES,
@@ -21,10 +23,29 @@ from .policies import (
 )
 from .store import JobNotFound, Store
 from .worker import Worker as Worker
-from .schemas import VideoErrorResponse, FramePageResponse, JobResponse, sanitize_optional_candidate
+from .schemas import (
+    AnalysisSummaryResponse,
+    VideoErrorResponse,
+    FramePageResponse,
+    JobResponse,
+    sanitize_optional_candidate,
+)
 from .service import UNAVAILABLE_DETAIL, VideoResources
-from .artifacts import BCS_WRITE_ERROR, job_artifact
+from .artifacts import BCS_WRITE_ERROR, job_artifact, read_summary
 from .candidate import CANDIDATE_ARTIFACT
+
+SUMMARY_UNAVAILABLE_DETAIL = (
+    "No se pudo leer el resumen guardado; las detecciones y el historial siguen disponibles."
+)
+_JOB_RESPONSE_LIST_ADAPTER = TypeAdapter(list[JobResponse])
+
+
+def _ensure_job_response_serializable(response):
+    """Preflight the same JSON serializer and list wrapper used by FastAPI."""
+    models = _JOB_RESPONSE_LIST_ADAPTER.validate_python([response])
+    _JOB_RESPONSE_LIST_ADAPTER.dump_json(
+        models, by_alias=True, exclude_unset=True, ensure_ascii=False
+    )
 
 
 def records(directory):
@@ -61,20 +82,49 @@ def create_router():
     def detail(store, job):
         directory = store.directory / job["id"]
         frames = records(directory)
-        summary_path = directory / "result/summary.json"
         summary = None
-        if job["status"] in ("completed", "failed") and summary_path.exists():
-            summary = sanitize_optional_candidate(json.loads(summary_path.read_text(encoding="utf-8")))
-            if "bcs" in summary and job["status"] != "completed":
-                summary["bcs"] = dict(status="not_evaluated", reason="video_not_completed")
-            elif job.get("error") == BCS_WRITE_ERROR:
-                summary["bcs"] = dict(status="failed", reason="metadata_write_failed")
-        return dict(
+        summary_error = None
+        if job["status"] in ("completed", "failed"):
+            try:
+                raw_summary = read_summary(store.directory, job["id"])
+                if type(raw_summary) is not dict:
+                    raise ValueError("Summary must be an object")
+                summary = sanitize_optional_candidate(raw_summary)
+                if "bcs" in summary and job["status"] != "completed":
+                    summary["bcs"] = dict(status="not_evaluated", reason="video_not_completed")
+                elif job.get("error") == BCS_WRITE_ERROR:
+                    summary["bcs"] = dict(status="failed", reason="metadata_write_failed")
+                AnalysisSummaryResponse.model_validate(summary)
+            except (OSError, UnicodeError, ValueError, ValidationError, RecursionError):
+                summary = None
+                summary_error = SUMMARY_UNAVAILABLE_DETAIL
+        response = dict(
             job,
             frames_analyzed=len(frames),
             summary=summary,
             schema_version="vacca-video-job-v1",
         )
+        if summary_error is not None:
+            response["summary_error"] = summary_error
+        try:
+            _ensure_job_response_serializable(response)
+        except (
+            ValidationError,
+            PydanticSerializationError,
+            UnicodeError,
+            ValueError,
+            RecursionError,
+        ):
+            if summary is None:
+                raise
+            summary = None
+            summary_error = SUMMARY_UNAVAILABLE_DETAIL
+            response["summary"] = None
+            response["summary_error"] = summary_error
+            # If the job fields themselves are not renderable, let that error
+            # surface rather than disguising it as a corrupt summary.
+            _ensure_job_response_serializable(response)
+        return response
 
     @router.get(
         "/api/v1/analyses", response_model=list[JobResponse],

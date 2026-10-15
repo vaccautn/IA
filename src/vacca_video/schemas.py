@@ -115,6 +115,7 @@ class JobResponse(BaseModel):
     error: str | None
     frames_analyzed: int
     summary: AnalysisSummaryResponse | None
+    summary_error: str | None = None
     schema_version: str
 
 

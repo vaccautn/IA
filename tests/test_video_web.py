@@ -480,6 +480,114 @@ def test_full_frame_and_summary_contract_preserves_artifact_fields(client):
     assert "FramePageResponse" in schema["components"]["schemas"]
 
 
+@pytest.mark.parametrize(
+    "summary_payload",
+    ["{", "[]", '"not an object"', '{"status": 5}'],
+    ids=["malformed-json", "list", "scalar", "invalid-field-type"],
+)
+def test_corrupt_job_summary_does_not_hide_other_history(client, summary_payload):
+    store = client.app.state.store
+    corrupt_id = submit(client, "corrupt.mp4").json()["id"]
+    valid_id = submit(client, "valid.mp4").json()["id"]
+    store.update(corrupt_id, "failed", "original worker error")
+    store.update(valid_id, "completed")
+    corrupt_path = store.directory / corrupt_id / "result"
+    valid_path = store.directory / valid_id / "result"
+    corrupt_path.mkdir()
+    valid_path.mkdir()
+    (corrupt_path / "summary.json").write_text(summary_payload, encoding="utf-8")
+    valid_summary = {"status": "completed", "frames_analyzed": 3, "extension": None}
+    (valid_path / "summary.json").write_text(json.dumps(valid_summary), encoding="utf-8")
+
+    response = client.get("/api/v1/analyses")
+
+    assert response.status_code == 200
+    jobs = {job["id"]: job for job in response.json()}
+    assert set(jobs) == {corrupt_id, valid_id}
+    assert jobs[valid_id]["summary"] == valid_summary
+    assert "summary_error" not in jobs[valid_id]
+    assert jobs[corrupt_id]["summary"] is None
+    assert jobs[corrupt_id]["error"] == "original worker error"
+    assert jobs[corrupt_id]["summary_error"] == "No se pudo leer el resumen guardado; las detecciones y el historial siguen disponibles."
+    detail = client.get(f"/api/v1/analyses/{corrupt_id}")
+    assert detail.status_code == 200
+    assert detail.json()["summary"] is None
+    assert detail.json()["summary_error"] == jobs[corrupt_id]["summary_error"]
+
+
+def test_missing_terminal_summary_is_reported_without_inventing_bcs_outcome(client):
+    job_id = submit(client).json()["id"]
+    client.app.state.store.update(job_id, "completed")
+
+    response = client.get(f"/api/v1/analyses/{job_id}")
+
+    assert response.status_code == 200
+    job = response.json()
+    assert job["summary"] is None
+    assert job["summary_error"] == "No se pudo leer el resumen guardado; las detecciones y el historial siguen disponibles."
+    assert "bcs" not in job
+
+
+def _nested_array(depth):
+    value = "leaf"
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+@pytest.mark.parametrize(
+    "extension",
+    [_nested_array(256), _nested_array(300), "\ud800"],
+    ids=["near-serializer-depth", "deep-serializer-depth", "unpaired-surrogate"],
+)
+def test_response_serialization_errors_are_isolated_per_job(client, extension):
+    store = client.app.state.store
+    corrupt_id = submit(client, "deep-extension.mp4").json()["id"]
+    valid_id = submit(client, "valid-neighbor.mp4").json()["id"]
+    store.update(corrupt_id, "completed")
+    store.update(valid_id, "completed")
+    corrupt_path = store.directory / corrupt_id / "result"
+    valid_path = store.directory / valid_id / "result"
+    corrupt_path.mkdir()
+    valid_path.mkdir()
+    (corrupt_path / "summary.json").write_text(
+        json.dumps({"status": "completed", "extension": extension}), encoding="utf-8"
+    )
+    valid_summary = {"status": "completed", "custom": None}
+    (valid_path / "summary.json").write_text(json.dumps(valid_summary), encoding="utf-8")
+    (corrupt_path / "detections.jsonl").write_text('{"frame_index":0}\n', encoding="utf-8")
+
+    history = client.get("/api/v1/analyses")
+
+    assert history.status_code == 200
+    jobs = {job["id"]: job for job in history.json()}
+    assert jobs[valid_id]["summary"] == valid_summary
+    assert "summary_error" not in jobs[valid_id]
+    assert jobs[corrupt_id]["summary"] is None
+    assert jobs[corrupt_id]["summary_error"] == webapp.SUMMARY_UNAVAILABLE_DETAIL
+    assert jobs[corrupt_id]["frames_analyzed"] == 1
+    detail = client.get(f"/api/v1/analyses/{corrupt_id}")
+    assert detail.status_code == 200
+    assert detail.json()["summary"] is None
+    assert detail.json()["summary_error"] == webapp.SUMMARY_UNAVAILABLE_DETAIL
+
+
+def test_normal_summary_serialization_preserves_extensions_and_nullable_fields(client):
+    job_id = submit(client, "serializable.mp4").json()["id"]
+    client.app.state.store.update(job_id, "completed")
+    result = client.app.state.store.directory / job_id / "result"
+    result.mkdir()
+    summary = {"status": "completed", "extension": _nested_array(8), "nullable": None}
+    (result / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+
+    response = client.get(f"/api/v1/analyses/{job_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["summary"] == summary
+    assert "summary_error" not in payload
+
+
 def test_lifespan_recovers_pending_and_stops_worker(tmp_path, monkeypatch):
     calls = []
 

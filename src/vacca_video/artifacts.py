@@ -34,6 +34,55 @@ def read_summary(root, job_id):
     return json.loads(data)
 
 
+def publish_initial_summary(directory, summary):
+    """Publish the required JSON/JS summary pair with rollback on write failure.
+
+    The two replacements are not a filesystem transaction. If a replacement
+    fails in-process, restore the prior pair (or remove newly-created files).
+    """
+    payload = json.dumps(summary, ensure_ascii=True, allow_nan=False)
+    targets = (
+        ("summary.json", payload + "\n"),
+        ("summary.js", "window.VACCA_SUMMARY = " + payload + ";\n"),
+    )
+    directory = Path(directory)
+    staged = []
+    backups = {}
+    replaced = []
+    try:
+        for name, content in targets:
+            target = directory / name
+            fd, temporary = tempfile.mkstemp(prefix=".summary-", dir=directory)
+            staged.append((Path(temporary), target))
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(content)
+        for name, _content in targets:
+            target = directory / name
+            if target.exists():
+                fd, temporary = tempfile.mkstemp(prefix=".summary-backup-", dir=directory)
+                backup = Path(temporary)
+                backups[target] = backup
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(target.read_bytes())
+        try:
+            for temporary, target in staged:
+                os.replace(temporary, target)
+                replaced.append(target)
+        except OSError:
+            for target in reversed(replaced):
+                backup = backups.pop(target, None)
+                if backup is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    os.replace(backup, target)
+            raise
+    finally:
+        for temporary, _target in staged:
+            temporary.unlink(missing_ok=True)
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
+
+
 def publish_summary(root, job_id, summary):
     payload = json.dumps(summary, ensure_ascii=True, allow_nan=False)
     targets = [("summary.json", payload + "\n")]
