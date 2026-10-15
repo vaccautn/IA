@@ -337,6 +337,17 @@ simulan el servicio y las fallas para verificar contratos, admisión compartida,
 cancelación, PNG original, saneamiento de metadatos y conservación de detecciones.
 La cobertura renderizada de Edge usa la API simulada; no valida inferencia.
 
+El guard de calidad inspecciona suites `*.test.js` y `*.test.mjs` bajo `IA/tests`
+y `IA/web`, incluido `web/ui.test.mjs` y las subpruebas registradas en esos
+archivos; excluye `node_modules`, fixtures y artefactos generados. Rechaza
+declaraciones `.only`, `.skip` y `.todo`, además de opciones potencialmente activas
+`only`, `skip` o `todo`; expresiones dinámicas se tratan conservadoramente como
+activas. En Node 22, `.only` solo filtra la ejecución con `--test-only`; la
+política del repositorio aun así prohíbe esa declaración. `skip` omite la prueba;
+`todo` la marca pendiente, así que ambas formas quedan prohibidas. Es una
+inspección estática acotada de las suites declaradas, no un análisis de toda
+posible registración dinámica de pruebas.
+
 ## Validación histórica del servicio independiente
 
 La verificación original siguiente corresponde al servicio independiente anterior
