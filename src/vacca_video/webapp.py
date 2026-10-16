@@ -9,7 +9,9 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
+import tempfile
+import zipfile
 from fastapi.staticfiles import StaticFiles
 from pydantic import TypeAdapter, ValidationError
 from pydantic_core import PydanticSerializationError
@@ -31,7 +33,7 @@ from .schemas import (
     sanitize_optional_candidate,
 )
 from .service import UNAVAILABLE_DETAIL, VideoResources
-from .artifacts import BCS_WRITE_ERROR, job_artifact, read_summary
+from .artifacts import BCS_WRITE_ERROR, frame_artifact, job_artifact, read_summary
 from .candidate import CANDIDATE_ARTIFACT
 
 SUMMARY_UNAVAILABLE_DETAIL = (
@@ -69,6 +71,31 @@ def video_store(request: Request) -> Store:
     return resources.store
 
 
+def highlighted_frame(frames, job_id):
+    """Return the first frame maximizing count then mean confidence."""
+    best = None
+    best_rank = None
+    for index, frame in enumerate(frames):
+        if type(frame) is not dict:
+            continue
+        detections = frame.get("detections", [])
+        if type(detections) is not list or any(type(item) is not dict for item in detections):
+            continue
+        scores = [item.get("confidence") for item in detections]
+        if any(type(score) not in (int, float) or not 0 <= score <= 1 for score in scores):
+            continue
+        count = frame.get("detection_count")
+        if type(count) is not int or count < 0:
+            continue
+        mean = sum(scores) / len(scores) if scores else None
+        rank = (count, mean if mean is not None else -1)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best = dict(frame, sample_index=index, mean_confidence=mean,
+                        image_url=f"/api/v1/analyses/{job_id}/frames/{index}/image")
+    return best
+
+
 def video_admission_store(request: Request) -> Store:
     resources = getattr(request.app.state, "video", None)
     if resources is None or not resources.available:
@@ -82,6 +109,13 @@ def create_router():
     def detail(store, job):
         directory = store.directory / job["id"]
         frames = records(directory)
+        highlight = None
+        highlight_error = False
+        if job["status"] in ("completed", "failed"):
+            try:
+                highlight = highlighted_frame(frames, job["id"])
+            except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+                highlight_error = True
         summary = None
         summary_error = None
         if job["status"] in ("completed", "failed"):
@@ -102,6 +136,7 @@ def create_router():
             job,
             frames_analyzed=len(frames),
             summary=summary,
+            highlighted_frame=None if highlight_error else highlight,
             schema_version="vacca-video-job-v1",
         )
         if summary_error is not None:
@@ -115,12 +150,19 @@ def create_router():
             ValueError,
             RecursionError,
         ):
+            if highlight is not None and not highlight_error:
+                response["highlighted_frame"] = None
+                highlight_error = True
+                try:
+                    _ensure_job_response_serializable(response)
+                    return response
+                except (ValidationError, PydanticSerializationError, UnicodeError,
+                        ValueError, RecursionError):
+                    pass
             if summary is None:
                 raise
-            summary = None
-            summary_error = SUMMARY_UNAVAILABLE_DETAIL
             response["summary"] = None
-            response["summary_error"] = summary_error
+            response["summary_error"] = SUMMARY_UNAVAILABLE_DETAIL
             # If the job fields themselves are not renderable, let that error
             # surface rather than disguising it as a corrupt summary.
             _ensure_job_response_serializable(response)
@@ -207,14 +249,74 @@ def create_router():
         }
 
     @router.get("/api/v1/analyses/{job_id}/frames/{index}/image")
-    def image(job_id: str, index: int, store: Store = Depends(video_store)):
+    def image(job_id: str, index: int, download: bool = False,
+              store: Store = Depends(video_store)):
         store.get(job_id)
         if index < 0 or index >= MAX_FRAMES:
             raise HTTPException(404)
-        path = store.directory / job_id / "result/frames" / f"{index:06d}.jpg"
-        if not path.is_file():
+        try:
+            path = frame_artifact(store.directory, job_id, index)
+            if not path.is_file():
+                raise ValueError("Missing frame")
+        except ValueError:
             raise HTTPException(404, "Frame todavía no disponible")
-        return FileResponse(path, media_type="image/jpeg")
+        return FileResponse(
+            path, media_type="image/jpeg",
+            filename=f"frame-{job_id}-{index + 1}.jpg" if download else None,
+        )
+
+    @router.get("/api/v1/analyses/{job_id}/frames.zip")
+    def download_frames(job_id: str, store: Store = Depends(video_store)):
+        job = store.get(job_id)
+        if job["status"] not in ("completed", "failed"):
+            raise HTTPException(409, "Esperá a que termine el análisis")
+        try:
+            paths = [frame_artifact(store.directory, job_id, index)
+                     for index in range(MAX_FRAMES)]
+            paths = [path for path in paths if path.is_file()]
+        except ValueError:
+            raise HTTPException(404, "Frames unavailable") from None
+        if not paths:
+            raise HTTPException(409, "No hay frames disponibles para descargar")
+        try:
+            if shutil.disk_usage(store.directory).free < RESERVE + sum(p.stat().st_size for p in paths):
+                raise HTTPException(507, "No hay espacio suficiente para preparar el archivo ZIP.")
+        except OSError:
+            raise HTTPException(507, "No se pudo reservar espacio para el archivo ZIP.") from None
+        try:
+            archive = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
+        except (OSError, MemoryError):
+            raise HTTPException(507, "No se pudo preparar el archivo ZIP.") from None
+        try:
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as bundle:
+                for path in paths:
+                    bundle.write(path, arcname=path.name)
+            archive.seek(0)
+        except (OSError, MemoryError):
+            archive.close()
+            raise HTTPException(507, "No se pudo preparar el archivo ZIP.") from None
+        except BaseException:
+            archive.close()
+            raise
+
+        def chunks():
+            try:
+                while chunk := archive.read(64 * 1024):
+                    yield chunk
+            finally:
+                archive.close()
+
+        class ArchiveResponse(StreamingResponse):
+            async def __call__(self, scope, receive, send):
+                try:
+                    await super().__call__(scope, receive, send)
+                finally:
+                    archive.close()
+
+        return ArchiveResponse(
+            chunks(), media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="frames-{job_id}.zip"'},
+        )
 
     @router.get("/api/v1/analyses/{job_id}/candidate/image")
     def candidate_image(job_id: str, store: Store = Depends(video_store)):

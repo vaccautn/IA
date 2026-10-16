@@ -488,3 +488,9 @@ footer {
 }
 .candidate-bcs { margin: 1rem 0; padding: 1rem; border: 1px solid #c8d6cc; border-radius: 12px; }
 .candidate-bcs img { display: block; max-width: 100%; max-height: 360px; object-fit: contain; margin: 1rem 0; }
+
+.final-summary { margin: 24px 0; padding: 20px; background: var(--verde-pastel); border-radius: 6px; }
+.download-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.final-summary p { font-size: 14px; }
+.highlight-image { display: block; max-width: 100%; max-height: 360px; margin: 16px auto; border-radius: 5px; }
+.confidence-list { display: flex; flex-wrap: wrap; gap: 8px 24px; padding-left: 20px; font-size: 13px; }

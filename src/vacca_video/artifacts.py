@@ -26,6 +26,21 @@ def job_artifact(root, job_id, name):
     return path
 
 
+def frame_artifact(root, job_id, index):
+    """Resolve one fixed sampled JPEG without following linked ancestors."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id) or type(index) is not int or not 0 <= index < 300:
+        raise ValueError("Invalid frame path")
+    root = Path(root)
+    directory = root / job_id / "result" / "frames"
+    path = directory / f"{index:06d}.jpg"
+    for part in (root, root / job_id, root / job_id / "result", directory, path):
+        if part.is_symlink() or part.is_junction():
+            raise ValueError("Symbolic frame paths are not allowed")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError("Frame is outside job storage")
+    return path
+
+
 def read_summary(root, job_id):
     with job_artifact(root, job_id, "summary.json").open("rb") as stream:
         data = stream.read(1024 * 1024 + 1)

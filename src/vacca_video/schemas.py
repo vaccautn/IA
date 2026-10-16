@@ -115,6 +115,7 @@ class JobResponse(BaseModel):
     error: str | None
     frames_analyzed: int
     summary: AnalysisSummaryResponse | None
+    highlighted_frame: "HighlightedFrameResponse | None" = None
     summary_error: str | None = None
     schema_version: str
 
@@ -133,6 +134,11 @@ class FrameResponse(ArtifactResponse):
     image_height: int | None = None
     inference_time_ms: int | float | None = None
     image_url: str
+
+
+class HighlightedFrameResponse(FrameResponse):
+    sample_index: int = Field(ge=0)
+    mean_confidence: int | float | None = Field(ge=0, le=1, allow_inf_nan=False)
 
 
 class FramePageResponse(BaseModel):

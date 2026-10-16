@@ -223,6 +223,24 @@ OpenAPI y explorador interactivo: http://127.0.0.1:8001/docs.
 | GET /api/v1/analyses/{id}/frames/{index}/image | JPEG anotado del frame seleccionado |
 | GET /api/v1/analyses/{id}/candidate/image | PNG original del candidato BCS, ruta fija local del trabajo; nunca una ruta recibida en el resumen |
 | GET /api/v1/analyses/{id}/results | Descarga JSONL una vez terminado, incluso si hay resultados parciales de un error |
+| GET /api/v1/analyses/{id}/frames.zip | Descarga todos los JPG anotados disponibles en un ZIP al finalizar; incluye resultados parciales de un análisis fallido |
+
+Las imágenes se sirven como `image/jpeg` con sus mismos bytes; la opción
+`?download=true` agrega una disposición de descarga con nombre
+`frame-{id}-{index+1}.jpg`, mientras que la respuesta predeterminada es inline.
+El ZIP responde `application/zip` y `frames-{id}.zip` para trabajos completados
+o fallidos con frames disponibles. Trabajos sin terminar o sin imágenes devuelven
+409; un trabajo desconocido devuelve 404. El archivo incluye solo frames fijos
+`000000.jpg` a `000299.jpg`, en orden, sin rutas de directorio.
+
+Los trabajos terminales pueden incluir `highlighted_frame`: una muestra elegida
+por mayor cantidad de detecciones y, ante empate, mayor confianza promedio; el
+primer empate exacto permanece seleccionado. Frames sin detecciones no exponen
+promedio. `sample_index` es la posición muestreada usada para el visor; no debe
+confundirse con el `frame_index` decodificado. Este destacado no altera el
+candidato BCS, que sigue seleccionando por confianza individual y usa la imagen
+original completa. El campo es opcional para mantener compatibilidad con trabajos
+históricos.
 
 Trabajo: `schema_version=vacca-video-job-v1`, `id`, `name`, `status`, `created_at`,
 `error`, `frames_analyzed`, `summary`. Estados: pending, processing, completed,

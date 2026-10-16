@@ -4,6 +4,9 @@ import json
 import asyncio
 import logging
 import threading
+import io
+import os
+import zipfile
 from urllib.parse import urlencode, urlsplit
 
 import pytest
@@ -72,6 +75,8 @@ class TestClient:
             {
                 "status_code": messages[0]["status"],
                 "content": body,
+                "headers": {key.decode().lower(): value.decode()
+                            for key, value in messages[0].get("headers", [])},
                 "json": lambda self: json.loads(body),
             },
         )()
@@ -332,7 +337,7 @@ def test_job_json_contract_and_nullable_summary(client):
     job = submit(client).json()
     assert set(job) == {
         "id", "name", "status", "created_at", "error", "frames_analyzed",
-        "summary", "schema_version",
+        "summary", "schema_version", "highlighted_frame",
     }
     assert job["error"] is None and job["summary"] is None
     assert job["frames_analyzed"] == 0
@@ -619,3 +624,152 @@ def test_lifespan_recovers_pending_and_stops_worker(tmp_path, monkeypatch):
 
     asyncio.run(run())
     assert calls == ["start", "stop", ("join", 10)]
+def test_highlight_prefers_count_then_confidence_and_keeps_first_tie():
+    frames = [
+        {"frame_index": 0, "timestamp_ms": 0, "detection_count": 1,
+         "detections": [{"confidence": 0.99}]},
+        {"frame_index": 5, "timestamp_ms": 200, "detection_count": 2,
+         "detections": [{"confidence": 0.6}, {"confidence": 0.8}]},
+        {"frame_index": 10, "timestamp_ms": 400, "detection_count": 2,
+         "detections": [{"confidence": 0.8}, {"confidence": 0.9}]},
+        {"frame_index": 15, "timestamp_ms": 600, "detection_count": 2,
+         "detections": [{"confidence": 0.8}, {"confidence": 0.9}]},
+    ]
+    best = webapp.highlighted_frame(frames, "job")
+    assert best["frame_index"] == 10
+    assert best["sample_index"] == 2
+    assert best["mean_confidence"] == pytest.approx(0.85)
+    assert best["image_url"].endswith("/frames/2/image")
+    assert webapp.highlighted_frame([], "job") is None
+    empty = webapp.highlighted_frame([
+        {"frame_index": 0, "timestamp_ms": 0, "detection_count": 0,
+         "detections": []}], "job")
+    assert empty["mean_confidence"] is None
+
+
+def test_completed_job_includes_highlight_and_downloadable_image(client):
+    job_id = submit(client).json()["id"]
+    store = client.app.state.store
+    path = store.directory / job_id / "result"
+    (path / "frames").mkdir(parents=True)
+    frame = {"frame_index": 12, "timestamp_ms": 400, "detection_count": 1,
+             "detections": [{"confidence": 0.9}]}
+    (path / "detections.jsonl").write_text(json.dumps(frame), encoding="utf-8")
+    (path / "frames/000000.jpg").write_bytes(b"jpeg fixture")
+    assert client.get(f"/api/v1/analyses/{job_id}").json()["highlighted_frame"] is None
+    store.update(job_id, "completed")
+    best = client.get(f"/api/v1/analyses/{job_id}").json()["highlighted_frame"]
+    assert best["frame_index"] == 12
+    assert best["mean_confidence"] == 0.9
+    assert client.get(best["image_url"] + "?download=true").content == b"jpeg fixture"
+
+
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_download_frames_zip_contains_only_job_images(client, status):
+    job_id = submit(client).json()["id"]
+    store = client.app.state.store
+    frames = store.directory / job_id / "result/frames"
+    frames.mkdir(parents=True)
+    (frames / "000000.jpg").write_bytes(b"first jpeg")
+    (frames / "000002.jpg").write_bytes(b"third jpeg")
+    (frames / "private.txt").write_text("not a frame")
+    (frames / "000300.jpg").write_bytes(b"outside limit")
+    url = f"/api/v1/analyses/{job_id}/frames.zip"
+    assert client.get(url).status_code == 409
+    store.update(job_id, status)
+    response = client.get(url)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["content-disposition"] == f'attachment; filename="frames-{job_id}.zip"'
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert archive.namelist() == ["000000.jpg", "000002.jpg"]
+        assert archive.read("000000.jpg") == b"first jpeg"
+        assert archive.read("000002.jpg") == b"third jpeg"
+    assert client.get("/api/v1/analyses/missing/frames.zip").status_code == 404
+
+
+def test_image_download_has_attachment_name_and_same_inline_bytes(client):
+    job_id = submit(client).json()["id"]
+    frame = client.app.state.store.directory / job_id / "result/frames/000000.jpg"
+    frame.parent.mkdir(parents=True)
+    frame.write_bytes(b"unchanged jpeg bytes")
+
+    inline = client.get(f"/api/v1/analyses/{job_id}/frames/0/image")
+    download = client.get(f"/api/v1/analyses/{job_id}/frames/0/image?download=true")
+
+    assert inline.content == download.content == b"unchanged jpeg bytes"
+    assert "attachment" not in inline.headers.get("content-disposition", "")
+    assert download.headers["content-type"] == "image/jpeg"
+    assert download.headers["content-disposition"] == f'attachment; filename="frame-{job_id}-1.jpg"'
+
+
+def test_frame_routes_reject_linked_job_ancestry(client, tmp_path):
+    store = client.app.state.store
+    job_id = submit(client).json()["id"]
+    other_id = submit(client).json()["id"]
+    target = store.directory / other_id / "result/frames"
+    target.mkdir(parents=True)
+    (target / "000000.jpg").write_bytes(b"other job")
+    linked = store.directory / job_id / "result"
+    try:
+        linked.symlink_to(store.directory / other_id / "result", target_is_directory=True)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
+
+    assert client.get(f"/api/v1/analyses/{job_id}/frames/0/image").status_code == 404
+
+
+def test_download_frames_zip_rejects_empty_results(client):
+    job_id = submit(client).json()["id"]
+    client.app.state.store.update(job_id, "completed")
+    assert client.get(f"/api/v1/analyses/{job_id}/frames.zip").status_code == 409
+
+
+def test_zip_allocation_failure_is_507_and_preserves_source_frame(client, monkeypatch):
+    job_id = submit(client).json()["id"]
+    store = client.app.state.store
+    frame = store.directory / job_id / "result/frames/000000.jpg"
+    frame.parent.mkdir(parents=True)
+    frame.write_bytes(b"source remains intact")
+    store.update(job_id, "completed")
+
+    class FailedZip:
+        def __init__(self, *args, **kwargs):
+            raise OSError("synthetic archive allocation failure")
+
+    monkeypatch.setattr(webapp.zipfile, "ZipFile", FailedZip)
+    response = client.get(f"/api/v1/analyses/{job_id}/frames.zip")
+
+    assert response.status_code == 507
+    assert frame.read_bytes() == b"source remains intact"
+
+
+def test_unrenderable_highlight_isolated_without_corrupting_summary_or_history(client):
+    store = client.app.state.store
+    bad_id = submit(client, "bad-highlight.mp4").json()["id"]
+    good_id = submit(client, "neighbor.mp4").json()["id"]
+    for job_id in (bad_id, good_id):
+        store.update(job_id, "completed")
+        (store.directory / job_id / "result").mkdir()
+    summary = {"status": "completed", "extension": "kept"}
+    (store.directory / bad_id / "result/summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    (store.directory / good_id / "result/summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    deeply_nested = "0"
+    for _ in range(300):
+        deeply_nested = [deeply_nested]
+    bad_frame = {"frame_index": deeply_nested, "timestamp_ms": 1,
+                 "detection_count": 1, "detections": [{"confidence": 0.8}]}
+    (store.directory / bad_id / "result/detections.jsonl").write_text(
+        json.dumps(bad_frame) + "\n", encoding="utf-8"
+    )
+
+    history = client.get("/api/v1/analyses")
+
+    assert history.status_code == 200
+    jobs = {item["id"]: item for item in history.json()}
+    assert jobs[bad_id]["highlighted_frame"] is None
+    assert jobs[bad_id]["summary"] == summary
+    assert "summary_error" not in jobs[bad_id]
+    assert jobs[good_id]["summary"] == summary

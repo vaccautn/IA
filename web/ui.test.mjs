@@ -13,7 +13,12 @@ const reply = (body, status = 200) => ({ body, status });
 const job = (id, frames = 3) => ({
   id, name: `${id}.mp4`, status: frames ? "completed" : "pending",
   created_at: "2026-10-12T12:00:00Z", error: null, frames_analyzed: frames,
-  summary: null, schema_version: "vacca-video-job-v1"
+  summary: null, schema_version: "vacca-video-job-v1",
+  ...(frames ? { highlighted_frame: {
+    frame_index: 17, sample_index: 1, timestamp_ms: 1200, detection_count: 2,
+    mean_confidence: 0.875, detections: [{ confidence: 0.9 }, { confidence: 0.85 }],
+    image_url: `/api/v1/analyses/${id}/frames/1/image`
+  } } : {})
 });
 const frame = (id, index) => ({ items: [{
   image_url: `/api/v1/analyses/${id}/frames/${index}/image`, timestamp_ms: (id === "b" ? 2000 : 1000) + index * 200,
@@ -51,6 +56,7 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     ["fonts/Manrope-VariableFont_wght.woff2", "font/woff2"]
   ].map(async ([name, type]) => [`/videos/${name}`, { type, body: await readFile(path.join(webRoot, "public", name)) }])));
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="48"><rect width="64" height="48" fill="green"/></svg>';
+  const zipBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x66, 0x72, 0x61, 0x6d, 0x65]);
   const server = createServer((request, response) => {
     if (request.url === "/videos/") {
       response.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -132,6 +138,16 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     };
     await page.route("**/api/v1/**", async (route) => {
       const request = route.request(), endpoint = new URL(request.url());
+      if (endpoint.pathname.endsWith("/frames.zip")) {
+        return route.fulfill({ status: 200, contentType: "application/zip", headers: {
+          "content-disposition": `attachment; filename="frames-${endpoint.pathname.split("/")[4]}.zip"`
+        }, body: zipBytes });
+      }
+      if (endpoint.pathname.endsWith("/results")) {
+        return route.fulfill({ status: 200, contentType: "application/x-ndjson",
+          headers: { "content-disposition": `attachment; filename="${endpoint.pathname.split("/")[4]}.jsonl"` },
+          body: Buffer.from('{"frame_index":17}\n') });
+      }
       if (/\/frames\/\d+\/image$/.test(endpoint.pathname) || endpoint.pathname.endsWith("/candidate/image")) {
         return route.fulfill({ contentType: "image/svg+xml", body: svg });
       }
@@ -317,6 +333,27 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     assert.equal(await page.evaluate(() => window.timerCounts().playback), 0);
     await page.evaluate(() => window.advanceVideoTimers(true));
     assert.equal(await page.getByRole("slider").inputValue(), "0");
+  });
+
+  await t.test("downloads keep binary payloads and the highlight seeks without changing BCS", async (t) => {
+    const { page } = await fixture(t);
+    const highlight = page.getByRole("region", { name: "Frame destacado por detecciones" });
+    await highlight.getByText(/confianza promedio 87\.5 %/).waitFor();
+    await highlight.getByRole("button", { name: "Ver frame destacado" }).click();
+    await page.locator('.viewer img[src="/api/v1/analyses/a/frames/1/image"]').waitFor();
+    assert.equal(await page.getByRole("slider").inputValue(), "1");
+    assert.equal(await page.getByRole("region", { name: "BCS del frame seleccionado" }).count(), 0);
+    for (const [name, signature] of [["Descargar frames (ZIP)", "PK"], ["Descargar detecciones (JSONL)", "{\"frame_index\":17}"]]) {
+      const [download] = await Promise.all([
+        page.waitForEvent("download"),
+        page.getByRole("link", { name }).click()
+      ]);
+      assert.match(download.suggestedFilename(), name.includes("ZIP") ? /^frames-a\.zip$/ : /^a\.jsonl$/);
+      const stream = await download.createReadStream();
+      const chunks = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      assert.ok(Buffer.concat(chunks).includes(Buffer.from(signature)));
+    }
   });
 
   await t.test("React unmount stops timers and ignores in-flight history/frame/upload results", async (t) => {

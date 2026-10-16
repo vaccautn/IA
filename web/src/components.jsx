@@ -28,13 +28,24 @@ export function History({ jobs, selected, choose }) {
 }
 
 export function Results({ job, count, frame, index, playing, setPlaying, setIndex }) {
-  return <section className="card results" aria-labelledby="video-results-title"><div className="section-title"><div><h2 id="video-results-title">Resultados del análisis</h2><p>{job?.name ?? "Las detecciones aparecer\xE1n ac\xE1."}</p></div>{job && count > 0 && !["pending", "processing"].includes(job.status) && <a className="secondary" href={`/api/v1/analyses/${job.id}/results`}>Descargar detecciones</a>}</div>
+  const highlight = job?.highlighted_frame;
+  return <section className="card results" aria-labelledby="video-results-title"><div className="section-title"><div><h2 id="video-results-title">Resultados del análisis</h2><p>{job?.name ?? "Las detecciones aparecer\xE1n ac\xE1."}</p></div>{job && count > 0 && !["pending", "processing"].includes(job.status) && <div className="download-actions"><a className="secondary" href={`/api/v1/analyses/${job.id}/frames.zip`}>Descargar frames (ZIP)</a><a className="secondary" href={`/api/v1/analyses/${job.id}/results`}>Descargar detecciones (JSONL)</a></div>}</div>
     {job?.status === "pending" && <div className="notice" role="status">En espera. Los videos se procesan de a uno.</div>}
     {job?.status === "processing" && <div className="notice" role="status"><span className="spinner" /> Procesando · {count} frames analizados. La carga inicial del modelo puede tardar.</div>}
     {job?.error && <div className="alert" role="alert">{job.error}</div>}
     {job?.summary_error && <div className="alert" role="alert">{job.summary_error}</div>}
     {job?.summary?.stop_reason === "frame_limit" && <div className="notice">Resultado parcial: se alcanzó el límite de {MAX_FRAMES} frames.</div>}
     <CandidateBCS job={job} />
+    {highlight && <section className="final-summary" aria-label="Frame destacado por detecciones">
+      <h2>{job.status === "failed" || job.summary?.stop_reason === "frame_limit" ? "Resumen de los frames analizados" : "Frame destacado"}</h2>
+      <p>{highlight.detection_count} detecciones · confianza promedio {highlight.mean_confidence == null ? "no disponible sin detecciones" : `${(highlight.mean_confidence * 100).toFixed(1)} %`}.</p>
+      <p>Frame de origen {highlight.frame_index ?? "—"} · {(highlight.timestamp_ms / 1000).toFixed(2)} s · muestra {highlight.sample_index + 1} de {count}.</p>
+      <img className="highlight-image" src={highlight.image_url} alt={`Frame destacado con ${highlight.detection_count} detecciones`} />
+      {highlight.detections?.length > 0 && <ul className="confidence-list">{highlight.detections.map((detection, i) => <li key={i}>Detección {i + 1}: {(detection.confidence * 100).toFixed(1)} %</li>)}</ul>}
+      <a className="secondary" href={`${highlight.image_url}?download=true`}>Descargar frame destacado (JPG)</a>
+      <button className="secondary" onClick={() => { setPlaying(false); setIndex(highlight.sample_index); }}>Ver frame destacado</button>
+      <p className="hint">El destacado prioriza la cantidad de detecciones y luego su confianza promedio. Esto no indica animales únicos ni garantiza exactitud; es independiente de la selección de imagen original para BCS.</p>
+    </section>}
     {count > 0 ? <><div className="metrics"><div><span>Frames analizados</span><strong>{count}</strong></div><div><span>Detecciones en este frame</span><strong>{frame?.detection_count ?? "\u2014"}</strong></div><div><span>Tiempo en el video</span><strong>{frame ? `${(frame.timestamp_ms / 1e3).toFixed(2)} s` : "\u2014"}</strong></div></div><div className="viewer">{frame ? <img key={frame.image_url} src={frame.image_url} alt={`Frame a ${(frame.timestamp_ms / 1e3).toFixed(2)} segundos con ${frame.detection_count} detecciones`} /> : <span>Cargando frame…</span>}</div><div className="controls"><button className="secondary" onClick={() => setPlaying(!playing)}>{playing ? "Pausar" : "Reproducir frames"}</button><input aria-label="Frame del análisis" type="range" min="0" max={Math.max(0, count - 1)} value={index} onChange={(event) => {
       setPlaying(false);
       setIndex(Number(event.target.value));
