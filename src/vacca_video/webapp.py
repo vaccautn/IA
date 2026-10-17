@@ -179,6 +179,12 @@ def create_router():
         "/api/v1/analyses", status_code=202, response_model=JobResponse,
         response_model_exclude_unset=True,
         responses={code: {"model": VideoErrorResponse} for code in (413, 415, 429, 507)},
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {"video/mp4": {"schema": {"type": "string", "format": "binary"}}},
+            },
+        },
     )
     async def upload(
         request: Request, filename: str = Query(min_length=1, max_length=200),
@@ -248,7 +254,17 @@ def create_router():
             "total": len(frames),
         }
 
-    @router.get("/api/v1/analyses/{job_id}/frames/{index}/image")
+    @router.get(
+        "/api/v1/analyses/{job_id}/frames/{index}/image", response_class=FileResponse,
+        responses={200: {
+            "description": "Annotated JPEG; attachment only when download=true, otherwise no Content-Disposition header.",
+            "content": {"image/jpeg": {"schema": {"type": "string", "format": "binary"}}},
+            "headers": {"Content-Disposition": {
+                "description": "Present only with download=true: attachment; filename=frame-{job_id}-{index+1}.jpg",
+                "schema": {"type": "string"},
+            }},
+        }},
+    )
     def image(job_id: str, index: int, download: bool = False,
               store: Store = Depends(video_store)):
         store.get(job_id)
@@ -265,7 +281,17 @@ def create_router():
             filename=f"frame-{job_id}-{index + 1}.jpg" if download else None,
         )
 
-    @router.get("/api/v1/analyses/{job_id}/frames.zip")
+    @router.get(
+        "/api/v1/analyses/{job_id}/frames.zip", response_class=StreamingResponse,
+        responses={200: {
+            "description": "ZIP of available annotated frames from a completed or failed analysis.",
+            "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}},
+            "headers": {"Content-Disposition": {
+                "description": "attachment; filename=frames-{job_id}.zip",
+                "schema": {"type": "string"},
+            }},
+        }},
+    )
     def download_frames(job_id: str, store: Store = Depends(video_store)):
         job = store.get(job_id)
         if job["status"] not in ("completed", "failed"):
@@ -318,7 +344,13 @@ def create_router():
             headers={"Content-Disposition": f'attachment; filename="frames-{job_id}.zip"'},
         )
 
-    @router.get("/api/v1/analyses/{job_id}/candidate/image")
+    @router.get(
+        "/api/v1/analyses/{job_id}/candidate/image", response_class=FileResponse,
+        responses={200: {
+            "description": "Original candidate PNG, without a Content-Disposition header.",
+            "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}},
+        }},
+    )
     def candidate_image(job_id: str, store: Store = Depends(video_store)):
         store.get(job_id)
         try:
@@ -329,7 +361,17 @@ def create_router():
             raise HTTPException(404, "Imagen candidata no disponible") from None
         return FileResponse(path, media_type="image/png")
 
-    @router.get("/api/v1/analyses/{job_id}/results")
+    @router.get(
+        "/api/v1/analyses/{job_id}/results", response_class=FileResponse,
+        responses={200: {
+            "description": "NDJSON download: one frame record per line, not a single JSON object; may contain partial results from a failed analysis.",
+            "content": {"application/x-ndjson": {"schema": {"type": "string", "format": "binary"}}},
+            "headers": {"Content-Disposition": {
+                "description": "attachment; filename={job_id}.jsonl",
+                "schema": {"type": "string"},
+            }},
+        }},
+    )
     def download(job_id: str, store: Store = Depends(video_store)):
         job = store.get(job_id)
         path = store.directory / job_id / "result/detections.jsonl"

@@ -97,6 +97,21 @@ def test_principal_routes_and_video_contract_coexist(client):
     assert client.get("/api/v1/analyses/missing").json() == {"detail": "Análisis no encontrado"}
 
 
+@pytest.mark.parametrize("headers", [
+    {"content-type": "video/mp4"}, {}, {"content-type": "application/octet-stream"},
+])
+def test_raw_mp4_upload_metadata_does_not_change_wire_or_header_policy(client, headers):
+    payload = b"\x00\x00\x00\x18ftypisom00000000"
+    response = client.post(
+        "/api/v1/analyses?filename=raw.mp4", content=payload, headers=headers,
+    )
+    assert response.status_code == 202
+    job = response.json()
+    assert job["name"] == "raw.mp4" and job["status"] == "pending"
+    target = main.app.state.video.store.directory / job["id"] / "input.mp4"
+    assert target.read_bytes() == payload
+
+
 def test_primary_lifespan_recovery_persistence_and_finally_shutdown(runtime):
     store = Store(runtime)
     store.add("interrupted", "one.mp4")
