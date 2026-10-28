@@ -373,7 +373,7 @@ def _file_sha256(path: Path) -> str:
 
 @dataclass
 class PassageEvidence:
-    """Confidence-only candidates, never unique animal identities.
+    """Confidence/foreground candidates, never unique animal identities.
 
     Defaults are uncalibrated heuristics. Intervals are half-open at the
     confirmation sample; the last interval ends inclusively at the last sample.
@@ -382,12 +382,16 @@ class PassageEvidence:
 
     confirmation_count: int = 3
     confidence_margin: float = 0.1
+    max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS
+    recovery_area_ratio: float = 1.5
+    recovery_bottom_fraction: float = 0.10
     intervals: list[dict] = field(default_factory=list)
     retired: set[int] = field(default_factory=set)
     warnings: set[str] = field(default_factory=set)
     pending: dict | None = None
     last: tuple | None = None
     active_missing: bool = False
+    reference: dict | None = None
 
     def __post_init__(self):
         if type(self.confirmation_count) is not int or self.confirmation_count < 1:
@@ -396,8 +400,35 @@ class PassageEvidence:
                 or not isinstance(self.confidence_margin, (int, float))
                 or not math.isfinite(self.confidence_margin) or self.confidence_margin < 0):
             raise ValueError("passage_confidence_margin must be finite and nonnegative")
+        for name, value, lower, upper in (
+            ("max_gap_seconds", self.max_gap_seconds, 0, math.inf),
+            ("recovery_area_ratio", self.recovery_area_ratio, 1, math.inf),
+            ("recovery_bottom_fraction", self.recovery_bottom_fraction, 0, 1),
+        ):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not lower < value <= upper):
+                raise ValueError(f"passage_{name} must be finite and in ({lower}, {upper}]")
 
-    def observe(self, detections, frame, timestamp_ms):
+    @staticmethod
+    def _geometry(detection, frame_size):
+        """Reject malformed geometry, never clamp it into recovery evidence."""
+        try:
+            if len(frame_size) != 2 or len(detection.get("bbox")) != 4:
+                return None
+            values = (*frame_size, *detection["bbox"])
+            if any(isinstance(v, bool) or not isinstance(v, (int, float))
+                   or not math.isfinite(v) for v in values):
+                return None
+            width, height = frame_size
+            x1, y1, x2, y2 = detection["bbox"]
+            if width < 2 or height < 2 or not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+                return None
+            return {"bbox": [x1, y1, x2, y2], "frame_size": list(frame_size)}
+        except TypeError:
+            return None
+
+    def observe(self, detections, frame, timestamp_ms, *, frame_size=None):
+        # Callers supply strictly increasing source frames/times, not wall time.
         self.last = (frame, timestamp_ms)
         scores = {}
         seen = set()
@@ -414,23 +445,40 @@ class PassageEvidence:
                 self.warnings.add("invalid_confidence_unresolved")
                 invalid = True
         active = self.intervals[-1]["track_id"] if self.intervals else None
-        if active is not None:
-            if active not in scores:
-                self.active_missing = True
-                self.warnings.add("missing_incumbent_attribution_unresolved")
-                self.pending = None
-                return
-            if self.active_missing:
-                self.warnings.add("possible_track_id_reuse_unresolved")
-                self.active_missing = False
         if invalid:
             self.pending = None
             return
+        by_id = {d["track_id"]: d for d in detections}
+        missing = active is not None and active not in scores
+        if active is not None:
+            if missing:
+                self.active_missing = True
+                self.warnings.add("missing_incumbent_attribution_unresolved")
+            else:
+                if self.active_missing:
+                    self.warnings.add("possible_track_id_reuse_unresolved")
+                    self.active_missing = False
+                    self.pending = None
+                geometry = self._geometry(by_id[active], frame_size)
+                if geometry is not None:
+                    self.reference = dict(geometry, track_id=active, frame=frame,
+                                          timestamp_ms=timestamp_ms)
+        method = "missing_incumbent_foreground" if missing else "concurrent_confidence"
+        if self.pending and self.pending.get("method", "concurrent_confidence") != method:
+            self.pending = None
+        if missing:
+            if (self.reference is None or self.reference["track_id"] != active
+                    or self._geometry(self.reference, frame_size) is None
+                    or self.reference["frame_size"] != list(frame_size)
+                    or not 0 < timestamp_ms - self.reference["timestamp_ms"] <= self.max_gap_seconds * 1000):
+                self.warnings.add("missing_incumbent_reference_unavailable_or_stale")
+                self.pending = None
+                return
         ranked = sorted(scores, key=scores.get, reverse=True)
         winner = ranked[0] if ranked else None
         if len(ranked) > 1:
             delta = scores[winner] - scores[ranked[1]]
-            if delta <= 0 or (active is None and delta < self.confidence_margin
+            if delta <= 0 or ((active is None or missing) and delta < self.confidence_margin
                               and not math.isclose(delta, self.confidence_margin,
                                                    rel_tol=0, abs_tol=PASSAGE_MARGIN_EPSILON)):
                 self.warnings.add("ambiguous_dominance_unresolved")
@@ -441,11 +489,23 @@ class PassageEvidence:
             self.pending = None
             return
         # The unique strongest challenger must also beat this sample's incumbent.
-        if active is not None:
+        if active is not None and not missing:
             delta = scores[winner] - scores[active]
             if delta <= 0 or (delta < self.confidence_margin
                               and not math.isclose(delta, self.confidence_margin,
                                                    rel_tol=0, abs_tol=PASSAGE_MARGIN_EPSILON)):
+                self.pending = None
+                return
+        recovery = None
+        if missing:
+            geometry = self._geometry(by_id[winner], frame_size)
+            if geometry is not None:
+                a, b = self.reference["bbox"], geometry["bbox"]
+                area_ratio = ((b[2] - b[0]) * (b[3] - b[1])) / ((a[2] - a[0]) * (a[3] - a[1]))
+                bottom_fraction = (b[3] - a[3]) / frame_size[1]
+                if area_ratio >= self.recovery_area_ratio and bottom_fraction >= self.recovery_bottom_fraction:
+                    recovery = dict(geometry, area_ratio=area_ratio, bottom_fraction=bottom_fraction)
+            if recovery is None:
                 self.pending = None
                 return
         if active is None:
@@ -455,14 +515,20 @@ class PassageEvidence:
             if self.pending is None or self.pending["track_id"] != winner:
                 self.pending = {"track_id": winner, "count": 0, "start_frame": frame,
                                 "start_timestamp_ms": timestamp_ms}
+                if missing:
+                    self.pending["method"] = method
             self.pending["count"] += 1
             if self.pending["count"] < self.confirmation_count:
                 return
             support = self.pending.copy()
+            if missing:
+                support.update(reference=self.reference.copy(), geometry=recovery,
+                               elapsed_since_reference_ms=timestamp_ms - self.reference["timestamp_ms"])
             self.intervals[-1].update(end_frame=frame, end_timestamp_ms=timestamp_ms,
                                       end_exclusive=True)
             self.retired.add(active)
         self.intervals.append({"track_id": winner, "status": "passage_evidence_candidate",
+                               "transition_method": method if active is not None else "initial_confidence",
                                "sequence": len(self.intervals) + 1,
                                "candidate": {"status": "not_available", "reason": "no_candidate_captured",
                                              "bcs_eligibility": "not_assessed", "bcs_status": "not_evaluated"},
@@ -471,6 +537,10 @@ class PassageEvidence:
                                                confirmation_timestamp_ms=timestamp_ms),
                                "warnings": []})
         self.pending = None
+        self.active_missing = False
+        geometry = self._geometry(by_id[winner], frame_size)
+        self.reference = (dict(geometry, track_id=winner, frame=frame, timestamp_ms=timestamp_ms)
+                          if geometry is not None else None)
 
     def capture_candidate(self, output, image, detection, score, contamination, overlap_iou,
                           crop_margin, others=()):
@@ -554,6 +624,12 @@ class PassageEvidence:
         return {"status": "provisional_evidence_not_unique_animal_identity",
                 "policy": {"confirmation_count": self.confirmation_count,
                            "confidence_margin": self.confidence_margin,
+                           "max_gap_seconds": self.max_gap_seconds,
+                           "recovery_area_ratio": self.recovery_area_ratio,
+                           "recovery_bottom_fraction": self.recovery_bottom_fraction,
+                           "recovery_limitations": "uncalibrated_larger_lower_foreground_not_identity; "
+                                                   "fragment_like_or_stale_geometry_stays_unresolved",
+                           "observation_order": "strictly_increasing_source_frames_and_timestamps",
                            "numerical_margin_epsilon": PASSAGE_MARGIN_EPSILON,
                            "calibration": "uncalibrated_confidence_proxy_not_visibility_or_bcs",
                            "boundary": "confirmation_sample_half_open_final_end_inclusive",
@@ -572,7 +648,9 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
                 crop_margin: float = DEFAULT_CROP_MARGIN, clip_format: str = "mp4",
                 max_seconds: float | None = None, max_frames: int | None = None, model=None,
                 segmenter=None, segment_limit: int = DEFAULT_SEGMENT_LIMIT,
-                passage_confirmation_count: int = 3, passage_confidence_margin: float = 0.1) -> dict:
+                passage_confirmation_count: int = 3, passage_confidence_margin: float = 0.1,
+                passage_recovery_area_ratio: float = 1.5,
+                passage_recovery_bottom_fraction: float = 0.10) -> dict:
     """Run Ultralytics tracking and write one directory per temporal track.
 
     ``model`` accepts any object exposing Ultralytics' ``track`` API; when it is
@@ -587,7 +665,9 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
     """
     import cv2
 
-    passages = PassageEvidence(passage_confirmation_count, passage_confidence_margin)
+    passages = PassageEvidence(passage_confirmation_count, passage_confidence_margin,
+                               max_gap_seconds, passage_recovery_area_ratio,
+                               passage_recovery_bottom_fraction)
     input_path, output, model_path = Path(input_path), Path(output), Path(model_path)
     if not math.isfinite(confidence) or not 0 <= confidence <= 1:
         raise ValueError("confidence debe estar entre 0 y 1")
@@ -622,6 +702,10 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     clip_fps = min(sample_fps, fps) if sample_fps else fps
+    # Count includes the first missing sample: all confirmations must fit since
+    # the last valid incumbent, not just since the challenger started winning.
+    if passage_confirmation_count / clip_fps > max_gap_seconds:
+        passages.warnings.add("recovery_confirmation_exceeds_gap_at_sample_rate")
     max_gap_ms = max_gap_seconds * 1000.0
     stats: dict[int, TrackStats] = {}
     writers = {}
@@ -664,7 +748,8 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
                 detections, all_boxes = _result_detections(results[0], image)
                 if len(all_boxes) > len(detections):
                     passages.warnings.add("untracked_detection_attribution_unresolved")
-                passages.observe(detections, frame_index, timestamp_ms)
+                passages.observe(detections, frame_index, timestamp_ms,
+                                 frame_size=(image.shape[1], image.shape[0]))
                 for detection in detections:
                     track_id, bbox = detection["track_id"], detection["bbox"]
                     others = [box for index, box in enumerate(all_boxes) if index != detection["box_index"]]

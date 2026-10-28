@@ -930,6 +930,160 @@ def test_passage_without_capture_is_explicit_not_a_bcs_result():
                                      "bcs_eligibility": "not_assessed", "bcs_status": "not_evaluated"}
 
 
+# Compact geometry derived from the approved trace; IDs deliberately differ.
+REFERENCE = (449, 176, 626, 522)
+FOREGROUND = (631, 486, 1272, 720)
+FRAGMENT = (453, 211, 678, 538)
+
+
+def _spatial(evidence, frame, items, size=(1280, 720), step=100):
+    evidence.observe([dict(track_id=key, bbox=box, confidence=score)
+                      for key, box, score in items], frame, frame * step, frame_size=size)
+
+
+def test_missing_foreground_recovery_trace_and_provenance():
+    evidence = PassageEvidence()
+    _spatial(evidence, 0, [(50, REFERENCE, .99), (60, FOREGROUND, .7)])
+    for frame in range(1, 4):
+        _spatial(evidence, frame, [(60, FOREGROUND, .8), (70, FRAGMENT, .6)])
+    first, second = evidence.intervals
+    assert [first["track_id"], second["track_id"]] == [50, 60]
+    assert first["end_exclusive"] and first["end_frame"] == second["start_frame"] == 3
+    assert second["transition_method"] == "missing_incumbent_foreground"
+    support = second["support"]
+    assert support["count"] == 3 and support["reference"]["frame"] == 0
+    assert support["reference"]["bbox"] == list(REFERENCE)
+    assert support["geometry"]["area_ratio"] > 2
+    assert support["elapsed_since_reference_ms"] == 300
+    # A subsequent incumbent reference can recover another larger foreground.
+    _spatial(evidence, 4, [(60, (700, 200, 900, 500), .8)])
+    for frame in range(5, 8):
+        _spatial(evidence, frame, [(80, (472, 275, 1031, 717), .9)])
+    assert [item["track_id"] for item in evidence.intervals] == [50, 60, 80]
+    for frame in range(8, 11):
+        _spatial(evidence, frame, [(50, (0, 0, 1280, 720), .99)])
+    assert len(evidence.intervals) == 3  # Retired IDs never reopen.
+
+
+@pytest.mark.parametrize("box", [REFERENCE, FRAGMENT, (460, 180, 640, 530),
+    (0, 0, 1000, 550), (486, 107, 620, 287), (450, 170, 600, 720),
+    (449, 176, 900, 522), None, (0, 0, float("nan"), 720), (0, 0, 0, 20),
+    (-1, 0, 1280, 720), (0, 0, 1300, 720)])
+def test_missing_fragment_background_or_invalid_geometry_stays_unresolved(box):
+    evidence = PassageEvidence()
+    _spatial(evidence, 0, [(50, REFERENCE, .9)])
+    for frame in range(1, 5):
+        _spatial(evidence, frame, [(60, box, .9)])
+    assert len(evidence.intervals) == 1 and evidence.pending is None
+
+
+@pytest.mark.parametrize("reset", [[], [(60, FOREGROUND, .9), (70, FOREGROUND, .9)],
+    [(60, FOREGROUND, .9), (70, FOREGROUND, .85)], [(70, FOREGROUND, .9)],
+    [(60, FOREGROUND, float("nan"))], [(60, FOREGROUND, .9)] * 2,
+    [(60, FRAGMENT, .9)], [(50, REFERENCE, .99)]])
+def test_missing_recovery_streak_resets(reset):
+    evidence = PassageEvidence()
+    _spatial(evidence, 0, [(50, REFERENCE, .9)])
+    _spatial(evidence, 1, [(60, FOREGROUND, .9)])
+    _spatial(evidence, 2, reset)
+    for frame in (3, 4):
+        _spatial(evidence, frame, [(60, FOREGROUND, .9)])
+    assert len(evidence.intervals) == 1
+    assert evidence.pending["count"] == 2
+
+
+def test_concurrent_support_cannot_count_as_missing_geometry_support():
+    evidence = PassageEvidence()
+    _spatial(evidence, 0, [(50, REFERENCE, .99)])
+    for frame in (1, 2):
+        _spatial(evidence, frame, [(50, REFERENCE, .4), (60, FOREGROUND, .9)])
+    _spatial(evidence, 3, [(60, FOREGROUND, .9)])
+    assert len(evidence.intervals) == 1 and evidence.pending["count"] == 1
+    _spatial(evidence, 4, [(50, REFERENCE, .4), (60, FOREGROUND, .9)])
+    assert len(evidence.intervals) == 1 and evidence.pending["count"] == 1
+
+
+def test_recovery_cannot_confirm_after_reference_expires():
+    evidence = PassageEvidence()
+    _spatial(evidence, 0, [(50, REFERENCE, .99)])
+    for frame in (4, 5, 6, 7):
+        _spatial(evidence, frame, [(60, FOREGROUND, .9)])
+    assert len(evidence.intervals) == 1 and evidence.pending is None
+
+
+@pytest.mark.parametrize("size", [None, 720, (0, 720), (1280, float("inf")), (True, 720), (1280,)])
+def test_missing_recovery_needs_valid_frame_dimensions(size):
+    evidence = PassageEvidence()
+    _spatial(evidence, 0, [(50, REFERENCE, .9)])
+    for frame in range(1, 4):
+        _spatial(evidence, frame, [(60, FOREGROUND, .9)], size=size)
+    assert len(evidence.intervals) == 1
+
+
+@pytest.mark.parametrize("step,recovered", [(1000 / 24, True), (100, False)])
+def test_compact_actual_geometry_replay_respects_sampling_gap(step, recovered):
+    evidence = PassageEvidence()
+    _spatial(evidence, 114, [(50, REFERENCE, .99)], step=step)
+    for frame in (121, 122, 123):
+        _spatial(evidence, frame, [(60, (308, 318, 1198, 713), .9)], step=step)
+    assert (len(evidence.intervals) == 2) is recovered
+    if not recovered:
+        return
+    _spatial(evidence, 159, [(60, (467, 148, 715, 520), .9)], step=step)
+    for frame in (161, 162, 163):
+        _spatial(evidence, frame, [(80, (421, 231, 1030, 718), .9)], step=step)
+    assert evidence.intervals[-1]["track_id"] == 80
+    # An overlapping, similarly sized box cannot recover as a new foreground.
+    for frame in (169, 170, 171):
+        _spatial(evidence, frame, [(90, (450, 245, 1010, 717), .9)], step=step)
+    assert evidence.intervals[-1]["track_id"] == 80 and evidence.pending is None
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "score", "box"])
+def test_invalid_incumbent_never_refreshes_reference(invalid):
+    evidence = PassageEvidence()
+    _spatial(evidence, 0, [(50, REFERENCE, .9)])
+    items = [(50, FOREGROUND if invalid != "box" else None,
+              float("nan") if invalid == "score" else .9)]
+    _spatial(evidence, 4, items * (2 if invalid == "duplicate" else 1))
+    for frame in (5, 6, 7):
+        _spatial(evidence, frame, [(60, FOREGROUND, .9)])
+    assert len(evidence.intervals) == 1 and evidence.pending is None
+    assert evidence.reference["frame"] == 0
+
+
+@pytest.mark.parametrize("kwargs", [
+    {key: value} for key in ("passage_recovery_area_ratio", "passage_recovery_bottom_fraction")
+    for value in (float("nan"), float("inf"), True, -1)
+] + [{"passage_recovery_area_ratio": 1}, {"passage_recovery_bottom_fraction": 0},
+     {"passage_recovery_bottom_fraction": 1.1}])
+def test_invalid_recovery_policy_before_output(media, kwargs):
+    test_invalid_passage_parameters_fail_before_output(media, kwargs)
+
+
+def test_nondefault_recovery_bound_and_sparse_sampling(media):
+    summary, _ = _run(media, 24, lambda call: [(50, (40, 20, 70, 60), .9)]
+                      if call == 0 else [(60, (80, 30, 180, 120), .9)],
+                      sample_fps=6, max_gap_seconds=.3,
+                      passage_recovery_area_ratio=2, passage_recovery_bottom_fraction=.2)
+    evidence = summary["passage_evidence"]
+    assert len(evidence["intervals"]) == 1
+    assert "recovery_confirmation_exceeds_gap_at_sample_rate" in evidence["warnings"]
+    assert evidence["policy"]["recovery_area_ratio"] == 2
+    assert evidence["policy"]["max_gap_seconds"] == .3
+
+
+def test_fallback_boundary_captures_actual_candidate_image(media, passage_images):
+    passage_images([10, 9, 8, 7, 6])
+    summary, output = _run(media, 5, lambda call: [(50, (40, 20, 70, 60), .99)]
+                           if call == 0 else [(60, (80, 30, 180, 120), .8)])
+    first, final = summary["passage_evidence"]["intervals"]
+    _assert_passage_image(output, first, 0)
+    _assert_passage_image(output, final, 3)
+    assert first["end_frame"] == final["start_frame"] == 3
+    assert final["end_frame"] == 4 and not final["end_exclusive"]
+
+
 @pytest.mark.parametrize("failure", ["false", "raise", "replace"])
 @pytest.mark.parametrize("failed_frame", [0, 1], ids=["initial", "replacement"])
 def test_passage_write_failure_releases_resources_without_publishing(
