@@ -571,6 +571,13 @@ def test_passage_summary_integrates_sampled_frames_policy_and_inactive_eof(media
     assert last["end_timestamp_ms"] == pytest.approx(16000 / FPS)
     assert last["end_exclusive"] is False
     assert last["support"]["start_frame"] == 4
+    for interval in (first, last):
+        candidate = interval["candidate"]
+        assert candidate["status"] == "available"
+        assert candidate["track_id"] == interval["track_id"]
+        assert (output / candidate["original"]).is_file()
+    assert first["candidate"]["frame_index"] < 8
+    assert last["candidate"]["frame_index"] == 8
     assert "missing_incumbent_attribution_unresolved" in evidence["warnings"]
     assert [track["track_id"] for track in summary["tracks"]] == [2, 90]
     assert all(track["segmentation"]["status"] == "not_requested" for track in summary["tracks"])
@@ -635,3 +642,167 @@ def test_margin_tolerance_does_not_admit_subthreshold_or_tied_scores(score_type,
     evidence = _passages([[(90, 0.99)]] + [sample] * 4)
     assert [item["track_id"] for item in evidence.intervals] == [90]
     assert evidence.pending is None
+
+
+@pytest.fixture
+def passage_images(monkeypatch):
+    """Distinct, JPEG-stable source pixels and controlled quality per sample."""
+    import vacca_video.tracking as tracking
+
+    original = FakeModel.track
+
+    def track(self, image, **kwargs):
+        image[:] = 20 + self.calls * 20
+        return original(self, image, **kwargs)
+
+    monkeypatch.setattr(FakeModel, "track", track)
+
+    def quality(scores):
+        monkeypatch.setattr(tracking, "frame_quality",
+                            lambda image, *args: scores[(int(image[0, 0, 0]) - 20) // 20])
+
+    return quality
+
+
+def _assert_passage_image(output, interval, frame):
+    candidate = interval["candidate"]
+    assert candidate["status"] == "available"
+    assert candidate["frame_index"] == frame
+    assert candidate["timestamp_ms"] == pytest.approx(frame * 1000 / FPS)
+    assert candidate["track_id"] == interval["track_id"]
+    assert candidate["bcs_eligibility"] == "not_assessed"
+    assert candidate["bcs_status"] == "not_evaluated"
+    assert candidate["original"] == f"passages/{interval['sequence']}/best-original.jpg"
+    image = cv2.imread(str(output / candidate["original"]))
+    assert image.shape == (HEIGHT, WIDTH, 3)
+    assert np.abs(image.astype(int) - (20 + frame * 20)).max() <= 1
+    assert interval["start_frame"] <= frame <= interval["end_frame"]
+    if interval["end_exclusive"]:
+        assert frame < interval["end_frame"]
+    assert not {"best_crop", "best_mask", "segmentation"} & candidate.keys()
+    return candidate
+
+
+def test_passage_candidate_never_inherits_global_best_and_keeps_earliest_tie(media, passage_images):
+    passage_images([9, 5, 4, 3, 3, 2])
+    summary, output = _run(media, 6, lambda call: [
+        (90, (20, 20, 80, 90), 0.95 if call == 0 else 0.5),
+        (2, (100, 20, 180, 90), 0.7 if call == 0 else 0.9)],
+        segmenter=lambda image, bbox: _box_mask((110, 30, 170, 85)))
+    first, second = summary["passage_evidence"]["intervals"]
+    assert [first["sequence"], second["sequence"]] == [1, 2]
+    _assert_passage_image(output, first, 0)
+    candidate = _assert_passage_image(output, second, 3)
+    track = next(item for item in summary["tracks"] if item["track_id"] == 2)
+    assert track["best_frame_index"] == 0
+    assert track["segmentation"]["status"] == "ok"
+    assert candidate["confidence"] == 0.9
+    assert candidate["bbox"] == [100, 20, 180, 90]
+    assert candidate["quality"]["score"] == 3
+    assert candidate["quality"]["method"] == "frame_quality"
+    assert candidate["quality"]["crop_contamination"] == 0
+    assert candidate["quality"]["crop_margin"] == 0.1
+    assert candidate["original"] != track["best_original"]
+    assert json.loads((output / "summary.json").read_text())["passage_evidence"] == summary["passage_evidence"]
+
+
+def test_passage_confirmation_frame_not_available_to_old_interval(media, passage_images):
+    passage_images([1, 2, 3, 10])
+    summary, output = _run(media, 4, lambda call: [
+        (90, (20, 20, 80, 90), 0.95 if call == 0 else 0.5),
+        (2, (100, 20, 180, 90), 0.7 if call == 0 else 0.9)])
+    first, final = summary["passage_evidence"]["intervals"]
+    assert first["end_frame"] == final["start_frame"] == 3
+    _assert_passage_image(output, first, 2)
+    _assert_passage_image(output, final, 3)
+    assert final["end_frame"] == 3 and final["end_exclusive"] is False
+
+
+def test_passage_missing_samples_and_reset_do_not_capture_other_track(media, passage_images):
+    passage_images([1, 2, 99, 3, 4, 99])
+    samples = [[(90, 0.95)], [(90, 0.5), (2, 0.9)], [(2, 0.9)],
+               [(90, 0.5), (2, 0.9)], [(90, 0.5), (2, 0.9)], [(2, 0.9)]]
+    summary, output = _run(media, 6, lambda call: [
+        (key, (20, 20, 80, 90), score) for key, score in samples[call]])
+    interval, = summary["passage_evidence"]["intervals"]
+    _assert_passage_image(output, interval, 4)
+    assert interval["end_frame"] == 5
+    assert summary["passage_evidence"]["unresolved_tracks"][0]["track_id"] == 2
+    assert {item["track_id"] for item in summary["tracks"]} == {90, 2}
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_no_selected_passage_creates_no_candidate_artifacts(media, ambiguous):
+    summary, output = _run(media, 3, lambda call: [
+        (1, (20, 20, 80, 90), 0.9), (2, (100, 20, 180, 90), 0.9)] if ambiguous else [])
+    assert summary["passage_evidence"]["intervals"] == []
+    assert len(summary["passage_evidence"]["unresolved_tracks"]) == (2 if ambiguous else 0)
+    assert not (output / "passages").exists()
+
+
+def test_passage_without_capture_is_explicit_not_a_bcs_result():
+    from vacca_video.tracking import TrackStats
+
+    evidence = _passages([[(1, 0.9)]])
+    interval, = evidence.summary({1: TrackStats(1)})["intervals"]
+    assert interval["candidate"] == {"status": "not_available", "reason": "no_candidate_captured",
+                                     "bcs_eligibility": "not_assessed", "bcs_status": "not_evaluated"}
+
+
+@pytest.mark.parametrize("failure", ["false", "raise", "replace"])
+@pytest.mark.parametrize("failed_frame", [0, 1], ids=["initial", "replacement"])
+def test_passage_write_failure_releases_resources_without_publishing(
+        media, monkeypatch, passage_images, failure, failed_frame):
+    passage_images([1, 2])
+    imwrite, capture_factory, writer_factory = cv2.imwrite, cv2.VideoCapture, cv2.VideoWriter
+    released = []
+
+    class Resource:
+        def __init__(self, resource, name):
+            self.resource, self.name = resource, name
+
+        def __getattr__(self, name):
+            return getattr(self.resource, name)
+
+        def release(self):
+            released.append(self.name)
+            self.resource.release()
+
+    # Patch after input creation, so only tracking resources are counted.
+    root, model_path = media
+    video = _write_video(root / "input.mp4", 2)
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *a: Resource(capture_factory(*a), "capture"))
+    monkeypatch.setattr(cv2, "VideoWriter", lambda *a: Resource(writer_factory(*a), "writer"))
+
+    def write(path, image):
+        if "passages" in Path(path).parts and int(image[0, 0, 0]) == 20 + failed_frame * 20:
+            if failure == "raise":
+                raise OSError("fixture candidate write")
+            if failure == "false":
+                Path(path).write_bytes(b"partial image")
+                return False
+        return imwrite(path, image)
+
+    monkeypatch.setattr(cv2, "imwrite", write)
+    if failure == "replace":
+        original_replace = Path.replace
+        replacements = []
+
+        def replace(source, target):
+            replacements.append(target)
+            if len(replacements) > failed_frame:
+                raise OSError("fixture candidate replace")
+            return original_replace(source, target)
+
+        monkeypatch.setattr(Path, "replace", replace)
+    with pytest.raises(OSError):
+        track_video(video, root / "run", model_path, output_size=(64, 64),
+                    model=FakeModel(lambda call: [(1, (20, 20, 80, 90), 0.9)]))
+    assert sorted(released) == ["capture", "writer"]
+    assert not (root / "run/summary.json").exists()
+    images = list((root / "run/passages").rglob("*.jpg"))
+    if failed_frame == 0:
+        assert images == []
+    else:
+        assert images == [root / "run/passages/1/best-original.jpg"]
+        assert (cv2.imread(str(images[0])) == 20).all(), "Failed replacement preserves prior image"

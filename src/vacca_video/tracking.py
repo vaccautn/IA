@@ -411,11 +411,57 @@ class PassageEvidence:
                                       end_exclusive=True)
             self.retired.add(active)
         self.intervals.append({"track_id": winner, "status": "passage_evidence_candidate",
+                               "sequence": len(self.intervals) + 1,
+                               "candidate": {"status": "not_available", "reason": "no_candidate_captured",
+                                             "bcs_eligibility": "not_assessed", "bcs_status": "not_evaluated"},
                                "start_frame": frame, "start_timestamp_ms": timestamp_ms,
                                "support": dict(support, confirmation_frame=frame,
                                                confirmation_timestamp_ms=timestamp_ms),
                                "warnings": []})
         self.pending = None
+
+    def capture_candidate(self, output, image, detection, score, contamination, overlap_iou, crop_margin):
+        """Persist only the active interval's observed source, with earliest ties.
+
+        Called after observe on the same sample, so a confirmation frame belongs
+        only to the new interval. No full-resolution passage images are retained.
+        The original is a full frame, not an isolated animal or visibility proof.
+        """
+        import cv2
+
+        if not self.intervals or self.last is None:
+            return
+        interval = self.intervals[-1]
+        if detection["track_id"] != interval["track_id"]:
+            return
+        candidate = interval["candidate"]
+        if not math.isfinite(score) or not 0 <= detection["confidence"] <= 1:
+            return
+        if candidate["status"] == "available" and score <= candidate["quality"]["score"]:
+            return
+        relative = Path("passages") / str(interval["sequence"]) / "best-original.jpg"
+        target = output / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(".best-original.tmp.jpg")
+        try:
+            if not cv2.imwrite(str(temporary), image):
+                raise OSError("Could not write passage candidate image")
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        # Publish provenance only after the image has been successfully replaced.
+        frame, timestamp_ms = self.last
+        height, width = image.shape[:2]
+        interval["candidate"] = {
+            "status": "available", "original": relative.as_posix(),
+            "frame_index": frame, "timestamp_ms": timestamp_ms,
+            "track_id": detection["track_id"], "confidence": detection["confidence"],
+            "bbox": list(detection["bbox"]),
+            "quality": {"method": "frame_quality", "score": score,
+                        "crop_contamination": contamination, "crop_margin": crop_margin,
+                        "iou": overlap_iou, "touches_border": touches_border(detection["bbox"], width, height),
+                        "frame_size": [width, height]},
+            "bcs_eligibility": "not_assessed", "bcs_status": "not_evaluated"}
 
     def summary(self, stats):
         if self.intervals and self.last is not None:
@@ -440,6 +486,10 @@ class PassageEvidence:
                            "numerical_margin_epsilon": PASSAGE_MARGIN_EPSILON,
                            "calibration": "uncalibrated_confidence_proxy_not_visibility_or_bcs",
                            "boundary": "confirmation_sample_half_open_final_end_inclusive",
+                           "candidate_selection": "interval_local_frame_quality_max_earliest_tie",
+                           "candidate_limitations": "full_frame_not_isolated_animal; "
+                                                    "contamination_measures_detected_boxes_only; "
+                                                    "no_anatomical_visibility_guarantee",
                            "initial_selection": "single_observation_unique_margin_dominance"},
                 "intervals": self.intervals, "pending": self.pending,
                 "unresolved_tracks": unresolved, "warnings": sorted(self.warnings)}
@@ -600,6 +650,10 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
                         item.best_contamination = contamination
                         item.best_iou = overlap_iou
                         item.best_others = others
+                    # Duplicate IDs have no unique box attribution on this sample.
+                    if sum(other["track_id"] == track_id for other in detections) == 1:
+                        passages.capture_candidate(output, image, detection, score, contamination,
+                                                   overlap_iou, crop_margin)
                     writer.write(crop_with_padding(image, bbox, output_size, crop_margin))
                     item.clip_frames += 1
                     observations.write(json.dumps({
