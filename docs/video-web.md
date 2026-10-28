@@ -37,7 +37,7 @@ determinista; ese proveedor de prueba no es el runtime de la aplicación.
 
 La selección compara solo los frames analizados (hasta 300 a 5 FPS), no todos
 los frames del video. Descarta cero o varias detecciones; un empate de confianza
-conserva el primer frame decodificado elegible. No agrega inferencias, tracking ni
+conserva el primer frame decodificado elegible. No usa las trayectorias ni
 identificadores de animales. Una sola detección **no garantiza** una sola vaca
 real: el detector puede omitir otros animales o producir cajas duplicadas.
 
@@ -216,7 +216,7 @@ OpenAPI y explorador interactivo: http://127.0.0.1:8001/docs.
 
 | Método/ruta | Contrato |
 | --- | --- |
-| POST /api/v1/analyses?filename=nombre.mp4 | Body binario MP4 (no multipart); devuelve 202 y trabajo persistido |
+| POST /api/v1/analyses?filename=nombre.mp4 | Body binario MP4 o MOV de QuickTime (`.mov`, grabaciones de celular), no multipart; devuelve 202 y trabajo persistido |
 | GET /api/v1/analyses | Últimos 100 trabajos, más recientes primero |
 | GET /api/v1/analyses/{id} | Trabajo y resumen final si está disponible |
 | GET /api/v1/analyses/{id}/frames?offset=0&limit=30 | items y total; máximo 100 por página |
@@ -224,6 +224,10 @@ OpenAPI y explorador interactivo: http://127.0.0.1:8001/docs.
 | GET /api/v1/analyses/{id}/candidate/image | PNG original del candidato BCS, ruta fija local del trabajo; nunca una ruta recibida en el resumen |
 | GET /api/v1/analyses/{id}/results | Descarga JSONL una vez terminado, incluso si hay resultados parciales de un error |
 | GET /api/v1/analyses/{id}/frames.zip | Descarga todos los JPG anotados disponibles en un ZIP al finalizar; incluye resultados parciales de un análisis fallido |
+| GET /api/v1/analyses/{id}/tracks | Trayectorias temporales del video: `status` (`pending`, `completed`, `failed`, `disabled`, `unavailable`), `reason` y una lista de tracks con URLs propias del trabajo |
+| GET /api/v1/analyses/{id}/tracks/{track_id}/clip | Clip 320×320 de la trayectoria: `video/webm` (VP8) en la web, `video/mp4` para corridas archivadas |
+| GET /api/v1/analyses/{id}/tracks/{track_id}/best-crop | PNG del recorte rectangular con padding del mejor frame |
+| GET /api/v1/analyses/{id}/tracks/{track_id}/best-original | JPEG del frame original completo elegido, sin anotaciones |
 
 Las imágenes se sirven como `image/jpeg` con sus mismos bytes; la opción
 `?download=true` agrega una disposición de descarga con nombre
@@ -267,8 +271,9 @@ El nombre recibido es solo una etiqueta; las rutas se generan desde UUIDs.
 - El visor reproduce muestras a una velocidad fija; muestra los timestamps
   reales, pero no representa la velocidad original del video.
 - Historial local sin usuarios ni permisos multiusuario, sin R2; BCS opcional experimental en la web.
-- El detector puede generar cajas duplicadas u omitir vacas. No hay tracking,
-  identificación individual ni conteo de animales únicos. BCS no verifica cuántos animales hay realmente.
+- El detector puede generar cajas duplicadas u omitir vacas. Las trayectorias
+  son temporales y valen solo dentro del video: no hay identificación individual
+  ni conteo de animales únicos. BCS no verifica cuántos animales hay realmente.
 - Antes de una carga se exige espacio para 50 MiB más una reserva de 50 MiB.
   Es una comprobación inicial, no una garantía de espacio para cualquier salida.
   No hay borrado automático de resultados. Administrar outputs/web cuando el
@@ -410,3 +415,25 @@ Las pruebas de integración de `tests/test_video_api_integration.py` ejecutan la
 principal con detectores/runtime/worker simulados y almacenamiento temporal. Cubren
 convivencia de rutas, recuperación y cierre, fallos aislados, seguridad local y
 ausencia de bloqueo global de imagen/BCS. No cargan pesos ni procesan videos reales.
+
+## Trayectorias por vaca
+
+Después de la detección muestreada (y del BCS opcional), el worker ejecuta
+`scripts/track_video.py` en otro subproceso sobre el mismo `input.mp4`:
+ByteTrack, todos los frames (`--sample-fps 0`), hasta los primeros 60 segundos
+(la misma ventana que cubren 300 muestras a 5 FPS) y clips WebM VP8, porque los
+navegadores no reproducen `mp4v`. El paso tiene su propio límite de 5 minutos.
+
+El tracking es opcional y aislado: nunca cambia el estado ni el error del
+análisis. El resultado queda en `result/tracking/` y el estado en
+`result/tracking-status.json` (`completed`, `failed` con `reason`, o
+`disabled`). Las rutas de archivos de un tracking fallido o interrumpido
+responden 404 aunque haya clips parciales en disco. Los análisis anteriores a
+esta función responden `status: "unavailable"` con `reason: "not_tracked"`.
+`VACCA_VIDEO_TRACKING=0` desactiva el paso. Si falta `lap`, el tracking falla
+sin instalar nada.
+
+La respuesta de `/tracks` no expone rutas de disco: el resumen de tracking
+conserva `input` y `model`, pero la API sólo publica el sha256 del modelo y
+URLs del trabajo. El detalle de segmentos, huecos y advertencias está en
+[tracking-y-recorte-por-vaca.md](tracking-y-recorte-por-vaca.md).

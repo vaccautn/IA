@@ -30,11 +30,21 @@ from .schemas import (
     VideoErrorResponse,
     FramePageResponse,
     JobResponse,
+    TrackListResponse,
     sanitize_optional_candidate,
 )
 from .service import UNAVAILABLE_DETAIL, VideoResources
-from .artifacts import BCS_WRITE_ERROR, frame_artifact, job_artifact, read_summary
+from .artifacts import (
+    BCS_WRITE_ERROR,
+    TRACK_MEDIA_TYPES,
+    frame_artifact,
+    job_artifact,
+    read_summary,
+    read_tracking_json,
+    tracking_artifact,
+)
 from .candidate import CANDIDATE_ARTIFACT
+from .tracking_job import TRACKING_STATUS
 
 SUMMARY_UNAVAILABLE_DETAIL = (
     "No se pudo leer el resumen guardado; las detecciones y el historial siguen disponibles."
@@ -94,6 +104,74 @@ def highlighted_frame(frames, job_id):
             best = dict(frame, sample_index=index, mean_confidence=mean,
                         image_url=f"/api/v1/analyses/{job_id}/frames/{index}/image")
     return best
+
+
+TRACKS_SCHEMA_VERSION = "vacca-video-tracks-v1"
+TRACKING_FAILURE_REASONS = {
+    "interrupted", "timeout", "process_failed", "summary_missing", "disabled_by_configuration",
+}
+TRACKING_SUMMARY_FIELDS = (
+    "identity_semantics", "tracker", "model_sha256", "fps", "width", "height", "frames_read",
+    "frames_sampled", "stop_reason", "config", "warnings", "notes",
+)
+# Disk paths stay private; the API exposes job-scoped URLs instead.
+TRACK_PRIVATE_FIELDS = ("clip", "best_original", "best_crop")
+
+
+def _track_entry(job_id, item):
+    if type(item) is not dict or type(item.get("track_id")) is not int or item["track_id"] < 0:
+        raise ValueError("Invalid track entry")
+    track_id = item["track_id"]
+    prefix = f"/api/v1/analyses/{job_id}/tracks/{track_id}"
+    clip = item.get("clip")
+    clip_name = clip.rsplit("/", 1)[-1] if type(clip) is str else None
+    entry = {key: value for key, value in item.items() if key not in TRACK_PRIVATE_FIELDS}
+    entry.update(
+        clip_url=f"{prefix}/clip" if clip_name in ("clip.webm", "clip.mp4") else None,
+        clip_media_type=TRACK_MEDIA_TYPES.get(clip_name) if clip_name in ("clip.webm", "clip.mp4") else None,
+        best_crop_url=f"{prefix}/best-crop",
+        best_original_url=f"{prefix}/best-original",
+    )
+    return entry
+
+
+def tracks_detail(root, job):
+    """Describe a job's tracks; tracking problems never surface as HTTP errors."""
+    job_id = job["id"]
+    response = dict(schema_version=TRACKS_SCHEMA_VERSION, tracks=[])
+    if job["status"] in ("pending", "processing"):
+        return dict(response, status="pending")
+    if job["status"] != "completed":
+        return dict(response, status="unavailable", reason="video_not_completed")
+    try:
+        recorded = read_tracking_json(root, job_id, TRACKING_STATUS)
+    except FileNotFoundError:
+        return dict(response, status="unavailable", reason="not_tracked")
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return dict(response, status="failed", reason="status_unreadable")
+    state = recorded.get("status") if type(recorded) is dict else None
+    reason = recorded.get("reason") if type(recorded) is dict else None
+    reason = reason if reason in TRACKING_FAILURE_REASONS else "unknown"
+    if state == "running":
+        return dict(response, status="pending")
+    if state == "disabled":
+        return dict(response, status="disabled", reason=reason)
+    if state != "completed":
+        return dict(response, status="failed", reason=reason)
+    try:
+        summary = read_tracking_json(root, job_id, "summary.json")
+        if type(summary) is not dict or type(summary.get("tracks")) is not list:
+            raise ValueError("Invalid tracking summary")
+        response.update({key: summary[key] for key in TRACKING_SUMMARY_FIELDS if key in summary})
+        response.update(status="completed",
+                        tracks=[_track_entry(job_id, item) for item in summary["tracks"]])
+        # Preflight the serializer so one bad artifact cannot become a 500.
+        TrackListResponse.model_validate(response).model_dump_json()
+    except (OSError, UnicodeError, ValueError, ValidationError, PydanticSerializationError,
+            RecursionError):
+        return dict(schema_version=TRACKS_SCHEMA_VERSION, tracks=[], status="failed",
+                    reason="summary_unreadable")
+    return response
 
 
 def video_admission_store(request: Request) -> Store:
@@ -182,7 +260,9 @@ def create_router():
         openapi_extra={
             "requestBody": {
                 "required": True,
-                "content": {"video/mp4": {"schema": {"type": "string", "format": "binary"}}},
+                # QuickTime (.mov, phone recordings) shares the MP4 ISO box layout.
+                "content": {media: {"schema": {"type": "string", "format": "binary"}}
+                            for media in ("video/mp4", "video/quicktime")},
             },
         },
     )
@@ -190,8 +270,8 @@ def create_router():
         request: Request, filename: str = Query(min_length=1, max_length=200),
         store: Store = Depends(video_admission_store),
     ):
-        if not filename.lower().endswith(".mp4"):
-            raise HTTPException(415, "Elegí un video MP4.")
+        if not filename.lower().endswith((".mp4", ".mov")):
+            raise HTTPException(415, "Elegí un video MP4 o MOV.")
         with store.connect() as conn:
             active = conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
@@ -380,6 +460,62 @@ def create_router():
         return FileResponse(
             path, filename=f"{job_id}.jsonl", media_type="application/x-ndjson"
         )
+
+    @router.get(
+        "/api/v1/analyses/{job_id}/tracks", response_model=TrackListResponse,
+        response_model_exclude_unset=True, responses={404: {"model": VideoErrorResponse}},
+    )
+    def get_tracks(job_id: str, store: Store = Depends(video_store)):
+        return tracks_detail(store.directory, store.get(job_id))
+
+    def track_file(store, job_id, track_id, names):
+        job = store.get(job_id)
+        try:
+            recorded = read_tracking_json(store.directory, job_id, TRACKING_STATUS)
+        except (OSError, UnicodeError, ValueError, RecursionError):
+            recorded = None
+        # Interrupted runs may leave partial clips; only finished tracking is served.
+        if job["status"] != "completed" or type(recorded) is not dict or recorded.get("status") != "completed":
+            raise HTTPException(404, "Trayectoria no disponible")
+        for name in names:
+            try:
+                path = tracking_artifact(store.directory, job_id, name, track_id)
+            except ValueError:
+                raise HTTPException(404, "Trayectoria no disponible") from None
+            if path.is_file():
+                return FileResponse(path, media_type=TRACK_MEDIA_TYPES[name])
+        raise HTTPException(404, "Trayectoria no disponible")
+
+    def binary(description, *media_types):
+        return {200: {
+            "description": description,
+            "content": {media: {"schema": {"type": "string", "format": "binary"}}
+                        for media in media_types},
+        }, 404: {"model": VideoErrorResponse}}
+
+    @router.get(
+        "/api/v1/analyses/{job_id}/tracks/{track_id}/clip", response_class=FileResponse,
+        responses=binary("Clip 320x320 of one trajectory; samples without detection are labelled grey frames.",
+                         "video/webm", "video/mp4"),
+    )
+    def track_clip(job_id: str, track_id: int, store: Store = Depends(video_store)):
+        return track_file(store, job_id, track_id, ("clip.webm", "clip.mp4"))
+
+    @router.get(
+        "/api/v1/analyses/{job_id}/tracks/{track_id}/best-crop", response_class=FileResponse,
+        responses=binary("Padded rectangular crop of the selected frame; it may include other animals.",
+                         "image/png"),
+    )
+    def track_best_crop(job_id: str, track_id: int, store: Store = Depends(video_store)):
+        return track_file(store, job_id, track_id, ("best-crop.png",))
+
+    @router.get(
+        "/api/v1/analyses/{job_id}/tracks/{track_id}/best-original", response_class=FileResponse,
+        responses=binary("Original full frame selected for the trajectory, without annotations.",
+                         "image/jpeg"),
+    )
+    def track_best_original(job_id: str, track_id: int, store: Store = Depends(video_store)):
+        return track_file(store, job_id, track_id, ("best-original.jpg",))
 
     return router
 

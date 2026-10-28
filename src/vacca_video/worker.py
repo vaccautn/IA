@@ -29,6 +29,7 @@ class Worker:
         self.on_fault = None
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.finish_video = None
+        self.track_video = None
 
     @property
     def health(self):
@@ -129,3 +130,10 @@ class Worker:
             except Exception as exc:
                 self._fault(exc)
                 return
+            if status == "completed" and self.track_video is not None:
+                # Optional and after publication: detections are never held back
+                # and a tracking failure never changes the job outcome.
+                try:
+                    self.track_video(directory, self.stop)
+                except Exception as exc:
+                    logger.error("Video tracking hook failed: %s", type(exc).__name__)

@@ -148,3 +148,48 @@ class FramePageResponse(BaseModel):
 
 class VideoErrorResponse(BaseModel):
     detail: str
+
+
+class TrackResponse(ArtifactResponse):
+    """One temporal trajectory inside a single video, never a bovine identity."""
+
+    track_id: int = Field(ge=0)
+    status: Literal["candidate", "review"]
+    warnings: list[str]
+    observations: int | None = None
+    first_frame: int | None = None
+    last_frame: int | None = None
+    first_timestamp_ms: int | float | None = None
+    last_timestamp_ms: int | float | None = None
+    segments: list[dict[str, JsonValue]] | None = None
+    gaps: list[dict[str, JsonValue]] | None = None
+    possible_continuation_of: int | None = None
+    possible_continued_by: int | None = None
+    best_frame_index: int | None = None
+    best_timestamp_ms: int | float | None = None
+    best_confidence: int | float | None = None
+    best_crop_contamination: int | float | None = None
+    clip_url: str | None = None
+    clip_frames: int | None = Field(default=None, ge=0)
+    clip_media_type: Literal["video/webm", "video/mp4"] | None = None
+    best_crop_url: str
+    best_original_url: str
+
+
+class TrackListResponse(BaseModel):
+    schema_version: Literal["vacca-video-tracks-v1"]
+    status: Literal["pending", "completed", "failed", "disabled", "unavailable"]
+    reason: str | None = None
+    identity_semantics: str | None = None
+    tracker: str | None = None
+    model_sha256: str | None = None
+    fps: int | float | None = None
+    width: int | None = None
+    height: int | None = None
+    frames_read: int | None = None
+    frames_sampled: int | None = None
+    stop_reason: str | None = None
+    config: dict[str, JsonValue] | None = None
+    warnings: list[str] | None = None
+    notes: list[str] | None = None
+    tracks: list[TrackResponse]

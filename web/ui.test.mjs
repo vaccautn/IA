@@ -25,6 +25,18 @@ const frame = (id, index) => ({ items: [{
   detection_count: index + 1
 }], total: 3 });
 
+const track = (id, trackId, status, warnings = []) => ({
+  track_id: trackId, status, warnings, observations: 12, clip_frames: 48, first_timestamp_ms: 500, last_timestamp_ms: 2500,
+  segments: [{}, ...(warnings.includes("long_gap_review_required") ? [{}] : [])],
+  clip_url: `/api/v1/analyses/${id}/tracks/${trackId}/clip`, clip_media_type: "video/webm",
+  best_crop_url: `/api/v1/analyses/${id}/tracks/${trackId}/best-crop`,
+  best_original_url: `/api/v1/analyses/${id}/tracks/${trackId}/best-original`
+});
+const tracks = (id) => ({
+  schema_version: "vacca-video-tracks-v1", status: "completed", stop_reason: "end_of_video",
+  tracks: [track(id, 1, "candidate"), { ...track(id, 7, "review", ["long_gap_review_required", "other_detection_in_crop_at_best_frame"]), possible_continuation_of: 1 }]
+});
+
 function deferred() {
   let resolve;
   const promise = new Promise((yes) => { resolve = yes; });
@@ -134,7 +146,8 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     const mock = {
       history: () => reply([job("a"), job("b")]),
       upload: () => reply(job("created", 0), 202),
-      frames: (id, index) => reply(frame(id, index))
+      frames: (id, index) => reply(frame(id, index)),
+      tracks: (id) => reply(tracks(id))
     };
     await page.route("**/api/v1/**", async (route) => {
       const request = route.request(), endpoint = new URL(request.url());
@@ -148,7 +161,17 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
           headers: { "content-disposition": `attachment; filename="${endpoint.pathname.split("/")[4]}.jsonl"` },
           body: Buffer.from('{"frame_index":17}\n') });
       }
-      if (/\/frames\/\d+\/image$/.test(endpoint.pathname) || endpoint.pathname.endsWith("/candidate/image")) {
+      if (/\/tracks\/\d+\/clip$/.test(endpoint.pathname)) {
+        calls.clips = (calls.clips ?? 0) + 1;
+        return route.fulfill({ status: 204 });
+      }
+      if (endpoint.pathname.endsWith("/tracks")) {
+        calls.tracks = (calls.tracks ?? 0) + 1;
+        const result = await mock.tracks(endpoint.pathname.split("/")[4]);
+        return route.fulfill({ status: result.status, contentType: "application/json", body: JSON.stringify(result.body) });
+      }
+      if (/\/frames\/\d+\/image$/.test(endpoint.pathname) || endpoint.pathname.endsWith("/candidate/image")
+        || /\/tracks\/\d+\/(best-crop|best-original)$/.test(endpoint.pathname)) {
         return route.fulfill({ contentType: "image/svg+xml", body: svg });
       }
       let result;
@@ -354,6 +377,61 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
       for await (const chunk of stream) chunks.push(chunk);
       assert.ok(Buffer.concat(chunks).includes(Buffer.from(signature)));
     }
+  });
+
+  await t.test("track gallery separates review tracks, toggles clips and isolates failures", async (t) => {
+    const { page, mock } = await fixture(t);
+    const gallery = page.getByRole("region", { name: "Trayectorias por vaca" });
+    await gallery.getByText("2 trayectorias · 1 para revisión").waitFor();
+    const cards = gallery.getByRole("listitem").filter({ hasText: /^Trayectoria \d/ });
+    assert.equal(await cards.count(), 2);
+    const review = gallery.getByRole("listitem").filter({ hasText: "Trayectoria 7" });
+    await review.getByText("Revisar").waitFor();
+    await review.getByText("Ausencia larga: trayectoria fragmentada").waitFor();
+    await review.getByText("Otra vaca dentro del recorte").waitFor();
+    assert.match(await review.textContent(), /0\.50–2\.50 s · 12 observaciones · 2 tramos/);
+    await review.getByText("Puede ser el mismo animal que la trayectoria 1.").waitFor();
+    assert.equal(await gallery.getByRole("listitem").filter({ hasText: "Trayectoria 1" }).getByText("Candidata").count(), 1);
+    assert.equal(await review.getByAltText("Mejor recorte de la trayectoria 7").getAttribute("src"), "/api/v1/analyses/a/tracks/7/best-crop");
+    assert.equal(await review.getByRole("link", { name: "Frame original" }).getAttribute("href"), "/api/v1/analyses/a/tracks/7/best-original");
+    await review.getByRole("button", { name: "Ver clip" }).click();
+    assert.equal(await review.locator("video").getAttribute("src"), "/api/v1/analyses/a/tracks/7/clip");
+    assert.equal(await review.getByRole("button", { name: "Ver recorte" }).getAttribute("aria-expanded"), "true");
+    await review.getByRole("button", { name: "Ver recorte" }).click();
+    assert.equal(await review.locator("video").count(), 0);
+
+    const single = { ...tracks("a"), tracks: [{ ...track("a", 3, "review", ["short_track_review_required"]), clip_frames: 1 }] };
+    mock.tracks = () => reply(single);
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    const lone = gallery.getByRole("listitem").filter({ hasText: "Trayectoria 3" });
+    await lone.getByText("Pocas observaciones").waitFor();
+    assert.equal(await lone.getByRole("button", { name: "Ver clip" }).count(), 0, "One-frame clips are not offered");
+    mock.tracks = (id) => reply(tracks(id));
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    await gallery.getByText("2 trayectorias · 1 para revisión").waitFor();
+
+    mock.tracks = () => reply({ detail: "Falla simulada" }, 500);
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await gallery.getByText(/No se pudieron cargar las trayectorias/).waitFor();
+    assert.equal(await page.getByRole("alert").count(), 0, "Track failures never raise the page alert");
+    await page.locator('.viewer img[src="/api/v1/analyses/b/frames/0/image"]').waitFor();
+  });
+
+  await t.test("pending tracks show detections first and refresh until tracking finishes", async (t) => {
+    const { page, mock, calls } = await fixture(t);
+    await page.getByRole("region", { name: "Trayectorias por vaca" }).getByText("2 trayectorias · 1 para revisión").waitFor();
+    let answered = 0;
+    mock.tracks = (id) => (++answered === 1
+      ? reply({ schema_version: "vacca-video-tracks-v1", status: "pending", tracks: [] })
+      : reply(tracks(id)));
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    const gallery = page.getByRole("region", { name: "Trayectorias por vaca" });
+    await gallery.getByText(/Calculando trayectorias/).waitFor();
+    await page.locator('.viewer img[src="/api/v1/analyses/b/frames/0/image"]').waitFor();
+    await gallery.getByText("2 trayectorias · 1 para revisión").waitFor({ timeout: 6000 });
+    assert.equal(answered, 2);
+    assert.equal(await page.evaluate(() => window.timerCounts().poll), 1, "Track refresh never uses the history poll timer");
+    assert.ok(calls.tracks >= 3);
   });
 
   await t.test("React unmount stops timers and ignores in-flight history/frame/upload results", async (t) => {

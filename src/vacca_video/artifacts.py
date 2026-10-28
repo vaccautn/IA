@@ -133,3 +133,49 @@ def publish_summary(root, job_id, summary):
             temporary.unlink(missing_ok=True)
         if backup is not None:
             backup.unlink(missing_ok=True)
+
+
+TRACK_MEDIA_TYPES = {
+    "clip.webm": "video/webm",
+    "clip.mp4": "video/mp4",
+    "best-crop.png": "image/png",
+    "best-original.jpg": "image/jpeg",
+}
+TRACKING_JSON_LIMIT = 4 * 1024 * 1024
+
+
+def tracking_artifact(root, job_id, name, track_id=None):
+    """Resolve a fixed tracking file of one job without following links."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+        raise ValueError("Invalid job identifier")
+    root = Path(root)
+    result = root / job_id / "result"
+    chain = [root, root / job_id, result]
+    if track_id is None:
+        if name == "tracking-status.json":
+            path = result / name
+        elif name == "summary.json":
+            chain.append(result / "tracking")
+            path = result / "tracking" / name
+        else:
+            raise ValueError("Invalid tracking artifact")
+    else:
+        if type(track_id) is not int or track_id < 0 or name not in TRACK_MEDIA_TYPES:
+            raise ValueError("Invalid track artifact")
+        tracks = result / "tracking" / "tracks"
+        chain += [result / "tracking", tracks, tracks / str(track_id)]
+        path = tracks / str(track_id) / name
+    for part in chain + [path]:
+        if part.is_symlink() or part.is_junction():
+            raise ValueError("Symbolic tracking paths are not allowed")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError("Tracking artifact is outside job storage")
+    return path
+
+
+def read_tracking_json(root, job_id, name):
+    with tracking_artifact(root, job_id, name).open("rb") as stream:
+        data = stream.read(TRACKING_JSON_LIMIT + 1)
+    if len(data) > TRACKING_JSON_LIMIT:
+        raise ValueError("Tracking metadata is too large")
+    return json.loads(data)

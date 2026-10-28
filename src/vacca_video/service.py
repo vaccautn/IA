@@ -33,6 +33,7 @@ class VideoResources:
         self._worker_faulted = False
         self.upload_lock = asyncio.Lock()
         self.finish_video = None
+        self.track_video = None
 
     @property
     def available(self):
@@ -66,6 +67,15 @@ class VideoResources:
             self.store.add(job_id, filename)
             return True
 
+    def _recover_tracking(self):
+        # Optional metadata: a failure here must not block detection startup.
+        from .tracking_job import recover_interrupted
+
+        try:
+            recover_interrupted(self.store.directory)
+        except OSError as exc:
+            logger.error("Video tracking recovery skipped: %s", type(exc).__name__)
+
     def prepare(self):
         self.store = Store(self.directory)
         self.worker = self.worker_factory(self.store)
@@ -76,12 +86,15 @@ class VideoResources:
             if self.store is None:
                 self.prepare()
             self.worker.finish_video = self.finish_video
+            self.worker.track_video = self.track_video
             self.worker.on_fault = self._on_worker_fault
             if start_worker:
                 # Startup and recovery must both succeed before any job is claimed.
                 self.worker.ready.clear()
                 with self.store.connect() as conn:
                     self.store.recover(conn)
+                    if self.track_video is not None:
+                        self._recover_tracking()
                     self.worker.thread.start()
                     self.started = True
                 self.available = True

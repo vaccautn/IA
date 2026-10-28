@@ -7,6 +7,7 @@ async function request(path, options) {
 }
 export const videoApi = {
   list: (signal) => request("/analyses", { signal }),
-  upload: (file, signal) => request(`/analyses?filename=${encodeURIComponent(file.name)}`, { method: "POST", body: file, headers: { "Content-Type": "video/mp4" }, signal }),
-  frames: (id, offset, signal) => request(`/analyses/${id}/frames?offset=${offset}&limit=1`, { signal })
+  upload: (file, signal) => request(`/analyses?filename=${encodeURIComponent(file.name)}`, { method: "POST", body: file, headers: { "Content-Type": file.name.toLowerCase().endsWith(".mov") ? "video/quicktime" : "video/mp4" }, signal }),
+  frames: (id, offset, signal) => request(`/analyses/${id}/frames?offset=${offset}&limit=1`, { signal }),
+  tracks: (id, signal) => request(`/analyses/${encodeURIComponent(id)}/tracks`, { signal })
 };

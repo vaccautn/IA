@@ -13,6 +13,13 @@ WORKER_TIMEOUT_SECONDS = 10 * 60
 WORKER_POLL_SECONDS = 0.5
 WORKER_TERMINATE_GRACE_SECONDS = 5
 WORKER_SHUTDOWN_JOIN_SECONDS = 10
+# Web tracking reads every frame (sampling caused ID switches in the test videos)
+# of the window the sampled detection covers, capped by frames: ~150-400 ms per
+# frame on a 4-core CPU keeps 1200 frames inside the timeout.
+TRACKING_TIMEOUT_SECONDS = 10 * 60
+TRACKING_MAX_SECONDS = DEFAULT_MAX_FRAMES / DEFAULT_SAMPLE_FPS
+TRACKING_MAX_FRAMES = 1200
+TRACKING_TRACKER = "bytetrack.yaml"
 
 
 def require_single_server_process(workers: int) -> None:

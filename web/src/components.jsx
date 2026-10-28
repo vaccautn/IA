@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState } from "react";
 import { MAX_FRAMES, SAMPLE_FPS } from "./policy";
 
 const labels = { pending: "En espera", processing: "Procesando", completed: "Completado", failed: "Error" };
@@ -13,7 +13,7 @@ export function Upload({ busy, file, input, chooseFile, upload }) {
       event.preventDefault();
       if (!busy) chooseFile(event.dataTransfer.files[0]);
     }}>
-      <Icon type="upload" size={32} /><strong>{file ? file.name : "Eleg\xED o arrastr\xE1 un video"}</strong><span>MP4 · hasta 50 MB</span><input ref={input} type="file" accept="video/mp4,.mp4" disabled={busy} onChange={(event) => chooseFile(event.target.files[0])} />
+      <Icon type="upload" size={32} /><strong>{file ? file.name : "Eleg\xED o arrastr\xE1 un video"}</strong><span>MP4 o MOV · hasta 50 MB</span><input ref={input} type="file" accept="video/mp4,video/quicktime,.mp4,.mov" disabled={busy} onChange={(event) => chooseFile(event.target.files[0])} />
     </label><div className="settings"><span>Frecuencia de análisis<strong>{SAMPLE_FPS} frames / segundo</strong></span><span>Máximo por análisis<strong>{MAX_FRAMES} frames</strong></span></div>
     <button className="primary" disabled={!file || busy} onClick={upload}><Icon type="upload" size={18} />{busy ? "Cargando video\u2026" : "Procesar video"}</button>
     <p className="hint">Se analizan hasta unos 60 segundos. El procesamiento continúa aunque cierres esta pestaña, mientras el servicio esté encendido.</p>
@@ -27,7 +27,7 @@ export function History({ jobs, selected, choose }) {
   </section>;
 }
 
-export function Results({ job, count, frame, index, playing, setPlaying, setIndex }) {
+export function Results({ job, count, frame, index, playing, setPlaying, setIndex, tracks }) {
   const highlight = job?.highlighted_frame;
   return <section className="card results" aria-labelledby="video-results-title"><div className="section-title"><div><h2 id="video-results-title">Resultados del análisis</h2><p>{job?.name ?? "Las detecciones aparecer\xE1n ac\xE1."}</p></div>{job && count > 0 && !["pending", "processing"].includes(job.status) && <div className="download-actions"><a className="secondary" href={`/api/v1/analyses/${job.id}/frames.zip`}>Descargar frames (ZIP)</a><a className="secondary" href={`/api/v1/analyses/${job.id}/results`}>Descargar detecciones (JSONL)</a></div>}</div>
     {job?.status === "pending" && <div className="notice" role="status">En espera. Los videos se procesan de a uno.</div>}
@@ -36,6 +36,7 @@ export function Results({ job, count, frame, index, playing, setPlaying, setInde
     {job?.summary_error && <div className="alert" role="alert">{job.summary_error}</div>}
     {job?.summary?.stop_reason === "frame_limit" && <div className="notice">Resultado parcial: se alcanzó el límite de {MAX_FRAMES} frames.</div>}
     <CandidateBCS job={job} />
+    <Tracks job={job} tracks={tracks} />
     {highlight && <section className="final-summary" aria-label="Frame destacado por detecciones">
       <h2>{job.status === "failed" || job.summary?.stop_reason === "frame_limit" ? "Resumen de los frames analizados" : "Frame destacado"}</h2>
       <p>{highlight.detection_count} detecciones · confianza promedio {highlight.mean_confidence == null ? "no disponible sin detecciones" : `${(highlight.mean_confidence * 100).toFixed(1)} %`}.</p>
@@ -77,6 +78,61 @@ function CandidateBCS({ job }) {
       <p>No aprobado para producción. Es una categoría ordinal del modelo, no un puntaje clínico estándar ni un diagnóstico.</p>
       <p>Procedencia: {bcs.package_id ?? "paquete no informado"} · estado del modelo: {bcs.model_status ?? "no informado"}</p></>
       : <p role="status">{explanations[bcs.reason] ?? "BCS no evaluado para este video."}</p>}
-    <p className="hint">Mejor confianza individual solo entre frames muestreados elegibles (hasta {MAX_FRAMES}), no entre todos los frames del video. El detector puede omitir otros animales; una detección no garantiza una sola vaca real. No hay identificación ni tracking.</p>
+    <p className="hint">Mejor confianza individual solo entre frames muestreados elegibles (hasta {MAX_FRAMES}), no entre todos los frames del video. El detector puede omitir otros animales; una detección no garantiza una sola vaca real. No hay identificación y esta selección no usa las trayectorias.</p>
   </section>;
+}
+
+const trackWarnings = {
+  short_track_review_required: "Pocas observaciones",
+  long_gap_review_required: "Ausencia larga: trayectoria fragmentada",
+  other_detection_in_crop_at_best_frame: "Otra vaca dentro del recorte",
+  border_touch_at_best_frame: "Animal cortado por el borde",
+  small_at_best_frame: "Animal muy lejos: pocos píxeles",
+  possible_fragment_review_required: "Posible fragmento de otra trayectoria",
+};
+const trackReasons = {
+  not_tracked: "Este análisis es anterior a las trayectorias por vaca.",
+  video_not_completed: "Las trayectorias solo se calculan para videos completados.",
+  disabled_by_configuration: "Las trayectorias por vaca están desactivadas en este servicio.",
+  timeout: "El cálculo de trayectorias superó el tiempo máximo. Las detecciones se conservaron.",
+  interrupted: "El cálculo de trayectorias se interrumpió. Las detecciones se conservaron.",
+  request_failed: "No se pudieron cargar las trayectorias. Volvé a seleccionar el análisis.",
+};
+const seconds = (ms) => (ms / 1000).toFixed(2);
+
+export function Tracks({ job, tracks }) {
+  if (job?.status !== "completed") return null;
+  const items = tracks?.tracks ?? [];
+  const review = items.filter((track) => track.status === "review").length;
+  return <section className="tracks" aria-labelledby="video-tracks-title">
+    <div className="section-title"><div><h3 id="video-tracks-title">Trayectorias por vaca</h3>
+      {tracks?.status === "completed" && <p>{items.length} trayectorias · {review} para revisión{tracks.stop_reason && tracks.stop_reason !== "end_of_video" && tracks.fps ? ` · solo los primeros ${seconds(tracks.frames_read / tracks.fps * 1000)} s del video` : ""}</p>}</div></div>
+    {!tracks ? <p role="status">Cargando trayectorias…</p>
+      : tracks.status === "pending" ? <p role="status"><span className="spinner" /> Calculando trayectorias. Las detecciones ya están disponibles.</p>
+      : tracks.status !== "completed" ? <p role="status">{trackReasons[tracks.reason] ?? "Las trayectorias no están disponibles. Las detecciones del video se conservaron."}</p>
+      : !items.length ? <p role="status">No se formó ninguna trayectoria en este video.</p>
+      : <ul className="track-grid">{items.map((track) => <TrackCard key={track.track_id} track={track} />)}</ul>}
+    <p className="hint">Una trayectoria vale solo dentro de este video: no es una caravana ni identifica al animal. El recorte es rectangular y puede incluir otra vaca que el detector no vio. En los clips, los momentos sin detección aparecen en gris.</p>
+  </section>;
+}
+
+function TrackCard({ track }) {
+  const [open, setOpen] = useState(false);
+  const segments = track.segments?.length ?? 1;
+  // A one-frame clip never becomes playable; the crop already shows that frame.
+  const clip = track.clip_frames > 1 ? track.clip_url : null;
+  return <li className={`track ${track.status}`}>
+    {open && clip
+      ? <video src={clip} controls muted autoPlay loop playsInline aria-label={`Clip de la trayectoria ${track.track_id}`} />
+      : <img src={track.best_crop_url} alt={`Mejor recorte de la trayectoria ${track.track_id}`} loading="lazy" />}
+    <div className="track-head"><strong>Trayectoria {track.track_id}</strong><span className={`status ${track.status === "review" ? "review" : "completed"}`}>{track.status === "review" ? "Revisar" : "Candidata"}</span></div>
+    <p>{seconds(track.first_timestamp_ms)}–{seconds(track.last_timestamp_ms)} s · {track.observations} {track.observations === 1 ? "observación" : "observaciones"}{segments > 1 ? ` · ${segments} tramos` : ""}</p>
+    {track.warnings.length > 0 && <ul className="track-warnings">{track.warnings.map((warning) => <li key={warning}>{trackWarnings[warning] ?? warning}</li>)}</ul>}
+    {track.possible_continuation_of != null && <p className="track-link">Puede ser el mismo animal que la trayectoria {track.possible_continuation_of}.</p>}
+    {track.possible_continued_by != null && <p className="track-link">Puede continuar en la trayectoria {track.possible_continued_by}.</p>}
+    <div className="track-actions">
+      {clip && <button className="secondary" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? "Ver recorte" : "Ver clip"}</button>}
+      <a className="secondary" href={track.best_original_url} target="_blank" rel="noreferrer">Frame original</a>
+    </div>
+  </li>;
 }

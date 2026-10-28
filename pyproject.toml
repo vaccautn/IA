@@ -19,6 +19,7 @@ api = [
     "python-multipart==0.0.32",
 ]
 yolo = ["ultralytics==8.4.115"]
+tracking = ["lap==0.5.13"]
 bcs = [
     "PyYAML==6.0.3",
     "torch==2.13.0+cpu",

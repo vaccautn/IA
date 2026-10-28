@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { videoApi } from "./api";
-import { MAX_UPLOAD_BYTES, PLAYBACK_INTERVAL_MS, POLL_INTERVAL_MS } from "./policy";
+import { MAX_UPLOAD_BYTES, PLAYBACK_INTERVAL_MS, POLL_INTERVAL_MS, TRACKS_POLL_INTERVAL_MS } from "./policy";
 import { createRequestOwner, startPolling } from "./requests";
 
 export function useVideoAnalysis() {
@@ -11,8 +11,33 @@ export function useVideoAnalysis() {
   const listRequests = useRef(null), uploadRequests = useRef(null);
   if (!listRequests.current) listRequests.current = createRequestOwner();
   if (!uploadRequests.current) uploadRequests.current = createRequestOwner();
+  const [tracks, setTracks] = useState(null);
   const job = jobs.find((item) => item.id === selected);
   const count = job?.frames_analyzed ?? 0;
+  const jobStatus = job?.status;
+
+  // Tracks are optional: a failed request never raises the page-level alert.
+  // Tracking runs after the job completes, so refresh while it reports pending.
+  useEffect(() => {
+    const requests = createRequestOwner();
+    let timer;
+    setTracks(null);
+    function load() {
+      requests.run(
+        (signal) => videoApi.tracks(selected, signal),
+        (data) => {
+          setTracks(data);
+          if (data.status === "pending") timer = setTimeout(load, TRACKS_POLL_INTERVAL_MS);
+        },
+        () => setTracks({ status: "failed", reason: "request_failed", tracks: [] })
+      );
+    }
+    if (selected && jobStatus === "completed") load();
+    return () => {
+      clearTimeout(timer);
+      requests.cancel();
+    };
+  }, [selected, jobStatus]);
 
   useEffect(() => {
     const stop = startPolling(() => listRequests.current.run(
@@ -55,8 +80,8 @@ export function useVideoAnalysis() {
   function chooseFile(candidate) {
     setError("");
     if (!candidate) return;
-    if (!candidate.name.toLowerCase().endsWith(".mp4") || candidate.size > MAX_UPLOAD_BYTES) {
-      setError("Eleg\xED un MP4 de hasta 50 MB.");
+    if (!/\.(mp4|mov)$/i.test(candidate.name) || candidate.size > MAX_UPLOAD_BYTES) {
+      setError("Eleg\xED un MP4 o MOV de hasta 50 MB.");
       return;
     }
     setFile(candidate);
@@ -80,6 +105,6 @@ export function useVideoAnalysis() {
       }
     );
   }
-  return { jobs, selected, file, busy, error, frame, index, playing, input, job, count,
+  return { jobs, selected, file, busy, error, frame, index, playing, input, job, count, tracks,
     setError, setIndex, setPlaying, choose, chooseFile, upload };
 }

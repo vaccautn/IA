@@ -116,6 +116,9 @@ async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
 
     coordinator = VideoBCSCoordinator(asyncio.get_running_loop(), evaluate_bcs)
     video.finish_video = coordinator.finish
+    from vacca_video.tracking_job import run_tracking
+
+    video.track_video = run_tracking
     target_app.state.video = video
     try:
         video.start()

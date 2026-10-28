@@ -12,7 +12,8 @@ def test_raw_mp4_request_and_typed_job_response():
     body = operation["requestBody"]
     assert body["required"] is True
     assert body["content"] == {
-        "video/mp4": {"schema": {"type": "string", "format": "binary"}}
+        "video/mp4": {"schema": {"type": "string", "format": "binary"}},
+        "video/quicktime": {"schema": {"type": "string", "format": "binary"}},
     }
     filename = next(p for p in operation["parameters"] if p["name"] == "filename")
     assert filename["in"] == "query" and filename["required"] is True
