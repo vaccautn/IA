@@ -174,6 +174,9 @@ class TrackResponse(ArtifactResponse):
     clip_media_type: Literal["video/webm", "video/mp4"] | None = None
     best_crop_url: str
     best_original_url: str
+    segmentation: dict[str, JsonValue] | None = None
+    best_masked_url: str | None = None
+    best_mask_url: str | None = None
 
 
 class TrackListResponse(BaseModel):

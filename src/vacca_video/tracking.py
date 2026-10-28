@@ -25,6 +25,14 @@ FRAGMENT_MIN_IOU = 0.3
 FRAGMENT_MAX_CENTRE_DISTANCE = 0.25
 DEFAULT_MAX_GAP_SECONDS = 0.5
 DEFAULT_CROP_MARGIN = 0.10
+# Best-frame segmentation (box + one point prompt). On the manga video a usable
+# cow mask covered 31-60% of its box and stayed inside it; outside that range
+# the mask usually grabbed ground or fence, so the rectangular crop is kept.
+SEGMENT_MIN_FILL = 0.15
+SEGMENT_MAX_FILL = 0.95
+SEGMENT_MAX_OUTSIDE = 0.10
+SEGMENT_POINT_HEIGHT = 0.4
+DEFAULT_SEGMENT_LIMIT = 40
 # mp4v is the archival default; browsers only play the VP8 WebM variant.
 CLIP_CODECS = {"mp4": "mp4v", "webm": "VP80"}
 
@@ -50,6 +58,7 @@ class TrackStats:
     best_confidence: float | None = None
     best_contamination: float = 0.0
     best_iou: float = 0.0
+    best_others: list = field(default_factory=list)
     max_width: int = 0
     max_height: int = 0
     first_bbox: tuple[int, int, int, int] | None = None
@@ -191,6 +200,67 @@ def track_warnings(item: TrackStats, width: int, height: int) -> list[str]:
     return warnings
 
 
+def assess_mask(mask, bbox, others) -> dict:
+    """Accept a best-frame mask only when it plausibly is the boxed animal."""
+    import numpy as np
+
+    x1, y1, x2, y2 = bbox
+    area = int(mask.sum())
+    if area == 0:
+        return {"status": "rejected", "reason": "empty_mask"}
+    inside = int(mask[y1:y2, x1:x2].sum())
+    fill = inside / ((x2 - x1) * (y2 - y1))
+    outside = 1.0 - inside / area
+    covered = np.zeros_like(mask)
+    for ox1, oy1, ox2, oy2 in others:
+        covered[oy1:oy2, ox1:ox2] = True
+    result = {"mask_fill": round(fill, 6), "mask_outside_box": round(outside, 6),
+              # Informational: overlapping boxes also share legitimate pixels.
+              "mask_other_overlap": round(int((mask & covered).sum()) / area, 6)}
+    if fill < SEGMENT_MIN_FILL:
+        return dict(result, status="rejected", reason="mask_too_small")
+    if fill > SEGMENT_MAX_FILL:
+        return dict(result, status="rejected", reason="mask_fills_box")
+    if outside > SEGMENT_MAX_OUTSIDE:
+        return dict(result, status="rejected", reason="mask_leaves_box")
+    return dict(result, status="ok")
+
+
+def masked_image(image, mask, background: int = 28):
+    """Keep only the animal's pixels; everything else becomes a flat background."""
+    result = image.copy()
+    result[~mask] = background
+    return result
+
+
+def load_sam_segmenter(model_path):
+    """Box+point MobileSAM/SAM prompt from local weights; never downloads."""
+    import cv2
+    import numpy as np
+
+    model_path = Path(model_path)
+    if not model_path.is_file():
+        raise ValueError("Falta el modelo de segmentación local; no se descarga automáticamente")
+    from ultralytics import SAM
+
+    sam = SAM(str(model_path))
+
+    def segment(image, bbox):
+        x1, y1, x2, y2 = bbox
+        point = [(x1 + x2) // 2, int(y1 + SEGMENT_POINT_HEIGHT * (y2 - y1))]
+        result = sam(image, bboxes=[list(bbox)], points=[point], labels=[1], verbose=False, device="cpu")[0]
+        if result.masks is None or len(result.masks.data) == 0:
+            return np.zeros(image.shape[:2], dtype=bool)
+        mask = result.masks.data[0].cpu().numpy().astype(np.uint8)
+        if mask.shape != image.shape[:2]:
+            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+        return mask.astype(bool)
+
+    segment.metadata = {"model": model_path.name, "model_sha256": _file_sha256(model_path),
+                        "prompt": f"box+point@{SEGMENT_POINT_HEIGHT:g}"}
+    return segment
+
+
 def link_fragments(stats: dict[int, TrackStats], max_gap_ms: float) -> None:
     """Mark tracks that likely continue an earlier one after a short loss.
 
@@ -249,12 +319,15 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
                 confidence: float = 0.25, sample_fps: float | None = None,
                 output_size=(320, 320), *, max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
                 crop_margin: float = DEFAULT_CROP_MARGIN, clip_format: str = "mp4",
-                max_seconds: float | None = None, max_frames: int | None = None, model=None) -> dict:
+                max_seconds: float | None = None, max_frames: int | None = None, model=None,
+                segmenter=None, segment_limit: int = DEFAULT_SEGMENT_LIMIT) -> dict:
     """Run Ultralytics tracking and write one directory per temporal track.
 
     ``model`` accepts any object exposing Ultralytics' ``track`` API; when it is
     None the local weights at ``model_path`` are loaded, never downloaded, and
     a missing ``lap`` fails instead of letting Ultralytics install it.
+    ``segmenter(image, bbox) -> bool mask`` optionally segments each track's
+    best frame (longest tracks first, up to ``segment_limit``).
     """
     import cv2
 
@@ -389,6 +462,7 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
                         item.best_confidence = detection["confidence"]
                         item.best_contamination = contamination
                         item.best_iou = overlap_iou
+                        item.best_others = others
                     writer.write(crop_with_padding(image, bbox, output_size, crop_margin))
                     item.clip_frames += 1
                     observations.write(json.dumps({
@@ -403,6 +477,7 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
         for writer in writers.values():
             writer.release()
     link_fragments(stats, max_gap_ms)
+    segmented = set(sorted(stats, key=lambda key: -stats[key].observations)[:segment_limit]) if segmenter else set()
     track_summaries = []
     for track_id, item in sorted(stats.items()):
         track_dir = tracks_dir / str(track_id)
@@ -411,6 +486,23 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
         cv2.imwrite(str(track_dir / crop_name),
                     crop_with_padding(item.best_frame, item.best_bbox, output_size, crop_margin))
         warnings = track_warnings(item, width, height)
+        segmentation = {"status": "not_requested"}
+        if track_id in segmented:
+            try:
+                mask = segmenter(item.best_frame, item.best_bbox)
+                segmentation = assess_mask(mask, item.best_bbox, item.best_others)
+                if segmentation["status"] == "ok":
+                    cv2.imwrite(str(track_dir / "best-masked.png"), crop_with_padding(
+                        masked_image(item.best_frame, mask), item.best_bbox, output_size, crop_margin))
+                    mask_image = cv2.cvtColor(mask.astype("uint8") * 255, cv2.COLOR_GRAY2BGR)
+                    cv2.imwrite(str(track_dir / "best-mask.png"), crop_with_padding(
+                        mask_image, item.best_bbox, output_size, crop_margin))
+                    segmentation.update(best_masked=f"tracks/{track_id}/best-masked.png",
+                                        best_mask=f"tracks/{track_id}/best-mask.png")
+            except Exception as exc:  # Optional enhancement: never lose the track.
+                segmentation = {"status": "failed", "reason": type(exc).__name__}
+        elif segmenter:
+            segmentation = {"status": "skipped", "reason": "segment_limit"}
         track_summaries.append({"track_id": track_id, "observations": item.observations,
             "first_frame": item.first_frame, "last_frame": item.last_frame,
             "first_timestamp_ms": item.first_timestamp_ms, "last_timestamp_ms": item.last_timestamp_ms,
@@ -427,6 +519,7 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
             "clip_duration_ms": round(item.clip_frames * 1000.0 / clip_fps, 3),
             "best_original": f"tracks/{track_id}/{original_name}",
             "best_crop": f"tracks/{track_id}/{crop_name}",
+            "segmentation": segmentation,
             "status": "review" if warnings else "candidate",
             "warnings": warnings})
     summary = {"schema_version": SCHEMA_VERSION, "input": str(input_path),
@@ -441,7 +534,12 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
                "frames_read": frame_index, "frames_sampled": sampled_frames, "stop_reason": stop_reason,
                "tracks": track_summaries, "identity_semantics": "temporal_track_id_within_video",
                "warnings": run_warnings,
+               "segmentation": dict(getattr(segmenter, "metadata", {}), limit=segment_limit,
+                                    min_fill=SEGMENT_MIN_FILL, max_fill=SEGMENT_MAX_FILL,
+                                    max_outside=SEGMENT_MAX_OUTSIDE) if segmenter else None,
                "notes": ["No se reconstruyen partes ocultas.",
+                         "La silueta (best-masked.png) sólo se segmenta en el mejor frame y no "
+                         "reconstruye lo que tapa otro animal.",
                          "Los clips conservan la línea de tiempo muestreada: cada muestra sin detección "
                          "entre dos observaciones se escribe como un lienzo gris rotulado.",
                          "Un hueco mayor a max_gap_seconds abre un segmento nuevo y marca el track para revisión.",

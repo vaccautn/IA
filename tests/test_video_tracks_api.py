@@ -116,6 +116,50 @@ def test_quicktime_mov_uploads_are_accepted_like_mp4(client):
     assert rejected.json()["detail"] == "Elegí un video MP4 o MOV."
 
 
+def test_accepted_silhouette_is_exposed_without_disk_paths(client):
+    job_id, result = tracked_job(client)
+    track_dir = result / "tracking" / "tracks" / "3"
+    (track_dir / "best-masked.png").write_bytes(b"masked")
+    (track_dir / "best-mask.png").write_bytes(b"mask")
+    summary_path = result / "tracking" / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["tracks"][0]["segmentation"] = {
+        "status": "ok", "mask_fill": 0.4, "best_masked": "tracks/3/best-masked.png",
+        "best_mask": "tracks/3/best-mask.png"}
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    track = client.get(f"/api/v1/analyses/{job_id}/tracks").json()["tracks"][0]
+    prefix = f"/api/v1/analyses/{job_id}/tracks/3"
+    assert track["best_masked_url"] == f"{prefix}/best-masked"
+    assert track["best_mask_url"] == f"{prefix}/best-mask"
+    assert track["segmentation"] == {"status": "ok", "mask_fill": 0.4}
+    for suffix, body in (("best-masked", b"masked"), ("best-mask", b"mask")):
+        response = client.get(f"{prefix}/{suffix}")
+        assert response.content == body
+        assert response.headers["content-type"].startswith("image/png")
+
+
+def test_rejected_silhouette_has_no_urls(client):
+    job_id, result = tracked_job(client)
+    summary_path = result / "tracking" / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["tracks"][0]["segmentation"] = {"status": "rejected", "reason": "mask_leaves_box"}
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    track = client.get(f"/api/v1/analyses/{job_id}/tracks").json()["tracks"][0]
+    assert track["best_masked_url"] is None and track["best_mask_url"] is None
+    assert client.get(f"/api/v1/analyses/{job_id}/tracks/3/best-masked").status_code == 404
+
+
+def test_tracking_command_uses_local_segmentation_weights_only_when_present(tmp_path, monkeypatch):
+    directory = _job_directory(tmp_path)
+    monkeypatch.setattr(tracking_job, "SEGMENTATION_MODEL", tmp_path / "missing.pt")
+    assert "--segment-model" not in tracking_job.tracking_command(directory)
+    weights = tmp_path / "mobile_sam.pt"
+    weights.write_bytes(b"weights")
+    monkeypatch.setattr(tracking_job, "SEGMENTATION_MODEL", weights)
+    command = tracking_job.tracking_command(directory)
+    assert command[command.index("--segment-model") + 1] == str(weights)
+
+
 def test_track_links_are_exposed(client):
     job_id, result = tracked_job(client)
     summary_path = result / "tracking" / "summary.json"

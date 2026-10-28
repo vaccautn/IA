@@ -343,6 +343,90 @@ def _run_again_with(media, script):
                        model=FakeModel(script)), root / "again"
 
 
+def _box_mask(box, shape=(HEIGHT, WIDTH)):
+    mask = np.zeros(shape, dtype=bool)
+    x1, y1, x2, y2 = box
+    mask[y1:y2, x1:x2] = True
+    return mask
+
+
+def test_assess_mask_accepts_animal_and_rejects_background_grabs():
+    from vacca_video.tracking import assess_mask
+
+    box = (20, 20, 80, 90)
+    good = assess_mask(_box_mask((30, 30, 70, 85)), box, [])
+    assert good["status"] == "ok" and 0.15 < good["mask_fill"] < 0.95
+    assert assess_mask(np.zeros((HEIGHT, WIDTH), bool), box, [])["reason"] == "empty_mask"
+    assert assess_mask(_box_mask((40, 40, 45, 45)), box, [])["reason"] == "mask_too_small"
+    assert assess_mask(_box_mask(box), box, [])["reason"] == "mask_fills_box"
+    assert assess_mask(_box_mask((30, 30, 200, 120)), box, [])["reason"] == "mask_leaves_box"
+    overlap = assess_mask(_box_mask((30, 30, 70, 85)), box, [(50, 30, 120, 85)])
+    assert overlap["status"] == "ok" and overlap["mask_other_overlap"] == pytest.approx(0.5)
+
+
+def test_accepted_mask_writes_silhouette_and_aligned_mask(media):
+    calls = []
+
+    def segmenter(image, bbox):
+        calls.append(bbox)
+        return _box_mask((30, 30, 70, 85))
+
+    segmenter.metadata = {"model": "fake_sam.pt", "model_sha256": "abc", "prompt": "box+point@0.4"}
+    summary, output = _run(media, 6, lambda call: [(1, (20, 20, 80, 90), 0.9)], segmenter=segmenter)
+    track = summary["tracks"][0]
+    assert calls == [(20, 20, 80, 90)]
+    assert track["segmentation"]["status"] == "ok"
+    masked = cv2.imread(str(output / track["segmentation"]["best_masked"]))
+    mask = cv2.imread(str(output / track["segmentation"]["best_mask"]), cv2.IMREAD_GRAYSCALE)
+    assert masked.shape == mask.shape[:2] + (3,) == (64, 64, 3)
+    assert (masked[mask == 0] == 28).all(), "Background outside the mask is flat"
+    assert summary["segmentation"]["model"] == "fake_sam.pt"
+    assert summary["segmentation"]["limit"] == 40
+
+
+def test_rejected_or_failed_masks_keep_rectangular_crop(media):
+    def rejected(image, bbox):
+        return _box_mask(bbox)
+
+    def broken(image, bbox):
+        raise RuntimeError("fixture")
+
+    for segmenter, expected in ((rejected, "rejected"), (broken, "failed")):
+        root, model_path = media
+        video = _write_video(root / f"{expected}.mp4", 4)
+        summary = track_video(video, root / expected, model_path, output_size=(64, 64),
+                              model=FakeModel(lambda call: [(1, (20, 20, 80, 90), 0.9)]),
+                              segmenter=segmenter)
+        track = summary["tracks"][0]
+        assert track["segmentation"]["status"] == expected
+        assert not (root / expected / "tracks/1/best-masked.png").exists()
+        assert (root / expected / track["best_crop"]).is_file()
+
+
+def test_segment_limit_prefers_longest_tracks(media):
+    def script(call):
+        return [(1, (10, 10, 60, 60), 0.9)] + ([(2, (120, 10, 180, 60), 0.9)] if call < 2 else [])
+
+    summary, _ = _run(media, 6, script, segmenter=lambda image, bbox: _box_mask((15, 15, 50, 55)),
+                      segment_limit=1)
+    states = {track["track_id"]: track["segmentation"]["status"] for track in summary["tracks"]}
+    assert states == {1: "ok", 2: "skipped"}
+
+
+def test_without_segmenter_nothing_is_segmented(media):
+    summary, _ = _run(media, 4, lambda call: [(1, (20, 20, 80, 90), 0.9)])
+    assert summary["segmentation"] is None
+    assert summary["tracks"][0]["segmentation"] == {"status": "not_requested"}
+
+
+def test_missing_segmentation_weights_are_never_downloaded(tmp_path):
+    from vacca_video.tracking import load_sam_segmenter
+
+    with pytest.raises(ValueError, match="no se descarga"):
+        load_sam_segmenter(tmp_path / "mobile_sam.pt")
+    assert not (tmp_path / "mobile_sam.pt").exists()
+
+
 def test_existing_output_is_never_overwritten(media):
     root, model_path = media
     video = _write_video(root / "input.mp4", 3)

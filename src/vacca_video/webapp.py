@@ -126,6 +126,15 @@ def _track_entry(job_id, item):
     clip = item.get("clip")
     clip_name = clip.rsplit("/", 1)[-1] if type(clip) is str else None
     entry = {key: value for key, value in item.items() if key not in TRACK_PRIVATE_FIELDS}
+    segmentation = item.get("segmentation")
+    segmented = type(segmentation) is dict and segmentation.get("status") == "ok"
+    if type(segmentation) is dict:
+        entry["segmentation"] = {key: value for key, value in segmentation.items()
+                                 if key not in ("best_masked", "best_mask")}
+    entry.update(
+        best_masked_url=f"{prefix}/best-masked" if segmented else None,
+        best_mask_url=f"{prefix}/best-mask" if segmented else None,
+    )
     entry.update(
         clip_url=f"{prefix}/clip" if clip_name in ("clip.webm", "clip.mp4") else None,
         clip_media_type=TRACK_MEDIA_TYPES.get(clip_name) if clip_name in ("clip.webm", "clip.mp4") else None,
@@ -516,6 +525,22 @@ def create_router():
     )
     def track_best_original(job_id: str, track_id: int, store: Store = Depends(video_store)):
         return track_file(store, job_id, track_id, ("best-original.jpg",))
+
+    @router.get(
+        "/api/v1/analyses/{job_id}/tracks/{track_id}/best-masked", response_class=FileResponse,
+        responses=binary("Silhouette of the selected frame: pixels outside the accepted mask are flat grey.",
+                         "image/png"),
+    )
+    def track_best_masked(job_id: str, track_id: int, store: Store = Depends(video_store)):
+        return track_file(store, job_id, track_id, ("best-masked.png",))
+
+    @router.get(
+        "/api/v1/analyses/{job_id}/tracks/{track_id}/best-mask", response_class=FileResponse,
+        responses=binary("Binary mask aligned with best-crop and best-masked (white is the animal).",
+                         "image/png"),
+    )
+    def track_best_mask(job_id: str, track_id: int, store: Store = Depends(video_store)):
+        return track_file(store, job_id, track_id, ("best-mask.png",))
 
     return router
 

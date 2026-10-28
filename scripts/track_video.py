@@ -9,7 +9,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from vacca_video.tracking import CLIP_CODECS, DEFAULT_MAX_GAP_SECONDS, track_video  # noqa: E402
+from vacca_video.tracking import (  # noqa: E402
+    CLIP_CODECS,
+    DEFAULT_MAX_GAP_SECONDS,
+    DEFAULT_SEGMENT_LIMIT,
+    load_sam_segmenter,
+    track_video,
+)
 
 
 def main(argv=None):
@@ -27,15 +33,25 @@ def main(argv=None):
                         help="deja de leer el video al alcanzar este tiempo")
     parser.add_argument("--max-frames", type=int, default=None,
                         help="deja de leer el video tras esta cantidad de frames")
+    parser.add_argument("--segment-model", type=Path, default=None,
+                        help="pesos MobileSAM/SAM locales para la silueta del mejor frame")
+    parser.add_argument("--segment-limit", type=int, default=DEFAULT_SEGMENT_LIMIT,
+                        help="máximo de trayectorias segmentadas, las más largas primero")
     parser.add_argument("--model", type=Path, default=ROOT / "models/deploy/vacca-yolo26n-v1.pt")
     args = parser.parse_args(argv)
     if args.sample_fps < 0:
         parser.error("--sample-fps no puede ser negativo")
+    if args.segment_limit < 0:
+        parser.error("--segment-limit no puede ser negativo")
     try:
+        if args.output.exists():
+            raise ValueError(f"La carpeta de salida ya existe: {args.output}")
+        segmenter = load_sam_segmenter(args.segment_model) if args.segment_model else None
         summary = track_video(args.input, args.output, args.model, args.tracker,
                               args.confidence, args.sample_fps or None,
                               max_gap_seconds=args.max_gap_seconds, clip_format=args.clip_format,
-                              max_seconds=args.max_seconds, max_frames=args.max_frames)
+                              max_seconds=args.max_seconds, max_frames=args.max_frames,
+                              segmenter=segmenter, segment_limit=args.segment_limit)
     except ImportError as exc:
         print(f"Faltan dependencias: {exc}", file=sys.stderr)
         return 1

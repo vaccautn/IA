@@ -1,5 +1,9 @@
 # VACCA IA — guía para revisar y corregir el tracking de vacas
 
+> Estado actual y próximos pasos: ver
+> [docs/traspaso-tracking-por-vaca.md](docs/traspaso-tracking-por-vaca.md). Esta guía
+> es el encargo original y se conserva como referencia.
+
 Este archivo es el contexto operativo para otro asistente de código. La tarea es
 revisar, probar y corregir el prototipo de tracking/exportación por vaca sin
 romper el detector, la API ni los contratos de video existentes.

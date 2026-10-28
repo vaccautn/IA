@@ -117,14 +117,17 @@ export function Tracks({ job, tracks }) {
 }
 
 function TrackCard({ track }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(false), [whole, setWhole] = useState(false);
   const segments = track.segments?.length ?? 1;
   // A one-frame clip never becomes playable; the crop already shows that frame.
   const clip = track.clip_frames > 1 ? track.clip_url : null;
+  const silhouette = track.best_masked_url && !whole;
   return <li className={`track ${track.status}`}>
     {open && clip
       ? <video src={clip} controls muted autoPlay loop playsInline aria-label={`Clip de la trayectoria ${track.track_id}`} />
-      : <img src={track.best_crop_url} alt={`Mejor recorte de la trayectoria ${track.track_id}`} loading="lazy" />}
+      : silhouette
+        ? <img src={track.best_masked_url} alt={`Silueta de la trayectoria ${track.track_id}, sin el fondo`} loading="lazy" />
+        : <img src={track.best_crop_url} alt={`Mejor recorte de la trayectoria ${track.track_id}`} loading="lazy" />}
     <div className="track-head"><strong>Trayectoria {track.track_id}</strong><span className={`status ${track.status === "review" ? "review" : "completed"}`}>{track.status === "review" ? "Revisar" : "Candidata"}</span></div>
     <p>{seconds(track.first_timestamp_ms)}–{seconds(track.last_timestamp_ms)} s · {track.observations} {track.observations === 1 ? "observación" : "observaciones"}{segments > 1 ? ` · ${segments} tramos` : ""}</p>
     {track.warnings.length > 0 && <ul className="track-warnings">{track.warnings.map((warning) => <li key={warning}>{trackWarnings[warning] ?? warning}</li>)}</ul>}
@@ -132,6 +135,7 @@ function TrackCard({ track }) {
     {track.possible_continued_by != null && <p className="track-link">Puede continuar en la trayectoria {track.possible_continued_by}.</p>}
     <div className="track-actions">
       {clip && <button className="secondary" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? "Ver recorte" : "Ver clip"}</button>}
+      {track.best_masked_url && !open && <button className="secondary" aria-pressed={!whole} onClick={() => setWhole(!whole)}>{whole ? "Ver silueta" : "Ver con fondo"}</button>}
       <a className="secondary" href={track.best_original_url} target="_blank" rel="noreferrer">Frame original</a>
     </div>
   </li>;

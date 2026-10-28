@@ -228,6 +228,8 @@ OpenAPI y explorador interactivo: http://127.0.0.1:8001/docs.
 | GET /api/v1/analyses/{id}/tracks/{track_id}/clip | Clip 320×320 de la trayectoria: `video/webm` (VP8) en la web, `video/mp4` para corridas archivadas |
 | GET /api/v1/analyses/{id}/tracks/{track_id}/best-crop | PNG del recorte rectangular con padding del mejor frame |
 | GET /api/v1/analyses/{id}/tracks/{track_id}/best-original | JPEG del frame original completo elegido, sin anotaciones |
+| GET /api/v1/analyses/{id}/tracks/{track_id}/best-masked | PNG de la silueta (fondo gris plano); 404 si la máscara no fue aceptada |
+| GET /api/v1/analyses/{id}/tracks/{track_id}/best-mask | PNG de la máscara binaria alineada con best-crop |
 
 Las imágenes se sirven como `image/jpeg` con sus mismos bytes; la opción
 `?download=true` agrega una disposición de descarga con nombre

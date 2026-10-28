@@ -34,7 +34,7 @@ const track = (id, trackId, status, warnings = []) => ({
 });
 const tracks = (id) => ({
   schema_version: "vacca-video-tracks-v1", status: "completed", stop_reason: "end_of_video",
-  tracks: [track(id, 1, "candidate"), { ...track(id, 7, "review", ["long_gap_review_required", "other_detection_in_crop_at_best_frame"]), possible_continuation_of: 1 }]
+  tracks: [{ ...track(id, 1, "candidate"), best_masked_url: `/api/v1/analyses/${id}/tracks/1/best-masked` }, { ...track(id, 7, "review", ["long_gap_review_required", "other_detection_in_crop_at_best_frame"]), possible_continuation_of: 1 }]
 });
 
 function deferred() {
@@ -171,7 +171,7 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
         return route.fulfill({ status: result.status, contentType: "application/json", body: JSON.stringify(result.body) });
       }
       if (/\/frames\/\d+\/image$/.test(endpoint.pathname) || endpoint.pathname.endsWith("/candidate/image")
-        || /\/tracks\/\d+\/(best-crop|best-original)$/.test(endpoint.pathname)) {
+        || /\/tracks\/\d+\/(best-crop|best-original|best-masked)$/.test(endpoint.pathname)) {
         return route.fulfill({ contentType: "image/svg+xml", body: svg });
       }
       let result;
@@ -399,6 +399,12 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     assert.equal(await review.getByRole("button", { name: "Ver recorte" }).getAttribute("aria-expanded"), "true");
     await review.getByRole("button", { name: "Ver recorte" }).click();
     assert.equal(await review.locator("video").count(), 0);
+    const candidate = gallery.getByRole("listitem").filter({ hasText: "Trayectoria 1" });
+    assert.equal(await candidate.getByAltText("Silueta de la trayectoria 1, sin el fondo").getAttribute("src"), "/api/v1/analyses/a/tracks/1/best-masked");
+    await candidate.getByRole("button", { name: "Ver con fondo" }).click();
+    assert.equal(await candidate.getByAltText("Mejor recorte de la trayectoria 1").getAttribute("src"), "/api/v1/analyses/a/tracks/1/best-crop");
+    await candidate.getByRole("button", { name: "Ver silueta" }).waitFor();
+    assert.equal(await review.getByRole("button", { name: /silueta|fondo/ }).count(), 0, "No silhouette toggle without an accepted mask");
 
     const single = { ...tracks("a"), tracks: [{ ...track("a", 3, "review", ["short_track_review_required"]), clip_frames: 1 }] };
     mock.tracks = () => reply(single);

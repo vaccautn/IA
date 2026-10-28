@@ -140,6 +140,8 @@ TRACK_MEDIA_TYPES = {
     "clip.mp4": "video/mp4",
     "best-crop.png": "image/png",
     "best-original.jpg": "image/jpeg",
+    "best-masked.png": "image/png",
+    "best-mask.png": "image/png",
 }
 TRACKING_JSON_LIMIT = 4 * 1024 * 1024
 

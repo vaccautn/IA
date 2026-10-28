@@ -40,13 +40,19 @@ Opciones:
   reproduce en el navegador; OpenCV de pip no trae un codificador H.264.
 - `--max-seconds` deja de leer al alcanzar ese tiempo; `summary.json` informa
   `stop_reason: "time_limit"` en lugar de `"end_of_video"`.
+- `--max-frames` corta tras esa cantidad de frames (`stop_reason: "frame_limit"`).
+- `--segment-model models\segmentation\mobile_sam.pt` agrega la silueta del mejor
+  frame (ver abajo). `--segment-limit` (por defecto 40) acota cuántas
+  trayectorias se segmentan, las más largas primero.
 
 Si falta `lap`, el comando falla sin dejar que Ultralytics lo instale.
 
 ## Galería web
 
 Cada análisis web completado ejecuta este mismo comando con ByteTrack, clips
-WebM y un límite de 60 segundos. La galería muestra el mejor recorte, el estado
+WebM, un límite de 60 segundos y 1200 frames, y la silueta si
+`models/segmentation/mobile_sam.pt` existe. La galería muestra la silueta (o el
+mejor recorte), el estado
 (`Candidata` o `Revisar`), las advertencias, el clip y el frame original de cada
 trayectoria. El contrato HTTP está en [video-web.md](video-web.md).
 
@@ -59,6 +65,8 @@ outputs/tracking/<corrida>/
   tracks/<id>/clip.mp4      (o clip.webm)
   tracks/<id>/best-original.jpg
   tracks/<id>/best-crop.png
+  tracks/<id>/best-masked.png   (sólo con silueta aceptada)
+  tracks/<id>/best-mask.png     (máscara alineada con best-crop, blanco = animal)
 ```
 
 `summary.json` registra el modelo y su sha256, el tracker, la configuración, el
@@ -103,8 +111,51 @@ también pueden relevarse en la misma posición de una manga.
 
 Un `candidate` no es una toma limpia garantizada: la contaminación sólo mide
 otras detecciones, así que una vaca que el detector no vio dentro del recorte no
-se mide. El recorte es rectangular; separar píxeles de otra vaca dentro de la
-caja requiere segmentación por instancia. Una oclusión no se reconstruye.
+se mide. Una oclusión no se reconstruye.
+
+### Silueta del mejor frame
+
+Con `--segment-model`, MobileSAM segmenta sólo el mejor frame de cada
+trayectoria, guiado por la caja y un punto positivo al 40 % de su altura (sobre
+la grupa en tomas desde atrás). Sólo la caja fallaba: en el video de manga
+agarraba fondo o alambrado en 2 de 7 trayectorias; caja + punto resolvió las 7.
+Tarda ~3 s por trayectoria en CPU.
+
+La máscara se acepta (`segmentation.status: "ok"`) sólo si cubre entre 15 % y
+95 % de la caja y menos del 10 % de sus píxeles cae fuera; si no, queda
+`rejected` con la razón y se usa el recorte rectangular. `mask_other_overlap`
+es informativo: cajas solapadas comparten píxeles legítimos. Los pesos se leen
+de disco y nunca se descargan durante una inferencia.
+
+Límites medidos: una vaca no detectada pegada a la silueta puede quedar
+incluida (en el video de manga, la cabeza de la colorada detrás de la blanca),
+y lo tapado por otra vaca no se reconstruye.
+
+## Recortes para entrenar BCS
+
+El modelo BCS actual (`models/catalog/bcs-category-coral-2026-09-04`) se
+entrenó con imágenes completas y no pasó sus controles de aceptación. Para
+reentrenarlo con vistas desde atrás por animal:
+
+```powershell
+# 1. Exportar las candidatas (una corrida por video) y una planilla vacía
+python scripts/export_bcs_crops.py export outputs\tracking\manga-v3-seg `
+  --output outputs\bcs-labeling\lote-1
+# 2. Completar bcs_category (1..5) en outputs\bcs-labeling\lote-1\labels.csv
+# 3. Armar el dataset por carpetas que lee BCSFolderDataset
+python scripts/export_bcs_crops.py materialize outputs\bcs-labeling\lote-1\labels.csv `
+  --output data\bcs-tracks-v1
+```
+
+- Se exporta la silueta si fue aceptada; si no, el recorte rectangular
+  (`image_kind`). `--include-review` agrega las trayectorias en revisión.
+- Nunca se asigna una categoría automáticamente; filas vacías se omiten y
+  cualquier valor fuera de 1..5 cancela sin copiar nada.
+- Un mismo video no puede exportarse desde dos trackers (duplicaría animales).
+- `group` identifica al animal dentro del video (un fragmento vinculado hereda
+  el grupo de su trayectoria anterior). `groups.json` permite dividir
+  train/val/test por animal y no por imagen, para no filtrar el mismo animal
+  entre particiones.
 
 ## Validación del material actual
 

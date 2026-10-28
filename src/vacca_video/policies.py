@@ -19,6 +19,8 @@ WORKER_SHUTDOWN_JOIN_SECONDS = 10
 TRACKING_TIMEOUT_SECONDS = 10 * 60
 TRACKING_MAX_SECONDS = DEFAULT_MAX_FRAMES / DEFAULT_SAMPLE_FPS
 TRACKING_MAX_FRAMES = 1200
+# Optional best-frame silhouettes; used only when these weights are already on disk.
+SEGMENTATION_MODEL = ROOT / "models/segmentation/mobile_sam.pt"
 TRACKING_TRACKER = "bytetrack.yaml"
 
 

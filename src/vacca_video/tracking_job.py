@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .policies import (
     ROOT,
+    SEGMENTATION_MODEL,
     TRACKING_MAX_FRAMES,
     TRACKING_MAX_SECONDS,
     TRACKING_TIMEOUT_SECONDS,
@@ -43,6 +44,7 @@ def write_status(result, status, reason=None):
 
 
 def tracking_command(directory):
+    segmentation = ["--segment-model", str(SEGMENTATION_MODEL)] if SEGMENTATION_MODEL.is_file() else []
     return [
         sys.executable,
         "-u",
@@ -60,6 +62,7 @@ def tracking_command(directory):
         str(TRACKING_MAX_SECONDS),
         "--max-frames",
         str(TRACKING_MAX_FRAMES),
+        *segmentation,
     ]
 
 
