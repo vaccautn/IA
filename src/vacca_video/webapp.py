@@ -32,7 +32,7 @@ from .schemas import (
     FramePageResponse,
     JobResponse,
     TrackListResponse,
-    PassageListResponse, PassageResponse, UnresolvedPassageResponse,
+    PassageBCSResult, PassageListResponse, UnresolvedPassageResponse,
     sanitize_optional_candidate,
 )
 from .service import UNAVAILABLE_DETAIL, VideoResources
@@ -43,11 +43,13 @@ from .artifacts import (
     job_artifact,
     read_summary,
     read_tracking_json,
+    read_tracking_bytes,
     tracking_artifact,
-    passage_artifact, PASSAGE_FILES,
+    passage_artifact, PASSAGE_FILES, PASSAGE_BCS_FILE,
 )
 from .candidate import CANDIDATE_ARTIFACT
 from .tracking_job import TRACKING_STATUS
+from .passage_bcs import digest, passage_entries, read_passage_bcs
 
 SUMMARY_UNAVAILABLE_DETAIL = (
     "No se pudo leer el resumen guardado; las detecciones y el historial siguen disponibles."
@@ -210,25 +212,15 @@ def _passage_warnings(value):
     return sorted(set(value) & PASSAGE_WARNINGS)
 
 
-def _passage_entry(root, job_id, item):
-    entry = PassageResponse.model_validate(item)
+def _passage_entry(root, job_id, entry, item):
     candidate = entry.candidate
     raw = item["candidate"]
     candidate.reason = None
     names = {}
     if candidate.status == "not_available":
-        if raw.get("reason") != "no_candidate_captured":
-            raise ValueError("Invalid candidate absence")
         candidate.reason = "no_candidate_captured"
         candidate.frame_index = candidate.timestamp_ms = None
     else:
-        if (type(raw.get("track_id")) is not int or raw["track_id"] != entry.track_id
-                or candidate.frame_index is None or candidate.timestamp_ms is None
-                or not entry.start_frame <= candidate.frame_index <= entry.end_frame
-                or not entry.start_timestamp_ms <= candidate.timestamp_ms <= entry.end_timestamp_ms
-                or (entry.end_exclusive and (candidate.frame_index == entry.end_frame
-                                            or candidate.timestamp_ms == entry.end_timestamp_ms))):
-            raise ValueError("Invalid candidate provenance")
         names = {"best-original": raw.get("original"), "best-crop": raw.get("best_crop")}
         segmentation = raw.get("segmentation")
         if type(segmentation) is not dict or segmentation.get("status") not in (
@@ -258,47 +250,46 @@ def passages_detail(root, job):
     if state["status"] != "completed":
         return PassageListResponse(**state)
     try:
-        summary = read_tracking_json(root, job["id"], "summary.json")
+        summary_bytes = read_tracking_bytes(root, job["id"], "summary.json")
+        summary = json.loads(summary_bytes)
         if type(summary) is not dict:
             raise ValueError("Invalid summary")
         if "passage_evidence" not in summary:
             return PassageListResponse(status="unavailable", reason="legacy_no_passage_evidence")
         evidence = summary["passage_evidence"]
-        if (type(evidence) is not dict
-                or evidence.get("status") != "provisional_evidence_not_unique_animal_identity"
-                or type(evidence.get("policy")) is not dict
-                or evidence["policy"].get("calibration") != "uncalibrated_confidence_proxy_not_visibility_or_bcs"
-                or type(evidence.get("intervals")) is not list
-                or type(evidence.get("unresolved_tracks")) is not list):
-            raise ValueError("Invalid passage evidence")
-        entries = sorted((_passage_entry(root, job["id"], item) for item in evidence["intervals"]),
-                         key=lambda entry: entry.sequence)
-        previous = None
-        track_ids = set()
-        for index, entry in enumerate(entries, 1):
-            if (entry.sequence != index or entry.track_id in track_ids
-                    or entry.end_frame < entry.start_frame or entry.end_timestamp_ms < entry.start_timestamp_ms
-                    or entry.end_exclusive != (index < len(entries))
-                    or (previous is not None and (
-                        entry.start_frame <= previous.start_frame
-                        or entry.start_timestamp_ms <= previous.start_timestamp_ms
-                        or entry.start_frame != previous.end_frame
-                        or entry.start_timestamp_ms != previous.end_timestamp_ms))):
-                raise ValueError("Inconsistent passage chronology")
-            previous = entry
-            track_ids.add(entry.track_id)
+        pairs = passage_entries(summary)
+        entries = [_passage_entry(root, job["id"], entry, raw) for entry, raw in pairs]
         unresolved = [UnresolvedPassageResponse.model_validate(item) for item in evidence["unresolved_tracks"]]
-        for item in unresolved:
-            if (item.track_id in track_ids or item.last_frame < item.first_frame
-                    or item.last_timestamp_ms < item.first_timestamp_ms):
-                raise ValueError("Invalid unresolved track")
-            track_ids.add(item.track_id)
-        return PassageListResponse(status="completed", evidence_status=evidence["status"],
+        response = PassageListResponse(status="completed", evidence_status=evidence["status"],
             calibration=evidence["policy"]["calibration"], passages=entries,
             unresolved_count=len(unresolved), unresolved_tracks=sorted(unresolved, key=lambda item: item.track_id),
             warnings=_passage_warnings(evidence.get("warnings")))
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
         return PassageListResponse(status="unavailable", reason="passage_evidence_unreadable")
+    try:
+        # Validate the entire ordered join before assigning even one score.
+        sidecar = read_passage_bcs(root, job["id"])
+        if sidecar["summary_sha256"] != digest(summary_bytes):
+            raise ValueError("Tracking summary changed during projection")
+        results = [PassageBCSResult.model_validate({key: row[key]
+                   for key in PassageBCSResult.model_fields if key in row})
+                   for row in sidecar["passages"]]
+    except FileNotFoundError:
+        # Only an absent sidecar is a legitimate legacy/not-configured result.
+        try:
+            tracking_artifact(root, job["id"], PASSAGE_BCS_FILE).stat()
+        except FileNotFoundError:
+            return response
+        except (OSError, ValueError):
+            pass
+        response.bcs_status, response.bcs_reason = "unavailable", "passage_bcs_unreadable"
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        response.bcs_status, response.bcs_reason = "unavailable", "passage_bcs_unreadable"
+    else:
+        for entry, result in zip(entries, results):
+            entry.bcs = result
+        response.bcs_status = "completed"
+    return response
 
 
 def video_admission_store(request: Request) -> Store:
@@ -598,12 +589,15 @@ def create_router():
     @router.get("/api/v1/analyses/{job_id}/passages", response_model=PassageListResponse,
                 responses={404: {"model": VideoErrorResponse}})
     def get_passages(job_id: str, store: Store = Depends(video_store)):
-        """Provisional evidence only; not unique animal counts or per-passage BCS.
+        """Provisional passages with optional original-only experimental BCS categories.
 
         Like tracks, processing videos remain pending until configured stages settle.
         Legacy completed videos without tracking status remain unavailable.
         Image availability does not establish anatomical visibility, BCS eligibility,
-        or validation of the masked representation. No clinical scoring is performed.
+        or validation of crops/masks. Full frames may contain other cows. Categories
+        are not clinically validated; the model is experimental, not approved, and
+        no BCS confidence is reported. passage.bcs is authoritative; candidate.bcs_status
+        is a deprecated tracking-producer snapshot, not the current inference state.
         """
         return passages_detail(store.directory, store.get(job_id))
 

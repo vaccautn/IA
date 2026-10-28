@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from test_video_tracks_api import client, tracked_job
+from test_video_tracks_api import client as client, tracked_job
 from test_video_web import TestClient, submit
 from vacca_video import tracking_job
 
@@ -130,6 +130,7 @@ def test_order_semantics_and_allowlisted_metadata(client):
     job_id, result, evidence = passage_job(client)
     evidence["intervals"].reverse()
     evidence["intervals"][0]["support"] = {"private": "C:/secret"}
+    evidence["intervals"][0]["bcs"] = {"status": "evaluated", "bcs_category": 5}
     evidence["warnings"] = ["C:/private/error", "possible_fragment_identity_unresolved"]
     save(result, evidence)
     data = listing(client, job_id)
@@ -298,3 +299,130 @@ def test_passages_openapi_and_local_only(client):
     job_id, _, _ = passage_job(client)
     remote = TestClient(client.app, client_host="10.0.0.5")
     assert remote.get(f"/api/v1/analyses/{job_id}/passages").status_code == 403
+
+
+def scored_job(client, *, mixed=False):
+    from io import BytesIO
+    from PIL import Image
+    from test_video_passage_bcs import result as outcome
+    from fastapi import HTTPException
+
+    job_id, result, evidence = passage_job(client)
+    for entry in evidence["intervals"]:
+        stream = BytesIO()
+        Image.new("RGB", (65, 49), (entry["sequence"] * 50, 20, 30)).save(stream, format="JPEG")
+        (result / "tracking" / entry["candidate"]["original"]).write_bytes(stream.getvalue())
+    if mixed:
+        evidence["intervals"][2]["candidate"] = dict(status="not_available",
+            reason="no_candidate_captured", bcs_eligibility="not_assessed", bcs_status="not_evaluated")
+    save(result, evidence)
+    calls = []
+    async def evaluate(image, **kwargs):
+        calls.append(image)
+        if mixed and len(calls) == 2:
+            raise HTTPException(503, "Inference capacity is busy; retry shortly")
+        return outcome(len(calls))
+    # Reuse the coordinator fixture with this actual API job ID.
+    from vacca_video.bcs import VideoBCSCoordinator
+    import asyncio
+    async def run():
+        coordinator = VideoBCSCoordinator(asyncio.get_running_loop(), evaluate)
+        try:
+            await asyncio.to_thread(coordinator.finish_passages,
+                                    client.app.state.store.directory, job_id, threading.Event())
+        finally:
+            await coordinator.close()
+    asyncio.run(run())
+    return job_id, result
+
+
+def test_public_bcs_join_and_mixed_outcomes(client, tmp_path):
+    for mixed in (False, True):
+        job_id, _ = scored_job(client, mixed=mixed)
+        data = listing(client, job_id)
+        assert data["bcs_status"] == "completed" and data["bcs_reason"] is None
+        assert [p["track_id"] for p in data["passages"]] == [9, 2, 8, 1]
+        scores = [p["bcs"] for p in data["passages"]]
+        assert [s["bcs_category"] for s in scores] == ([1, None, None, 3] if mixed else [1, 2, 3, 4])
+        assert scores[0]["model_status"] == "experimental_not_approved"
+        assert scores[0]["input_representation"] == "original_only"
+        assert scores[0]["package_id"] == "fake-package"
+        assert len(scores[0]["input_sha256"]) == 64
+        if mixed:
+            assert [scores[i]["reason"] for i in (1, 2)] == ["capacity_busy", "no_candidate_captured"]
+            assert data["passages"][2]["candidate"]["status"] == "not_available"
+        assert "confidence" not in json.dumps(scores)
+        assert not any(key in json.dumps(scores) for key in ("C:/", "track_id", "start_frame"))
+        candidate = data["passages"][0]["candidate"]
+        assert candidate["bcs_status"] == "not_evaluated"  # Deprecated producer snapshot.
+        assert candidate["bcs_eligibility"] == "not_assessed"
+        assert client.get(candidate["best_original_url"]).status_code == 200
+    (tmp_path / "passages-response.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+@pytest.mark.parametrize("defect", ["missing", "json", "oversize", "category", "type", "nan",
+    "summary", "frame", "time", "hash", "bytes", "order", "missing_image", "unevaluable_hash"])
+def test_unavailable_bcs_preserves_passages_and_images(client, defect):
+    job_id, result = scored_job(client)
+    path = result / "tracking/passage-bcs.json"
+    sidecar = json.loads(path.read_bytes())
+    row = sidecar["passages"][0]
+    if defect == "missing":
+        path.unlink()
+    elif defect == "json":
+        path.write_text("{")
+    elif defect == "oversize":
+        path.write_bytes(b" " * (1024 * 1024 + 1))
+    elif defect == "missing_image":
+        (result / "tracking/passages/1/best-original.jpg").unlink()
+    elif defect == "bytes":
+        (result / "tracking/passages/1/best-original.jpg").write_bytes(
+            (result / "tracking/passages/2/best-original.jpg").read_bytes())
+    else:
+        if defect == "category":
+            row["bcs_category"] = 6
+        elif defect == "type":
+            row["bcs_category"] = True
+        elif defect == "nan":
+            row["inference_time_ms"] = float("nan")
+        elif defect == "summary":
+            sidecar["summary_sha256"] = "0" * 64
+        elif defect == "frame":
+            row["frame_index"] += 1
+        elif defect == "time":
+            row["timestamp_ms"] += 1
+        elif defect == "hash":
+            row["input_sha256"] = "0" * 64
+        elif defect == "order":
+            sidecar["passages"].reverse()
+        elif defect == "unevaluable_hash":
+            row.update(status="unevaluable", reason="capacity_busy", bcs_category=None,
+                model_status=None, package_id=None, inference_time_ms=None, lineage=None,
+                input_sha256="0" * 64)
+        path.write_text(json.dumps(sidecar))
+    data = listing(client, job_id)
+    assert data["status"] == "completed" and len(data["passages"]) == 4
+    assert data["bcs_status"] == ("not_evaluated" if defect == "missing" else "unavailable")
+    assert data["bcs_reason"] == (None if defect == "missing" else "passage_bcs_unreadable")
+    assert all(p["bcs"] is None for p in data["passages"])
+    assert client.get(data["passages"][0]["candidate"]["best_crop_url"]).status_code == 200
+
+
+@pytest.mark.parametrize("state", ["pending", "processing"])
+def test_existing_scores_are_private_until_completed(client, state):
+    job_id, _ = scored_job(client)
+    client.app.state.store.update(job_id, state)
+    data = listing(client, job_id)
+    assert data["status"] == "pending" and data["passages"] == []
+    assert data["bcs_status"] == "not_evaluated"
+    assert client.get(f"/api/v1/analyses/{job_id}/passages/1/best-original").status_code == 404
+
+
+def test_public_bcs_openapi(client):
+    schemas = client.app.openapi()["components"]["schemas"]
+    assert schemas["PassageResponse"]["properties"]["bcs"]["anyOf"] == [
+        {"$ref": "#/components/schemas/PassageBCSResult"}, {"type": "null"}]
+    fields = schemas["PassageBCSResult"]["properties"]
+    assert fields["input_representation"]["const"] == "original_only"
+    assert fields["bcs_category"]["anyOf"][1] == {"type": "null"}
+    assert schemas["PassageCandidateResponse"]["properties"]["bcs_status"]["deprecated"]

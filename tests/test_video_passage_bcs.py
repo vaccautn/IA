@@ -275,3 +275,63 @@ def test_close_interrupts_pending_passage_without_sidecar(tmp_path):
         assert not coordinator.tasks
     asyncio.run(run())
     assert not (directory / "passage-bcs.json").exists()
+
+
+@pytest.mark.parametrize("mode", ["success", "busy", "timeout"])
+def test_passages_use_native_parent_evaluator_and_retain_capacity(tmp_path, monkeypatch, mode):
+    from vacca_api import main
+    from vacca_api.metrics import PrototypeMetrics
+    from vacca_video.passage_bcs import read_passage_bcs
+
+    _, _, images = passage_job(tmp_path)
+    calls, release = [], threading.Event()
+    lineage = SimpleNamespace(checkpoint_schema_version="fake-v1", domain_id="fake-domain",
+        snapshot_schema="snapshot-v1", snapshot_identity="fake-identity", dataset_manifest_digest="fake-digest",
+        run_id="fake-run", source_schema="source-v1", source_identity_scheme="identity-v1",
+        observed_classes=(1, 2, 3, 4, 5), missing_classes=(), source_mapping=(("3.25", 1),),
+        checkpoint_path="C:/private/checkpoint")
+    def infer(image):
+        calls.append(image)
+        if mode == "timeout":
+            assert release.wait(5)
+        return SimpleNamespace(bcs_category=4, lineage=lineage)
+    service = SimpleNamespace(infer=infer)
+    runtime = SimpleNamespace(model_status="experimental_not_approved", package_id="fake-package",
+                              get_service=lambda: service)
+    monkeypatch.setattr(main, "get_bcs_runtime", lambda: runtime)
+    monkeypatch.setattr(main.app.state, "metrics", PrototypeMetrics())
+    async def run():
+        gate = main.InferenceCapacityGate("bcs", acquisition_timeout=.01)
+        monkeypatch.setattr(main.app.state, "bcs_inference_gate", gate)
+        coordinator = VideoBCSCoordinator(asyncio.get_running_loop(), main.evaluate_bcs, max_wait=.15)
+        if mode == "busy":
+            await gate.acquire()
+        try:
+            await asyncio.to_thread(coordinator.finish_passages, tmp_path, "fake", threading.Event())
+            if mode == "timeout":
+                with pytest.raises(main.InferenceCapacityBusyError):
+                    await gate.acquire()
+        finally:
+            release.set()
+            if mode == "busy":
+                gate.release()
+            await coordinator.close()
+        for _ in range(100):
+            if not gate._work_threads:
+                break
+            await asyncio.sleep(.01)
+        assert not gate._work_threads
+        await gate.acquire()
+        gate.release()
+    asyncio.run(run())
+    rows = read_passage_bcs(tmp_path, "fake")["passages"]
+    if mode == "success":
+        assert calls == images  # Full original JPEG bytes, never the crop sentinel.
+        assert [r["bcs_category"] for r in rows] == [4, 4, 4]
+        assert rows[0]["lineage"]["source_mapping"] == {"3.25": 1}
+        assert "private" not in json.dumps(rows)
+    else:
+        assert len(calls) == (1 if mode == "timeout" else 0)
+        assert [r["reason"] for r in rows] == (["evaluation_timeout", "capacity_busy", "capacity_busy"]
+                                               if mode == "timeout" else ["capacity_busy"] * 3)
+        assert all(r["bcs_category"] is None for r in rows)

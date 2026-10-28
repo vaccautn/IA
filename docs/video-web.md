@@ -214,6 +214,31 @@ ausentes; `error` y `summary` del trabajo mantienen sus valores nulos explícito
 
 OpenAPI y explorador interactivo: http://127.0.0.1:8001/docs.
 
+### Experimental per-passage BCS
+
+`GET /api/v1/analyses/{id}/passages` preserves `vacca-video-passages-v1` and adds
+`passage.bcs`: a typed `evaluated` or `unevaluable` result, nullable category
+`1..5`, controlled reason, `input_representation: original_only`, experimental
+model status, package, timing, sanitized lineage and input SHA-256 when present.
+It exposes neither private paths nor BCS confidence. Inference uses the full
+original frame, which may contain other cows; it never classifies crops or masks.
+The category is experimental, not clinically validated; the model is not approved.
+
+| List-level `bcs_status` | Meaning |
+| --- | --- |
+| `completed` | Full sidecar bound to the summary, ordered intervals and current images; may include `unevaluable` passages without categories. |
+| `not_evaluated` | Absent sidecar (legacy/no configured phase), or job not yet completed; does not imply inference failure. |
+| `unavailable` | Unreadable, oversized, invalid or stale sidecar; `bcs_reason: passage_bcs_unreadable`, all results null, valid images retained. |
+
+Candidate availability is separate from BCS availability. For compatibility,
+`candidate.bcs_status: not_evaluated` remains a **deprecated** tracking-producer
+snapshot, not the current inference state; use `passage.bcs` instead.
+`candidate.bcs_eligibility: not_assessed` still means clinical eligibility was not
+assessed. All passages remain chronological, including those without candidates.
+While the job is `pending` or `processing`, no passages, categories or files are
+exposed. There is no raw sidecar route. Job completion follows all configured
+stages, including sequential passage evaluation on the same parent BCS runtime/gate.
+
 | Método/ruta | Contrato |
 | --- | --- |
 | POST /api/v1/analyses?filename=nombre.mp4 | Body binario MP4 o MOV de QuickTime (`.mov`, grabaciones de celular), no multipart; devuelve 202 y trabajo persistido |

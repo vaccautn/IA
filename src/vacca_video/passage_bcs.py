@@ -3,19 +3,18 @@
 import hashlib
 import json
 import re
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from vacca_vision import validate_image_bytes
 
 from .artifacts import (PASSAGE_BCS_FILE, passage_artifact, read_tracking_bytes,
                         read_tracking_json)
-from .schemas import PassageResponse, UnresolvedPassageResponse
+from .schemas import PassageBCSReason, PassageResponse, UnresolvedPassageResponse
 
 IMAGE_LIMIT = 10 * 1024 * 1024
 SCHEMA = "vacca-video-passage-bcs-v1"
-REASONS = {"no_candidate_captured", "invalid_original", "image_rejected", "capacity_busy",
-           "capability_unavailable", "inference_failed", "evaluation_timeout", "invalid_outcome"}
+REASONS = set(get_args(PassageBCSReason))
 LINEAGE_FIELDS = {"checkpoint_schema_version", "domain_id", "snapshot_schema", "snapshot_identity",
                   "dataset_manifest_digest", "run_id", "source_schema", "source_identity_scheme"}
 
@@ -34,7 +33,7 @@ def passage_entries(summary):
             or type(evidence.get("intervals")) is not list
             or type(evidence.get("unresolved_tracks")) is not list):
         raise ValueError("Invalid passage evidence")
-    pairs = sorted(((PassageResponse.model_validate(raw), raw) for raw in evidence["intervals"]),
+    pairs = sorted(((PassageResponse.model_validate(dict(raw, bcs=None)), raw) for raw in evidence["intervals"]),
                    key=lambda pair: pair[0].sequence)
     previous, tracks = None, set()
     for index, (entry, raw) in enumerate(pairs, 1):
@@ -173,9 +172,10 @@ def read_passage_bcs(root, job_id):
     for row, (entry, raw) in zip(sidecar.passages, pairs):
         if any(row.model_dump()[key] != value for key, value in binding(entry).items()):
             raise ValueError("Stale passage BCS binding")
-        if row.status == "evaluated":
+        if row.input_sha256 is not None:
             image = original_bytes(root, job_id, entry, raw)
-            validate_original(image)
+            if row.status == "evaluated":
+                validate_original(image)
             if row.input_sha256 != digest(image):
                 raise ValueError("Stale passage BCS image")
     return sidecar.model_dump()

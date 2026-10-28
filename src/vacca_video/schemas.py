@@ -202,13 +202,32 @@ class PassageMetadata(BaseModel):
     model_config = ConfigDict(strict=True, extra="ignore", allow_inf_nan=False)
 
 
+PassageBCSReason = Literal["no_candidate_captured", "invalid_original", "image_rejected",
+    "capacity_busy", "capability_unavailable", "inference_failed", "evaluation_timeout", "invalid_outcome"]
+
+
+class PassageBCSResult(PassageMetadata):
+    """Public allowlist projected only after full sidecar/binding validation."""
+
+    status: Literal["evaluated", "unevaluable"]
+    bcs_category: int | None = Field(ge=1, le=5)
+    reason: PassageBCSReason | None
+    input_representation: Literal["original_only"] = "original_only"
+    model_status: Literal["experimental_not_approved"] | None = None
+    package_id: str | None = None
+    inference_time_ms: float | None = Field(default=None, ge=0)
+    lineage: dict[str, JsonValue] | None = None
+    input_sha256: str | None = None
+
+
 class PassageCandidateResponse(PassageMetadata):
     status: Literal["available", "not_available"]
     reason: Literal["no_candidate_captured"] | None = None
     frame_index: int | None = Field(default=None, ge=0)
     timestamp_ms: float | None = Field(default=None, ge=0)
-    bcs_eligibility: Literal["not_assessed"]
-    bcs_status: Literal["not_evaluated"]
+    bcs_eligibility: Literal["not_assessed"] = Field(description="Clinical eligibility is not assessed.")
+    bcs_status: Literal["not_evaluated"] = Field(deprecated=True,
+        description="Legacy tracking-producer snapshot, not current inference state. Use passage.bcs.")
     best_original_url: str | None = None
     best_crop_url: str | None = None
     best_mask_url: str | None = None
@@ -228,6 +247,8 @@ class PassageResponse(PassageMetadata):
     transition_method: Literal["initial_confidence", "concurrent_confidence", "missing_incumbent_foreground"]
     candidate: PassageCandidateResponse
     warnings: list[str]
+    bcs: PassageBCSResult | None = Field(default=None,
+        description="Authoritative experimental result; null when not performed or unavailable.")
 
 
 class UnresolvedPassageResponse(PassageMetadata):
@@ -245,6 +266,9 @@ class PassageListResponse(PassageMetadata):
     schema_version: Literal["vacca-video-passages-v1"] = "vacca-video-passages-v1"
     status: Literal["pending", "completed", "failed", "disabled", "unavailable"]
     reason: str | None = None
+    bcs_status: Literal["completed", "not_evaluated", "unavailable"] = Field(default="not_evaluated",
+        description="Completed means the validated pass finished, including any unevaluable entries; not clinical approval.")
+    bcs_reason: Literal["passage_bcs_unreadable"] | None = None
     evidence_status: Literal["provisional_evidence_not_unique_animal_identity"] | None = None
     identity_semantics: Literal["temporal_track_id_within_video"] = "temporal_track_id_within_video"
     calibration: Literal["uncalibrated_confidence_proxy_not_visibility_or_bcs"] | None = None
