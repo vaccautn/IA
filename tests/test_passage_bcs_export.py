@@ -62,6 +62,10 @@ def test_rows_assets_and_provenance(run):
     assert len({row["group_id"] for row in sheet}) == 1
     assert result["source_video_sha256"] == hashlib.sha256(video.read_bytes()).hexdigest()
     assert result["run_metadata_sha256"] == hashlib.sha256((root / "summary.json").read_bytes()).hexdigest()
+    assert result["schema_version"] == "vacca-bcs-passage-labels-v2"
+    assert result["input_representation"] == "full_original_frame_only"
+    assert result["assets"] == len(list((output / "images").iterdir())) == 2
+    assert json.loads((output / "export.json").read_text())["passages"] == result["passages"]
     assert all(row[key] == "" for row in sheet for key in ("bcs_category", "rump_visible", "notes"))
     assert sheet[1]["candidate_reason"] == "no_candidate_captured"
     assert all(sheet[1][key] == "" for key in ("original", "crop", "mask", "masked"))
@@ -72,13 +76,51 @@ def test_rows_assets_and_provenance(run):
                 path = output / row[key]
                 assert path.resolve().is_relative_to(output.resolve())
                 assert path.read_bytes() == (root / f"passages/{number}/{name}").read_bytes()
-    assert sheet[0]["representations"] == "full_original;rectangular_crop;binary_mask;masked_image"
-    assert not sheet[2]["masked"]
+    assert [row["representations"] for row in sheet] == ["full_original", "", "full_original"]
+    assert all(row[key] == "" for row in sheet for key in ("crop", "mask", "masked"))
+    assert sheet[0]["segmentation_status"] == "ok"  # Source metadata, not an input.
+
+
+@pytest.mark.parametrize("derivatives", ["absent", "missing_files", "unsafe", "unusable"])
+def test_derivatives_are_not_inputs(run, monkeypatch, derivatives):
+    root, summary, _, output = run
+    for item in summary["passage_evidence"]["intervals"]:
+        candidate = item["candidate"]
+        directory = root / f"passages/{item['sequence']}"
+        for name in ("best-crop.png", "best-mask.png", "best-masked.png"):
+            (directory / name).unlink()
+        if derivatives == "absent":
+            del candidate["best_crop"]
+            del candidate["segmentation"]
+        else:
+            prefix = f"passages/{item['sequence']}"
+            reference = {"missing_files": f"{prefix}/best-crop.png",
+                         "unsafe": "../../outside.png", "unusable": {"not": "a path"}}[derivatives]
+            candidate["best_crop"] = reference
+            candidate["segmentation"] = dict(status="ok", best_mask=reference, best_masked=reference)
+
+    from vacca_video import passage_bcs_export
+    checked = passage_bcs_export._checked
+    accesses = []
+
+    def original_access_only(path, **kwargs):
+        accesses.append(str(path))
+        assert str(path).endswith("best-original.jpg") or "passages" not in Path(path).parts
+        return checked(path, **kwargs)
+
+    monkeypatch.setattr(passage_bcs_export, "_checked", original_access_only)
+    result = export(run)
+    assert accesses
+    assert result["assets"] == len(list((output / "images").iterdir())) == 3
+    for number, row in enumerate(rows(output), 1):
+        assert (output / row["original"]).read_bytes() == (root / f"passages/{number}/best-original.jpg").read_bytes()
+        assert row["representations"] == "full_original"
+        assert all(row[key] == "" for key in ("crop", "mask", "masked", "bcs_category", "rump_visible", "notes"))
 
 
 @pytest.mark.parametrize("case", ["legacy", "state", "sequence", "duplicate", "order", "boundary",
     "nan", "type", "candidate_track", "bbox", "warning", "traversal", "backslash", "crossjob",
-    "track_asset", "optional_escape", "missing_artifact", "missing_source", "hash"])
+    "track_asset", "missing_reference", "missing_artifact", "missing_source", "hash"])
 def test_invalid_input_never_publishes(run, case):
     root, summary, video, output = run
     evidence = summary["passage_evidence"]
@@ -109,10 +151,10 @@ def test_invalid_input_never_publishes(run, case):
     elif case in ("traversal", "backslash", "crossjob", "track_asset"):
         candidate["original"] = {"traversal": "../best-original.jpg", "backslash": "passages\\1\\best-original.jpg",
             "crossjob": "/other/result/passages/1/best-original.jpg", "track_asset": "tracks/9/best-original.jpg"}[case]
-    elif case == "optional_escape":
-        candidate["segmentation"] = dict(status="ok", best_mask="../mask.png")
+    elif case == "missing_reference":
+        del candidate["original"]
     elif case == "missing_artifact":
-        (root / "passages/1/best-crop.png").unlink()
+        (root / "passages/1/best-original.jpg").unlink()
     elif case == "missing_source":
         video.unlink()
     elif case == "hash":

@@ -5,15 +5,20 @@
 From `IA`, create a **new** blank-label pack from one tracking run:
 
 ```powershell
-.venv/Scripts/python.exe -B scripts/export_passage_bcs_labels.py outputs/short4cow-recovery-20261028 --source-video ../Videos/gemini_generated_video_b27b0d61.mp4 --output outputs/bcs-passage-review-20261028
+.venv/Scripts/python.exe -B scripts/export_passage_bcs_labels.py outputs/short4cow-recovery-20261028 --source-video ../Videos/gemini_generated_video_b27b0d61.mp4 --output outputs/bcs-passage-review-originals-20261028
 ```
 
 `labels.csv` has one row per ordered provisional passage, including candidate-less
 intervals with an explicit reason and empty image references. `export.json` records
 source SHA256, summary-byte SHA256, interval/frame/temporal-track provenance and status.
-`original` is the full original frame; `crop` is rectangular and may contain another
-animal. Accepted, authorized `mask`/`masked` assets are optional separate columns;
-`representations` records exactly what was copied. Whole-track best images are never used.
+The v2 manifest declares `input_representation: full_original_frame_only`.
+`original` copies that passage's `best-original.jpg` byte-for-byte, without cropping,
+resizing or re-encoding; `representations` is `full_original` for available candidates.
+The full frame can include multiple animals and surrounding context; this choice
+is **not validation proof**. Compatibility columns `crop`, `mask` and `masked` stay
+empty, even with accepted segmentation. Derivative references/files are ignored;
+`segmentation_status`, when present, is source metadata only. Whole-track best
+images are never used, and missing originals never fall back to derivatives.
 
 All `bcs_category`, `rump_visible` and `notes` cells start blank. Future expert
 annotations may use BCS categories `1`..`5`, visibility `yes`/`no`/`uncertain`, and
@@ -29,8 +34,8 @@ An explicit source file is hashed and must match any recorded source digest. Wit
 it, full SHA256 metadata (`input_sha256`, `video_sha256` or `source_video_sha256`) is
 required; basenames are never identities. The output parent must already exist.
 Existing outputs, overlapping input/output trees, linked paths, malformed metadata
-and missing required original/crop files fail without publishing a partial pack.
-Unavailable optional mask files are omitted. No models or weights are loaded.
+and missing required original files fail without publishing a partial pack.
+No models or weights are loaded. Existing mixed-representation packs are not rewritten.
 
 ## Prototipo de video grabado
 

@@ -76,7 +76,7 @@ def export_passage_labels(run, output, *, source_video=None):
     """Publish a new directory atomically after strict metadata/path validation.
 
     A missing source is allowed only with a recorded full SHA256, never a basename.
-    Accepted optional masks remain separate from required original/crop references.
+    Only passage originals are inputs; derivative references are never accessed.
     """
     run = _checked(run, directory=True)
     output = _checked(output, missing=True)
@@ -136,32 +136,21 @@ def export_passage_labels(run, output, *, source_video=None):
                     or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]):
                 raise ValueError("Invalid candidate provenance or bbox")
             segmentation = candidate.get("segmentation")
-            if type(segmentation) is not dict or segmentation.get("status") not in (
-                    "ok", "not_requested", "rejected", "failed", "skipped"):
+            if segmentation is not None and (type(segmentation) is not dict or segmentation.get("status") not in (
+                    "ok", "not_requested", "rejected", "failed", "skipped")):
                 raise ValueError("Invalid candidate segmentation")
             row.update(frame_index=frame, timestamp_ms=timestamp, bbox=json.dumps(bbox),
-                       segmentation_status=segmentation["status"])
-            representations = []
-            assets = [("original", candidate.get("original"), "best-original.jpg", "full_original", True),
-                      ("crop", candidate.get("best_crop"), "best-crop.png", "rectangular_crop", True)]
-            if segmentation["status"] == "ok":
-                assets += [("mask", segmentation.get("best_mask"), "best-mask.png", "binary_mask", False),
-                           ("masked", segmentation.get("best_masked"), "best-masked.png", "masked_image", False)]
-            for column, reference, filename, representation, required in assets:
-                if reference is None and not required:
-                    continue
-                if reference != f"passages/{entry.sequence}/{filename}":
-                    raise ValueError("Invalid passage artifact reference")
-                source = _checked(run / reference, missing=not required)
-                if not required and not source.exists():
-                    continue
-                source = _checked(source)
-                row[column] = f"images/{image_id}-{filename}"
-                representations.append(representation)
-                copies.append((source, row[column]))
-            row["representations"] = ";".join(representations)
+                       segmentation_status=segmentation["status"] if segmentation is not None else "")
+            reference = candidate.get("original")
+            if reference != f"passages/{entry.sequence}/best-original.jpg":
+                raise ValueError("Invalid passage artifact reference")
+            source = _checked(run / reference)
+            row["original"] = f"images/{image_id}-best-original.jpg"
+            row["representations"] = "full_original"
+            copies.append((source, row["original"]))
         rows.append(row)
-    result = dict(schema_version="vacca-bcs-passage-labels-v1", source_video_sha256=digest,
+    result = dict(schema_version="vacca-bcs-passage-labels-v2", source_video_sha256=digest,
+        input_representation="full_original_frame_only",
         source_identity="verified_file" if source_video is not None else "recorded_sha256",
         run_metadata_sha256=metadata_digest, rows=len(rows), assets=len(copies),
         group_semantics="same_source_video_not_cow_identity", scoring="none",
