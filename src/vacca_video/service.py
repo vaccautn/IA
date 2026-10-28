@@ -34,6 +34,7 @@ class VideoResources:
         self.upload_lock = asyncio.Lock()
         self.finish_video = None
         self.track_video = None
+        self.finish_passages = None
 
     @property
     def available(self):
@@ -87,6 +88,7 @@ class VideoResources:
                 self.prepare()
             self.worker.finish_video = self.finish_video
             self.worker.track_video = self.track_video
+            self.worker.finish_passages = self.finish_passages
             self.worker.on_fault = self._on_worker_fault
             if start_worker:
                 # Startup and recovery must both succeed before any job is claimed.

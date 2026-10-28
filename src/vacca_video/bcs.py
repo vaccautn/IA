@@ -127,3 +127,75 @@ class VideoBCSCoordinator:
             task.cancel()
         if self.tasks:
             await asyncio.gather(*tuple(self.tasks), return_exceptions=True)
+
+    def finish_passages(self, root, job_id, stop):
+        """Run sequential original-only inference after successful tracking, before job completion."""
+        import json
+        from .artifacts import read_tracking_bytes, publish_passage_bcs
+        from .passage_bcs import (PassageBCSRow, PassageBCSSidecar, binding, digest,
+                                  original_bytes, passage_entries, validate_original)
+
+        def check_stop():
+            if stop.is_set() or self.closing:
+                raise RuntimeError("El servicio se interrumpió antes de completar BCS.")
+
+        check_stop()
+        try:
+            summary_bytes = read_tracking_bytes(root, job_id, "summary.json")
+            pairs = passage_entries(json.loads(summary_bytes))
+            rows = []
+            for entry, raw in pairs:
+                check_stop()
+                row = binding(entry) | dict(status="unevaluable", bcs_category=None,
+                    reason="no_candidate_captured", input_sha256=None)
+                image = None
+                if entry.candidate.status == "available":
+                    row["reason"] = "invalid_original"
+                    try:
+                        image = original_bytes(root, job_id, entry, raw)
+                        row["input_sha256"] = digest(image)
+                        validate_original(image)
+                    except (OSError, ValueError, ImageValidationError):
+                        image = None
+                if image is not None:
+                    future = asyncio.run_coroutine_threadsafe(self.outcome(image), self.loop)
+                    deadline = monotonic() + self.max_wait
+                    try:
+                        while True:
+                            check_stop()
+                            try:
+                                outcome = future.result(timeout=min(.1, max(.001, deadline - monotonic())))
+                                break
+                            except FutureTimeout:
+                                if monotonic() >= deadline:
+                                    outcome = dict(status="not_evaluated", reason="evaluation_timeout")
+                                    break
+                            except FutureCancelled:
+                                raise RuntimeError("El servicio se interrumpió antes de completar BCS.") from None
+                            except Exception:
+                                outcome = dict(status="failed", reason="invalid_outcome")
+                                break
+                    finally:
+                        if not future.done():
+                            future.cancel()
+                    check_stop()
+                    if outcome.get("reason") == "shutdown":
+                        raise RuntimeError("El servicio se interrumpió antes de completar BCS.")
+                    if outcome.get("status") == "completed":
+                        try:
+                            row = PassageBCSRow.model_validate(row | outcome | dict(
+                                status="evaluated", reason=None)).model_dump()
+                        except ValueError:
+                            row["reason"] = "invalid_outcome"
+                    else:
+                        row["reason"] = outcome["reason"]
+                rows.append(PassageBCSRow.model_validate(row))
+            sidecar = PassageBCSSidecar(summary_sha256=digest(summary_bytes), passages=rows)
+            check_stop()
+            if read_tracking_bytes(root, job_id, "summary.json") != summary_bytes:
+                raise ValueError("Tracking summary changed during BCS")
+            publish_passage_bcs(root, job_id, sidecar.model_dump(), check_stop)
+        except RuntimeError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+            raise RuntimeError("No se pudo guardar el resultado BCS por pasaje; las detecciones se conservaron.") from None

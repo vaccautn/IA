@@ -144,6 +144,8 @@ TRACK_MEDIA_TYPES = {
     "best-mask.png": "image/png",
 }
 TRACKING_JSON_LIMIT = 4 * 1024 * 1024
+PASSAGE_BCS_FILE = "passage-bcs.json"
+PASSAGE_BCS_LIMIT = 1024 * 1024
 
 
 def tracking_artifact(root, job_id, name, track_id=None):
@@ -156,7 +158,7 @@ def tracking_artifact(root, job_id, name, track_id=None):
     if track_id is None:
         if name == "tracking-status.json":
             path = result / name
-        elif name == "summary.json":
+        elif name in {"summary.json", PASSAGE_BCS_FILE}:
             chain.append(result / "tracking")
             path = result / "tracking" / name
         else:
@@ -176,11 +178,32 @@ def tracking_artifact(root, job_id, name, track_id=None):
 
 
 def read_tracking_json(root, job_id, name):
+    return json.loads(read_tracking_bytes(root, job_id, name))
+
+
+def read_tracking_bytes(root, job_id, name):
+    limit = PASSAGE_BCS_LIMIT if name == PASSAGE_BCS_FILE else TRACKING_JSON_LIMIT
     with tracking_artifact(root, job_id, name).open("rb") as stream:
-        data = stream.read(TRACKING_JSON_LIMIT + 1)
-    if len(data) > TRACKING_JSON_LIMIT:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
         raise ValueError("Tracking metadata is too large")
-    return json.loads(data)
+    return data
+
+
+def publish_passage_bcs(root, job_id, payload, check_stop):
+    """Publish one bounded sidecar only after the entire phase settles."""
+    content = json.dumps(payload, ensure_ascii=True, allow_nan=False).encode("utf-8")
+    if len(content) > PASSAGE_BCS_LIMIT:
+        raise ValueError("Passage BCS metadata is too large")
+    path = tracking_artifact(root, job_id, PASSAGE_BCS_FILE)
+    fd, temporary = tempfile.mkstemp(prefix=".passage-bcs-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+        check_stop()
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 PASSAGE_FILES = {"best-original": "best-original.jpg", "best-crop": "best-crop.png",

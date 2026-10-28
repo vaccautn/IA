@@ -31,6 +31,7 @@ class Worker:
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.finish_video = None
         self.track_video = None
+        self.finish_passages = None
 
     @property
     def health(self):
@@ -88,6 +89,7 @@ class Worker:
         # A late stop request must not invalidate an already settled outcome.
         if recorded.get("status") == "failed" and recorded.get("reason") == "interrupted":
             raise RuntimeError("El servicio se interrumpió. Volvé a cargar el video para reintentar.")
+        return recorded["status"]
 
     def _run_loop(self):
         # Principal startup may defer claims until recovery commits successfully.
@@ -155,7 +157,11 @@ class Worker:
                     if self.stop.is_set():
                         raise RuntimeError("El servicio se interrumpió antes de publicar el resultado.")
                 if self.track_video is not None:
-                    self._finish_tracking(directory)
+                    tracking_status = self._finish_tracking(directory)
+                    if tracking_status == "completed" and self.finish_passages is not None:
+                        self.finish_passages(self.store.directory, job_id, self.stop)
+                        if self.stop.is_set():
+                            raise RuntimeError("El servicio se interrumpió antes de publicar el resultado.")
             except Exception as exc:
                 status = "failed"
                 error = str(exc)

@@ -75,6 +75,9 @@ IMAGE_HEADERS = {"content-type": f"multipart/form-data; boundary={_BOUNDARY.deco
 
 
 def test_principal_routes_and_video_contract_coexist(client):
+    assert callable(main.app.state.video.worker.finish_passages)
+    assert main.app.state.video.worker.finish_passages == main.app.state.video.finish_passages
+    assert main.app.state.video.finish_passages.__self__ is main.app.state.video.finish_video.__self__
     for path in ("/health", "/ui", "/docs", "/openapi.json", "/metrics", "/ready/bcs"):
         assert client.get(path).status_code == 200
     assert client.get("/").status_code == 404
