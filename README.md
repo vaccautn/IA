@@ -1,5 +1,37 @@
 # VACCA Vision — API de detección bovina y BCS ordinal
 
+## Offline passage-label review (validate before scoring)
+
+From `IA`, create a **new** blank-label pack from one tracking run:
+
+```powershell
+.venv/Scripts/python.exe -B scripts/export_passage_bcs_labels.py outputs/short4cow-recovery-20261028 --source-video ../Videos/gemini_generated_video_b27b0d61.mp4 --output outputs/bcs-passage-review-20261028
+```
+
+`labels.csv` has one row per ordered provisional passage, including candidate-less
+intervals with an explicit reason and empty image references. `export.json` records
+source SHA256, summary-byte SHA256, interval/frame/temporal-track provenance and status.
+`original` is the full original frame; `crop` is rectangular and may contain another
+animal. Accepted, authorized `mask`/`masked` assets are optional separate columns;
+`representations` records exactly what was copied. Whole-track best images are never used.
+
+All `bcs_category`, `rump_visible` and `notes` cells start blank. Future expert
+annotations may use BCS categories `1`..`5`, visibility `yes`/`no`/`uncertain`, and
+free-text notes **after agreeing anatomical visibility and category criteria**;
+this tool neither validates completed sheets nor sets quality thresholds. Blank
+labels are not clinical unevaluable results. No scoring, API category, dataset
+materialization, automatic split or performance metric is produced.
+
+Every row shares a source-video `group_id` (leakage prevention, **not cow identity**).
+Use more independent videos and expert labels on the same representation before
+evaluation; local data directories and a whole-image baseline do not establish those labels.
+An explicit source file is hashed and must match any recorded source digest. Without
+it, full SHA256 metadata (`input_sha256`, `video_sha256` or `source_video_sha256`) is
+required; basenames are never identities. The output parent must already exist.
+Existing outputs, overlapping input/output trees, linked paths, malformed metadata
+and missing required original/crop files fail without publishing a partial pack.
+Unavailable optional mask files are omitted. No models or weights are loaded.
+
 ## Prototipo de video grabado
 
 **Web local en la API principal:** desde `IA`, ejecutar
