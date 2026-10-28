@@ -181,3 +181,22 @@ def read_tracking_json(root, job_id, name):
     if len(data) > TRACKING_JSON_LIMIT:
         raise ValueError("Tracking metadata is too large")
     return json.loads(data)
+
+
+PASSAGE_FILES = {"best-original": "best-original.jpg", "best-crop": "best-crop.png",
+                 "best-mask": "best-mask.png", "best-masked": "best-masked.png"}
+
+
+def passage_artifact(root, job_id, sequence, kind):
+    """Resolve only fixed passage media, rejecting linked files and ancestors."""
+    if type(sequence) is not int or not 0 < sequence <= 2147483647 or kind not in PASSAGE_FILES:
+        raise ValueError("Invalid passage artifact")
+    tracking = tracking_artifact(root, job_id, "summary.json").parent
+    directory = tracking / "passages" / str(sequence)
+    path = directory / PASSAGE_FILES[kind]
+    for part in (tracking / "passages", directory, path):
+        if part.is_symlink() or part.is_junction():
+            raise ValueError("Symbolic passage paths are not allowed")
+    if not path.resolve().is_relative_to(tracking.resolve()):
+        raise ValueError("Passage artifact is outside tracking storage")
+    return path

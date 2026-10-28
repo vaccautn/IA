@@ -7,8 +7,9 @@ import shutil
 import subprocess as subprocess  # Compatibility for existing worker callers.
 from urllib.parse import urlsplit
 from uuid import uuid4
+from typing import Literal
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 import tempfile
 import zipfile
@@ -31,6 +32,7 @@ from .schemas import (
     FramePageResponse,
     JobResponse,
     TrackListResponse,
+    PassageListResponse, PassageResponse, UnresolvedPassageResponse,
     sanitize_optional_candidate,
 )
 from .service import UNAVAILABLE_DETAIL, VideoResources
@@ -42,6 +44,7 @@ from .artifacts import (
     read_summary,
     read_tracking_json,
     tracking_artifact,
+    passage_artifact, PASSAGE_FILES,
 )
 from .candidate import CANDIDATE_ARTIFACT
 from .tracking_job import TRACKING_STATUS
@@ -144,10 +147,10 @@ def _track_entry(job_id, item):
     return entry
 
 
-def tracks_detail(root, job):
-    """Describe a job's tracks; tracking problems never surface as HTTP errors."""
+def _tracking_state(root, job):
+    """Conservative shared gate; a completed video need not have tracking yet."""
     job_id = job["id"]
-    response = dict(schema_version=TRACKS_SCHEMA_VERSION, tracks=[])
+    response = {}
     if job["status"] in ("pending", "processing"):
         return dict(response, status="pending")
     if job["status"] != "completed":
@@ -160,13 +163,22 @@ def tracks_detail(root, job):
         return dict(response, status="failed", reason="status_unreadable")
     state = recorded.get("status") if type(recorded) is dict else None
     reason = recorded.get("reason") if type(recorded) is dict else None
-    reason = reason if reason in TRACKING_FAILURE_REASONS else "unknown"
+    reason = reason if type(reason) is str and reason in TRACKING_FAILURE_REASONS else "unknown"
     if state == "running":
         return dict(response, status="pending")
     if state == "disabled":
         return dict(response, status="disabled", reason=reason)
     if state != "completed":
         return dict(response, status="failed", reason=reason)
+    return dict(status="completed")
+
+
+def tracks_detail(root, job):
+    """Describe a job's tracks; tracking problems never surface as HTTP errors."""
+    job_id = job["id"]
+    response = dict(schema_version=TRACKS_SCHEMA_VERSION, tracks=[], **_tracking_state(root, job))
+    if response["status"] != "completed":
+        return response
     try:
         summary = read_tracking_json(root, job_id, "summary.json")
         if type(summary) is not dict or type(summary.get("tracks")) is not list:
@@ -181,6 +193,112 @@ def tracks_detail(root, job):
         return dict(schema_version=TRACKS_SCHEMA_VERSION, tracks=[], status="failed",
                     reason="summary_unreadable")
     return response
+
+
+PASSAGE_WARNINGS = {
+    "duplicate_track_id_unresolved", "invalid_confidence_unresolved",
+    "missing_incumbent_attribution_unresolved", "possible_track_id_reuse_unresolved",
+    "missing_incumbent_reference_unavailable_or_stale", "ambiguous_dominance_unresolved",
+    "finalized_track_reentry_unresolved", "possible_fragment_identity_unresolved",
+    "recovery_confirmation_exceeds_gap_at_sample_rate", "untracked_detection_attribution_unresolved",
+}
+
+
+def _passage_warnings(value):
+    if type(value) is not list or any(type(item) is not str for item in value):
+        raise ValueError("Invalid passage warnings")
+    return sorted(set(value) & PASSAGE_WARNINGS)
+
+
+def _passage_entry(root, job_id, item):
+    entry = PassageResponse.model_validate(item)
+    candidate = entry.candidate
+    raw = item["candidate"]
+    candidate.reason = None
+    names = {}
+    if candidate.status == "not_available":
+        if raw.get("reason") != "no_candidate_captured":
+            raise ValueError("Invalid candidate absence")
+        candidate.reason = "no_candidate_captured"
+        candidate.frame_index = candidate.timestamp_ms = None
+    else:
+        if (type(raw.get("track_id")) is not int or raw["track_id"] != entry.track_id
+                or candidate.frame_index is None or candidate.timestamp_ms is None
+                or not entry.start_frame <= candidate.frame_index <= entry.end_frame
+                or not entry.start_timestamp_ms <= candidate.timestamp_ms <= entry.end_timestamp_ms
+                or (entry.end_exclusive and (candidate.frame_index == entry.end_frame
+                                            or candidate.timestamp_ms == entry.end_timestamp_ms))):
+            raise ValueError("Invalid candidate provenance")
+        names = {"best-original": raw.get("original"), "best-crop": raw.get("best_crop")}
+        segmentation = raw.get("segmentation")
+        if type(segmentation) is not dict or segmentation.get("status") not in (
+                "ok", "not_requested", "rejected", "failed", "skipped"):
+            raise ValueError("Invalid candidate segmentation")
+        if segmentation["status"] == "ok":
+            names.update({kind: segmentation.get(kind.replace("-", "_"))
+                          for kind in ("best-mask", "best-masked")})
+    prefix = f"/api/v1/analyses/{job_id}/passages/{entry.sequence}"
+    for kind, name in PASSAGE_FILES.items():
+        url = None
+        if kind in names:
+            if names[kind] != f"passages/{entry.sequence}/{name}":
+                raise ValueError("Invalid passage reference")
+            try:
+                if passage_artifact(root, job_id, entry.sequence, kind).is_file():
+                    url = f"{prefix}/{kind}"
+            except (OSError, ValueError):
+                pass  # A missing or unsafe optional artifact never receives a URL.
+        setattr(candidate, kind.replace("-", "_") + "_url", url)
+    entry.warnings = _passage_warnings(item.get("warnings"))
+    return entry
+
+
+def passages_detail(root, job):
+    state = _tracking_state(root, job)
+    if state["status"] != "completed":
+        return PassageListResponse(**state)
+    try:
+        summary = read_tracking_json(root, job["id"], "summary.json")
+        if type(summary) is not dict:
+            raise ValueError("Invalid summary")
+        if "passage_evidence" not in summary:
+            return PassageListResponse(status="unavailable", reason="legacy_no_passage_evidence")
+        evidence = summary["passage_evidence"]
+        if (type(evidence) is not dict
+                or evidence.get("status") != "provisional_evidence_not_unique_animal_identity"
+                or type(evidence.get("policy")) is not dict
+                or evidence["policy"].get("calibration") != "uncalibrated_confidence_proxy_not_visibility_or_bcs"
+                or type(evidence.get("intervals")) is not list
+                or type(evidence.get("unresolved_tracks")) is not list):
+            raise ValueError("Invalid passage evidence")
+        entries = sorted((_passage_entry(root, job["id"], item) for item in evidence["intervals"]),
+                         key=lambda entry: entry.sequence)
+        previous = None
+        track_ids = set()
+        for index, entry in enumerate(entries, 1):
+            if (entry.sequence != index or entry.track_id in track_ids
+                    or entry.end_frame < entry.start_frame or entry.end_timestamp_ms < entry.start_timestamp_ms
+                    or entry.end_exclusive != (index < len(entries))
+                    or (previous is not None and (
+                        entry.start_frame <= previous.start_frame
+                        or entry.start_timestamp_ms <= previous.start_timestamp_ms
+                        or entry.start_frame != previous.end_frame
+                        or entry.start_timestamp_ms != previous.end_timestamp_ms))):
+                raise ValueError("Inconsistent passage chronology")
+            previous = entry
+            track_ids.add(entry.track_id)
+        unresolved = [UnresolvedPassageResponse.model_validate(item) for item in evidence["unresolved_tracks"]]
+        for item in unresolved:
+            if (item.track_id in track_ids or item.last_frame < item.first_frame
+                    or item.last_timestamp_ms < item.first_timestamp_ms):
+                raise ValueError("Invalid unresolved track")
+            track_ids.add(item.track_id)
+        return PassageListResponse(status="completed", evidence_status=evidence["status"],
+            calibration=evidence["policy"]["calibration"], passages=entries,
+            unresolved_count=len(unresolved), unresolved_tracks=sorted(unresolved, key=lambda item: item.track_id),
+            warnings=_passage_warnings(evidence.get("warnings")))
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        return PassageListResponse(status="unavailable", reason="passage_evidence_unreadable")
 
 
 def video_admission_store(request: Request) -> Store:
@@ -476,6 +594,36 @@ def create_router():
     )
     def get_tracks(job_id: str, store: Store = Depends(video_store)):
         return tracks_detail(store.directory, store.get(job_id))
+
+    @router.get("/api/v1/analyses/{job_id}/passages", response_model=PassageListResponse,
+                responses={404: {"model": VideoErrorResponse}})
+    def get_passages(job_id: str, store: Store = Depends(video_store)):
+        """Provisional evidence only; not unique animal counts or per-passage BCS.
+
+        Like tracks, a completed video without tracking status is unavailable:
+        the completed-before-tracking-status lifecycle race is not resolved here.
+        Image availability does not establish anatomical visibility, BCS eligibility,
+        or validation of the masked representation. No clinical scoring is performed.
+        """
+        return passages_detail(store.directory, store.get(job_id))
+
+    @router.get("/api/v1/analyses/{job_id}/passages/{sequence}/{kind}", response_class=FileResponse,
+                responses={200: {"content": {media: {"schema": {"type": "string", "format": "binary"}}
+                                            for media in ("image/jpeg", "image/png")}},
+                           404: {"model": VideoErrorResponse}})
+    def passage_file(job_id: str, kind: Literal["best-original", "best-crop", "best-mask", "best-masked"],
+                     sequence: int = Path(gt=0, le=2147483647), store: Store = Depends(video_store)):
+        data = passages_detail(store.directory, store.get(job_id))
+        if data.status == "completed":
+            for entry in data.passages:
+                if entry.sequence == sequence and getattr(entry.candidate, kind.replace("-", "_") + "_url"):
+                    try:
+                        path = passage_artifact(store.directory, job_id, sequence, kind)
+                        if path.is_file():
+                            return FileResponse(path, media_type=TRACK_MEDIA_TYPES[PASSAGE_FILES[kind]])
+                    except (OSError, ValueError):
+                        pass
+        raise HTTPException(404, "Passage image unavailable")
 
     def track_file(store, job_id, track_id, names):
         job = store.get(job_id)

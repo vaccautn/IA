@@ -196,3 +196,59 @@ class TrackListResponse(BaseModel):
     warnings: list[str] | None = None
     notes: list[str] | None = None
     tracks: list[TrackResponse]
+
+
+class PassageMetadata(BaseModel):
+    model_config = ConfigDict(strict=True, extra="ignore", allow_inf_nan=False)
+
+
+class PassageCandidateResponse(PassageMetadata):
+    status: Literal["available", "not_available"]
+    reason: Literal["no_candidate_captured"] | None = None
+    frame_index: int | None = Field(default=None, ge=0)
+    timestamp_ms: float | None = Field(default=None, ge=0)
+    bcs_eligibility: Literal["not_assessed"]
+    bcs_status: Literal["not_evaluated"]
+    best_original_url: str | None = None
+    best_crop_url: str | None = None
+    best_mask_url: str | None = None
+    best_masked_url: str | None = None
+
+
+class PassageResponse(PassageMetadata):
+    """Chronological provisional interval, not a unique animal or clinical result."""
+    sequence: int = Field(gt=0, le=2147483647)
+    track_id: int = Field(ge=0)
+    status: Literal["passage_evidence_candidate"]
+    start_frame: int = Field(ge=0)
+    end_frame: int = Field(ge=0)
+    start_timestamp_ms: float = Field(ge=0)
+    end_timestamp_ms: float = Field(ge=0)
+    end_exclusive: bool
+    transition_method: Literal["initial_confidence", "concurrent_confidence", "missing_incumbent_foreground"]
+    candidate: PassageCandidateResponse
+    warnings: list[str]
+
+
+class UnresolvedPassageResponse(PassageMetadata):
+    track_id: int = Field(ge=0)
+    first_frame: int = Field(ge=0)
+    last_frame: int = Field(ge=0)
+    first_timestamp_ms: float = Field(ge=0)
+    last_timestamp_ms: float = Field(ge=0)
+    possible_continuation_of: int | None = Field(ge=0)
+    possible_continued_by: int | None = Field(ge=0)
+    status: Literal["unresolved_passage_attribution"]
+
+
+class PassageListResponse(PassageMetadata):
+    schema_version: Literal["vacca-video-passages-v1"] = "vacca-video-passages-v1"
+    status: Literal["pending", "completed", "failed", "disabled", "unavailable"]
+    reason: str | None = None
+    evidence_status: Literal["provisional_evidence_not_unique_animal_identity"] | None = None
+    identity_semantics: Literal["temporal_track_id_within_video"] = "temporal_track_id_within_video"
+    calibration: Literal["uncalibrated_confidence_proxy_not_visibility_or_bcs"] | None = None
+    passages: list[PassageResponse] = Field(default_factory=list)
+    unresolved_count: int = 0
+    unresolved_tracks: list[UnresolvedPassageResponse] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
