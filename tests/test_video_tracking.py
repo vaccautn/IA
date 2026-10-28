@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from vacca_video.tracking import (  # noqa: E402
+    PassageEvidence,
     clamp_box,
     crop_contamination,
     crop_with_padding,
@@ -444,3 +445,193 @@ def test_unreadable_video_does_not_leave_output_folder(media):
     with pytest.raises(ValueError):
         track_video(video, output, model_path, model=FakeModel(lambda call: []))
     assert not output.exists()
+
+
+def _passages(samples, count=3, margin=0.1):
+    evidence = PassageEvidence(count, margin)
+    for index, scores in enumerate(samples):
+        evidence.observe([{"track_id": key, "confidence": score} for key, score in scores],
+                         index * 4, index * 250.0)
+    return evidence
+
+
+def test_passage_short_crossover_and_eof_pending_do_not_close_incumbent():
+    evidence = _passages([[(80, 0.9)], [(80, 0.5), (2, 0.8)], [(80, 0.5), (2, 0.8)]])
+    assert [item["track_id"] for item in evidence.intervals] == [80]
+    assert evidence.pending == {"track_id": 2, "count": 2, "start_frame": 4,
+                                "start_timestamp_ms": 250.0}
+
+
+@pytest.mark.parametrize("reset", [[], [(2, 0.9)], [(80, 0.8)],
+                                  [(80, 0.8), (2, 0.85)], [(80, 0.8), (2, 0.8)],
+                                  [(80, 0.4), (2, 0.9), (3, 0.9)]])
+def test_passage_missing_or_nondominant_sample_resets_confirmation(reset):
+    evidence = _passages([[(80, 0.9)], [(80, 0.4), (2, 0.9)], reset,
+                          [(80, 0.4), (2, 0.9)], [(80, 0.4), (2, 0.9)]])
+    assert len(evidence.intervals) == 1
+    assert evidence.pending["count"] == 2
+    assert evidence.pending["start_frame"] == 12
+
+
+def test_passage_changed_challenger_resets_streak():
+    evidence = _passages([[(80, 0.9)], [(80, 0.4), (2, 0.9)],
+                          [(80, 0.4), (3, 0.9)], [(80, 0.4), (2, 0.9)]], count=2)
+    assert len(evidence.intervals) == 1
+    assert evidence.pending["track_id"] == 2 and evidence.pending["count"] == 1
+
+
+def test_unique_strongest_challenger_margin_is_compared_to_incumbent():
+    evidence = _passages([[(80, 0.9)]] +
+                         [[(80, 0.4), (2, 0.9), (3, 0.85)]] * 3)
+    assert [item["track_id"] for item in evidence.intervals] == [80, 2]
+
+
+@pytest.mark.parametrize("ids", [(90, 2), (2, 90)])
+def test_passage_sustained_current_confidence_not_historical_max(ids):
+    incumbent, challenger = ids
+    evidence = _passages([[(incumbent, 0.99)]] +
+                         [[(challenger, 0.8), (incumbent, 0.5)]] * 3)
+    first, second = evidence.intervals
+    assert [first["track_id"], second["track_id"]] == list(ids)
+    assert first["end_frame"] == second["start_frame"] == 12
+    assert first["end_timestamp_ms"] == second["start_timestamp_ms"] == 750.0
+    assert first["end_exclusive"] is True
+    assert second["support"] == {"track_id": challenger, "count": 3, "start_frame": 4,
+                                  "start_timestamp_ms": 250.0, "confirmation_frame": 12,
+                                  "confirmation_timestamp_ms": 750.0}
+
+
+@pytest.mark.parametrize("scores", [[(5, 0.9), (1, 0.9)], [(1, 0.9), (5, 0.9)],
+                                    [(1, 0.85), (5, 0.9)]])
+def test_passage_ambiguous_initial_competitors_stay_unknown(scores):
+    evidence = _passages([scores] * 5)
+    assert evidence.intervals == [] and evidence.pending is None
+    assert "ambiguous_dominance_unresolved" in evidence.warnings
+
+
+def test_passage_finalized_id_cannot_reenter_on_confidence_fluctuations():
+    evidence = _passages([[(80, 0.9)]] + [[(80, 0.4), (2, 0.9)]] * 3 +
+                         [[(80, 0.99), (2, 0.4)]] * 5)
+    assert [item["track_id"] for item in evidence.intervals] == [80, 2]
+    assert "finalized_track_reentry_unresolved" in evidence.warnings
+
+
+def test_passage_id_return_after_absence_is_unresolved_not_new_identity():
+    evidence = _passages([[(5, 0.9)], [], [(5, 0.9)]])
+    assert len(evidence.intervals) == 1
+    assert "possible_track_id_reuse_unresolved" in evidence.warnings
+
+
+@pytest.mark.parametrize("sample,warning", [
+    ([(5, 0.4), (2, float("nan"))], "invalid_confidence_unresolved"),
+    ([(5, 0.4), (2, 1.1)], "invalid_confidence_unresolved"),
+    ([(5, 0.4), (2, 0.9), (2, 0.95)], "duplicate_track_id_unresolved"),
+])
+def test_invalid_or_duplicate_observations_cannot_confirm_passage(sample, warning):
+    evidence = _passages([[(5, 0.9)], [(5, 0.4), (2, 0.9)], sample,
+                          [(5, 0.4), (2, 0.9)]], count=2)
+    assert len(evidence.intervals) == 1 and evidence.pending["count"] == 1
+    assert warning in evidence.warnings
+    assert _passages([sample]).intervals == []
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"passage_confirmation_count": value} for value in (0, -1, 1.5, True)
+] + [{"passage_confidence_margin": value} for value in (-0.1, float("nan"), float("inf"), True)])
+def test_invalid_passage_parameters_fail_before_output(media, kwargs):
+    root, model = media
+    with pytest.raises(ValueError, match="passage_"):
+        track_video(root / "unused.mp4", root / "run", model,
+                    model=FakeModel(lambda call: []), **kwargs)
+    assert not (root / "run").exists()
+
+
+def test_zero_margin_still_requires_unique_strict_dominance():
+    evidence = _passages([[(4, 0.5), (1, 0.5)], [(4, 0.6), (1, 0.5)],
+                          [(4, 0.5), (1, 0.6)]], count=1, margin=0)
+    assert [item["track_id"] for item in evidence.intervals] == [4, 1]
+
+
+def test_passage_summary_integrates_sampled_frames_policy_and_inactive_eof(media):
+    samples = [[(90, 0.99)], [(90, 0.5), (2, 0.9)],
+               [(90, 0.5), (2, 0.9)], [], []]
+    summary, output = _run(media, 20,
+                           lambda call: [(key, (20, 20, 80, 90), score)
+                                         for key, score in samples[call]],
+                           sample_fps=6, passage_confirmation_count=2,
+                           passage_confidence_margin=0.2)
+    evidence = summary["passage_evidence"]
+    assert json.loads((output / "summary.json").read_text())["passage_evidence"] == evidence
+    assert evidence["policy"]["confirmation_count"] == 2
+    assert evidence["policy"]["confidence_margin"] == 0.2
+    assert "uncalibrated" in evidence["policy"]["calibration"]
+    assert evidence["status"] == "provisional_evidence_not_unique_animal_identity"
+    first, last = evidence["intervals"]
+    assert (first["start_frame"], first["end_frame"], last["start_frame"], last["end_frame"]) == (0, 8, 8, 16)
+    assert last["end_timestamp_ms"] == pytest.approx(16000 / FPS)
+    assert last["end_exclusive"] is False
+    assert last["support"]["start_frame"] == 4
+    assert "missing_incumbent_attribution_unresolved" in evidence["warnings"]
+    assert [track["track_id"] for track in summary["tracks"]] == [2, 90]
+    assert all(track["segmentation"]["status"] == "not_requested" for track in summary["tracks"])
+
+
+def test_passage_initial_incumbent_preserved_and_fragment_not_claimed_as_new_cow(media):
+    summary, _ = _run(media, 8, lambda call: [
+        (90 if call < 3 else 2, (20, 20, 80, 90), 0.9)])
+    evidence = summary["passage_evidence"]
+    assert len(evidence["intervals"]) == 1
+    candidate = evidence["intervals"][0]
+    assert candidate["track_id"] == 90 and candidate["end_frame"] == 7
+    assert candidate["warnings"] == ["possible_fragment_identity_unresolved"]
+    unresolved, = evidence["unresolved_tracks"]
+    assert unresolved["track_id"] == 2 and unresolved["possible_continuation_of"] == 90
+    assert unresolved["status"] == "unresolved_passage_attribution"
+
+
+def test_ambiguous_observed_tracks_are_retained_without_identity_or_mask_filter(media):
+    summary, _ = _run(media, 3, lambda call: [(7, (20, 20, 80, 90), 0.9),
+                                             (1, (100, 20, 180, 90), 0.9)])
+    evidence = summary["passage_evidence"]
+    assert evidence["intervals"] == []
+    assert {item["track_id"] for item in evidence["unresolved_tracks"]} == {7, 1}
+    assert all(item["first_frame"] == 0 and item["last_frame"] == 2
+               for item in evidence["unresolved_tracks"])
+
+
+@pytest.mark.parametrize("score_type", [float, np.float32], ids=["float64", "float32"])
+@pytest.mark.parametrize("high,low", [(0.9, 0.8), (0.8, 0.7)])
+def test_nominal_margin_initial_selection_and_sustained_handoff(media, score_type, high, low):
+    high, low = float(score_type(high)), float(score_type(low))
+    summary, _ = _run(media, 4, lambda call: [
+        (90, (20, 20, 80, 90), high if call == 0 else low),
+        (2, (100, 20, 180, 90), low if call == 0 else high)])
+    evidence = summary["passage_evidence"]
+    assert evidence["policy"]["confidence_margin"] == 0.1
+    assert evidence["policy"]["numerical_margin_epsilon"] == 2**-24
+    first, second = evidence["intervals"]
+    assert (first["track_id"], first["start_frame"], first["end_frame"]) == (90, 0, 3)
+    assert (second["track_id"], second["start_frame"]) == (2, 3)
+    assert second["support"]["count"] == 3
+    assert second["support"]["start_frame"] == 1
+
+
+@pytest.mark.parametrize("score_type", [float, np.float32], ids=["float64", "float32"])
+@pytest.mark.parametrize("high,low", [(0.9, 0.8), (0.8, 0.7)])
+def test_nominal_margin_handoff_from_already_selected_incumbent(score_type, high, low):
+    high, low = float(score_type(high)), float(score_type(low))
+    evidence = _passages([[(90, 0.99)]] + [[(90, low), (2, high)]] * 3)
+    assert [item["track_id"] for item in evidence.intervals] == [90, 2]
+    assert evidence.intervals[1]["support"]["count"] == 3
+
+
+@pytest.mark.parametrize("score_type", [float, np.float32], ids=["float64", "float32"])
+@pytest.mark.parametrize("high", [0.899999, 0.8, 0.800000001],
+                         ids=["below_margin_outside_tolerance", "exact_tie", "near_tie"])
+def test_margin_tolerance_does_not_admit_subthreshold_or_tied_scores(score_type, high):
+    high, low = float(score_type(high)), float(score_type(0.8))
+    sample = [(2, high), (90, low)]
+    assert _passages([sample] * 4).intervals == []
+    evidence = _passages([[(90, 0.99)]] + [sample] * 4)
+    assert [item["track_id"] for item in evidence.intervals] == [90]
+    assert evidence.pending is None

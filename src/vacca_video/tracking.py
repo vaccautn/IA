@@ -25,6 +25,10 @@ FRAGMENT_MIN_IOU = 0.3
 FRAGMENT_MAX_CENTRE_DISTANCE = 0.25
 DEFAULT_MAX_GAP_SECONDS = 0.5
 DEFAULT_CROP_MARGIN = 0.10
+# Numerical tolerance only, not policy hysteresis: two float32 scores in [0, 1]
+# each round by at most 2**-25, so their difference can err by at most 2**-24.
+# Applied only to the margin threshold; strict positive dominance/ties stay exact.
+PASSAGE_MARGIN_EPSILON = 2**-24
 # Best-frame segmentation (box + one point prompt). On the manga video a usable
 # cow mask covered 31-60% of its box and stayed inside it; outside that range
 # the mask usually grabbed ground or fence, so the rectangular crop is kept.
@@ -315,12 +319,139 @@ def _file_sha256(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+@dataclass
+class PassageEvidence:
+    """Confidence-only candidates, never unique animal identities.
+
+    Defaults are uncalibrated heuristics. Intervals are half-open at the
+    confirmation sample; the last interval ends inclusively at the last sample.
+    Pending state and warning categories are bounded, not a per-frame log.
+    """
+
+    confirmation_count: int = 3
+    confidence_margin: float = 0.1
+    intervals: list[dict] = field(default_factory=list)
+    retired: set[int] = field(default_factory=set)
+    warnings: set[str] = field(default_factory=set)
+    pending: dict | None = None
+    last: tuple | None = None
+    active_missing: bool = False
+
+    def __post_init__(self):
+        if type(self.confirmation_count) is not int or self.confirmation_count < 1:
+            raise ValueError("passage_confirmation_count must be a positive integer")
+        if (isinstance(self.confidence_margin, bool)
+                or not isinstance(self.confidence_margin, (int, float))
+                or not math.isfinite(self.confidence_margin) or self.confidence_margin < 0):
+            raise ValueError("passage_confidence_margin must be finite and nonnegative")
+
+    def observe(self, detections, frame, timestamp_ms):
+        self.last = (frame, timestamp_ms)
+        scores = {}
+        seen = set()
+        invalid = False
+        for detection in detections:
+            track_id, score = detection["track_id"], detection["confidence"]
+            if track_id in seen:
+                self.warnings.add("duplicate_track_id_unresolved")
+                invalid = True
+            seen.add(track_id)
+            if math.isfinite(score) and 0 <= score <= 1:
+                scores[track_id] = score
+            else:
+                self.warnings.add("invalid_confidence_unresolved")
+                invalid = True
+        active = self.intervals[-1]["track_id"] if self.intervals else None
+        if active is not None:
+            if active not in scores:
+                self.active_missing = True
+                self.warnings.add("missing_incumbent_attribution_unresolved")
+                self.pending = None
+                return
+            if self.active_missing:
+                self.warnings.add("possible_track_id_reuse_unresolved")
+                self.active_missing = False
+        if invalid:
+            self.pending = None
+            return
+        ranked = sorted(scores, key=scores.get, reverse=True)
+        winner = ranked[0] if ranked else None
+        if len(ranked) > 1:
+            delta = scores[winner] - scores[ranked[1]]
+            if delta <= 0 or (active is None and delta < self.confidence_margin
+                              and not math.isclose(delta, self.confidence_margin,
+                                                   rel_tol=0, abs_tol=PASSAGE_MARGIN_EPSILON)):
+                self.warnings.add("ambiguous_dominance_unresolved")
+                winner = None
+        if winner is None or winner == active or winner in self.retired:
+            if winner in self.retired:
+                self.warnings.add("finalized_track_reentry_unresolved")
+            self.pending = None
+            return
+        # The unique strongest challenger must also beat this sample's incumbent.
+        if active is not None:
+            delta = scores[winner] - scores[active]
+            if delta <= 0 or (delta < self.confidence_margin
+                              and not math.isclose(delta, self.confidence_margin,
+                                                   rel_tol=0, abs_tol=PASSAGE_MARGIN_EPSILON)):
+                self.pending = None
+                return
+        if active is None:
+            support = {"track_id": winner, "count": 1, "start_frame": frame,
+                       "start_timestamp_ms": timestamp_ms}
+        else:
+            if self.pending is None or self.pending["track_id"] != winner:
+                self.pending = {"track_id": winner, "count": 0, "start_frame": frame,
+                                "start_timestamp_ms": timestamp_ms}
+            self.pending["count"] += 1
+            if self.pending["count"] < self.confirmation_count:
+                return
+            support = self.pending.copy()
+            self.intervals[-1].update(end_frame=frame, end_timestamp_ms=timestamp_ms,
+                                      end_exclusive=True)
+            self.retired.add(active)
+        self.intervals.append({"track_id": winner, "status": "passage_evidence_candidate",
+                               "start_frame": frame, "start_timestamp_ms": timestamp_ms,
+                               "support": dict(support, confirmation_frame=frame,
+                                               confirmation_timestamp_ms=timestamp_ms),
+                               "warnings": []})
+        self.pending = None
+
+    def summary(self, stats):
+        if self.intervals and self.last is not None:
+            self.intervals[-1].update(end_frame=self.last[0], end_timestamp_ms=self.last[1],
+                                      end_exclusive=False)
+        for interval in self.intervals:
+            item = stats[interval["track_id"]]
+            if item.possible_continuation_of is not None or item.possible_continued_by is not None:
+                interval["warnings"] = ["possible_fragment_identity_unresolved"]
+                self.warnings.add("possible_fragment_identity_unresolved")
+        selected = {interval["track_id"] for interval in self.intervals}
+        unresolved = [{"track_id": item.track_id, "first_frame": item.first_frame,
+                       "last_frame": item.last_frame, "first_timestamp_ms": item.first_timestamp_ms,
+                       "last_timestamp_ms": item.last_timestamp_ms,
+                       "possible_continuation_of": item.possible_continuation_of,
+                       "possible_continued_by": item.possible_continued_by,
+                       "status": "unresolved_passage_attribution"}
+                      for item in stats.values() if item.track_id not in selected]
+        return {"status": "provisional_evidence_not_unique_animal_identity",
+                "policy": {"confirmation_count": self.confirmation_count,
+                           "confidence_margin": self.confidence_margin,
+                           "numerical_margin_epsilon": PASSAGE_MARGIN_EPSILON,
+                           "calibration": "uncalibrated_confidence_proxy_not_visibility_or_bcs",
+                           "boundary": "confirmation_sample_half_open_final_end_inclusive",
+                           "initial_selection": "single_observation_unique_margin_dominance"},
+                "intervals": self.intervals, "pending": self.pending,
+                "unresolved_tracks": unresolved, "warnings": sorted(self.warnings)}
+
+
 def track_video(input_path: Path, output: Path, model_path: Path, tracker: str = "bytetrack.yaml",
                 confidence: float = 0.25, sample_fps: float | None = None,
                 output_size=(320, 320), *, max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
                 crop_margin: float = DEFAULT_CROP_MARGIN, clip_format: str = "mp4",
                 max_seconds: float | None = None, max_frames: int | None = None, model=None,
-                segmenter=None, segment_limit: int = DEFAULT_SEGMENT_LIMIT) -> dict:
+                segmenter=None, segment_limit: int = DEFAULT_SEGMENT_LIMIT,
+                passage_confirmation_count: int = 3, passage_confidence_margin: float = 0.1) -> dict:
     """Run Ultralytics tracking and write one directory per temporal track.
 
     ``model`` accepts any object exposing Ultralytics' ``track`` API; when it is
@@ -328,9 +459,12 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
     a missing ``lap`` fails instead of letting Ultralytics install it.
     ``segmenter(image, bbox) -> bool mask`` optionally segments each track's
     best frame (longest tracks first, up to ``segment_limit``).
+    Passage parameters are uncalibrated confidence heuristics, not anatomical
+    visibility, BCS, or unique-animal identity. Effective policy is in the summary.
     """
     import cv2
 
+    passages = PassageEvidence(passage_confirmation_count, passage_confidence_margin)
     input_path, output, model_path = Path(input_path), Path(output), Path(model_path)
     if not math.isfinite(confidence) or not 0 <= confidence <= 1:
         raise ValueError("confidence debe estar entre 0 y 1")
@@ -405,6 +539,9 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
                 results = model.track(image, persist=True, tracker=tracker, conf=confidence,
                                       verbose=False, device="cpu")
                 detections, all_boxes = _result_detections(results[0], image)
+                if len(all_boxes) > len(detections):
+                    passages.warnings.add("untracked_detection_attribution_unresolved")
+                passages.observe(detections, frame_index, timestamp_ms)
                 for detection in detections:
                     track_id, bbox = detection["track_id"], detection["bbox"]
                     others = [box for index, box in enumerate(all_boxes) if index != detection["box_index"]]
@@ -533,6 +670,7 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
                "fps": fps, "clip_fps": clip_fps, "width": width, "height": height,
                "frames_read": frame_index, "frames_sampled": sampled_frames, "stop_reason": stop_reason,
                "tracks": track_summaries, "identity_semantics": "temporal_track_id_within_video",
+               "passage_evidence": passages.summary(stats),
                "warnings": run_warnings,
                "segmentation": dict(getattr(segmenter, "metadata", {}), limit=segment_limit,
                                     min_fill=SEGMENT_MIN_FILL, max_fill=SEGMENT_MAX_FILL,
