@@ -375,7 +375,7 @@ def test_accepted_mask_writes_silhouette_and_aligned_mask(media):
     segmenter.metadata = {"model": "fake_sam.pt", "model_sha256": "abc", "prompt": "box+point@0.4"}
     summary, output = _run(media, 6, lambda call: [(1, (20, 20, 80, 90), 0.9)], segmenter=segmenter)
     track = summary["tracks"][0]
-    assert calls == [(20, 20, 80, 90)]
+    assert calls == [(20, 20, 80, 90)] * 2  # Track and its own saved passage candidate.
     assert track["segmentation"]["status"] == "ok"
     masked = cv2.imread(str(output / track["segmentation"]["best_masked"]))
     mask = cv2.imread(str(output / track["segmentation"]["best_mask"]), cv2.IMREAD_GRAYSCALE)
@@ -679,16 +679,25 @@ def _assert_passage_image(output, interval, frame):
     assert interval["start_frame"] <= frame <= interval["end_frame"]
     if interval["end_exclusive"]:
         assert frame < interval["end_frame"]
-    assert not {"best_crop", "best_mask", "segmentation"} & candidate.keys()
+    assert candidate["best_crop"] == f"passages/{interval['sequence']}/best-crop.png"
+    assert (output / candidate["best_crop"]).is_file()
+    assert candidate["artifact_source"] == "decoded_saved_original_jpeg"
     return candidate
 
 
 def test_passage_candidate_never_inherits_global_best_and_keeps_earliest_tie(media, passage_images):
     passage_images([9, 5, 4, 3, 3, 2])
+    calls = []
+
+    def segmenter(image, bbox):
+        calls.append((int(image[0, 0, 0]), tuple(bbox)))
+        return _box_mask((bbox[0] + 10, 30, bbox[2] - 10, 85))
+
     summary, output = _run(media, 6, lambda call: [
         (90, (20, 20, 80, 90), 0.95 if call == 0 else 0.5),
-        (2, (100, 20, 180, 90), 0.7 if call == 0 else 0.9)],
-        segmenter=lambda image, bbox: _box_mask((110, 30, 170, 85)))
+        (2, (110, 20, 190, 90) if call == 0 else (100, 20, 180, 90),
+         0.7 if call == 0 else 0.9)],
+        segmenter=segmenter)
     first, second = summary["passage_evidence"]["intervals"]
     assert [first["sequence"], second["sequence"]] == [1, 2]
     _assert_passage_image(output, first, 0)
@@ -703,7 +712,179 @@ def test_passage_candidate_never_inherits_global_best_and_keeps_earliest_tie(med
     assert candidate["quality"]["crop_contamination"] == 0
     assert candidate["quality"]["crop_margin"] == 0.1
     assert candidate["original"] != track["best_original"]
+    assert (80, (100, 20, 180, 90)) in calls
+    original = cv2.imread(str(output / candidate["original"]))
+    crop = cv2.imread(str(output / candidate["best_crop"]))
+    assert np.array_equal(crop, crop_with_padding(original, candidate["bbox"], (64, 64)))
+    assert candidate["segmentation"]["best_mask"].startswith("passages/2/")
     assert json.loads((output / "summary.json").read_text())["passage_evidence"] == summary["passage_evidence"]
+
+
+@pytest.mark.parametrize("kind,status,reason", [
+    ("none", "not_requested", None), ("empty", "rejected", "empty_mask"),
+    ("full", "rejected", "mask_fills_box"), ("shape", "rejected", "invalid_mask_shape"),
+    ("mismatch", "rejected", "invalid_mask_shape"), ("null", "rejected", "invalid_mask_shape"),
+    ("channels", "rejected", "invalid_mask_shape"), ("nan", "rejected", "invalid_mask_values"),
+    ("inf", "rejected", "invalid_mask_values"), ("object", "rejected", "invalid_mask_values"),
+    ("raise", "failed", "RuntimeError"), ("unavailable", "failed", "ImportError"),
+    ("missing", "failed", "FileNotFoundError"),
+])
+def test_passage_rectangular_fallback(media, kind, status, reason):
+    def segmenter(image, bbox):
+        if kind in ("raise", "unavailable", "missing"):
+            raise {"raise": RuntimeError, "unavailable": ImportError,
+                   "missing": FileNotFoundError}[kind]("fixture")
+        return {"empty": np.zeros((HEIGHT, WIDTH), bool), "full": _box_mask(bbox),
+                "shape": np.zeros((0, WIDTH)), "channels": np.zeros((HEIGHT, WIDTH, 1)),
+                "mismatch": np.zeros((HEIGHT // 2, WIDTH)), "null": None,
+                "nan": np.full((HEIGHT, WIDTH), np.nan), "inf": np.full((HEIGHT, WIDTH), np.inf),
+                "object": np.full((HEIGHT, WIDTH), "bad", dtype=object)}[kind]
+
+    summary, output = _run(media, 1, lambda call: [(1, (20, 20, 80, 90), 0.9)],
+                           segmenter=None if kind == "none" else segmenter)
+    candidate = summary["passage_evidence"]["intervals"][0]["candidate"]
+    assert candidate["segmentation"]["status"] == status
+    assert candidate["segmentation"].get("reason") == reason
+    assert summary["tracks"][0]["segmentation"] == candidate["segmentation"]
+    assert (output / candidate["best_crop"]).is_file()
+    assert not (output / "passages/1/best-mask.png").exists()
+    assert candidate["bcs_eligibility"] == "not_assessed"
+    assert candidate["bcs_status"] == "not_evaluated"
+
+
+@pytest.mark.parametrize("value,dtype,mixed", [
+    (-1, np.int32, False), (256, np.int32, False),
+    (-0.25, np.float32, False), (1.25, np.float32, False),
+    (0.25, np.float32, False), (2, np.int32, False),
+    (255, np.int32, True),
+])
+def test_invalid_finite_mask_values_rejected_for_passage_and_track(media, value, dtype, mixed):
+    mask = _box_mask((30, 30, 70, 85)).astype(dtype)
+    if mixed:
+        mask[30, 30] = value  # Mixed 1/255 foreground is not one binary encoding.
+    else:
+        mask[mask != 0] = value
+    summary, output = _run(media, 1, lambda call: [(1, (20, 20, 80, 90), 0.9)],
+                           segmenter=lambda image, bbox: mask)
+    for candidate in (summary["tracks"][0], summary["passage_evidence"]["intervals"][0]["candidate"]):
+        assert candidate["segmentation"] == {"status": "rejected", "reason": "invalid_mask_values"}
+        assert (output / candidate["best_crop"]).is_file()
+        directory = (output / candidate["best_crop"]).parent
+        assert not (directory / "best-mask.png").exists()
+        assert not (directory / "best-masked.png").exists()
+
+
+@pytest.mark.parametrize("dtype,foreground", [
+    (bool, True), (np.int32, 1), (np.float32, 1),
+    (np.uint8, 255), (np.float32, 255),
+])
+def test_supported_binary_mask_encodings_for_passage_and_track(media, dtype, foreground):
+    mask = _box_mask((30, 30, 70, 85)).astype(dtype) * foreground
+    summary, output = _run(media, 1, lambda call: [(1, (20, 20, 80, 90), 0.9)],
+                           segmenter=lambda image, bbox: mask)
+    for candidate in (summary["tracks"][0], summary["passage_evidence"]["intervals"][0]["candidate"]):
+        segmentation = candidate["segmentation"]
+        assert segmentation["status"] == "ok"
+        exported = cv2.imread(str(output / segmentation["best_mask"]), cv2.IMREAD_UNCHANGED)
+        assert exported.dtype == np.uint8 and set(np.unique(exported)) == {0, 255}
+
+
+def test_exported_masks_are_binary_and_aligned_for_tracks_and_passages(media):
+    root, model = media
+    video = _write_video(root / "input.mp4", 1)
+    output = root / "run"
+    box, size, margin = (21, 17, 132, 84), (73, 59), 0.23
+    source_mask = _box_mask((35, 27, 110, 68))
+    summary = track_video(video, output, model, output_size=size, crop_margin=margin,
+                          model=FakeModel(lambda call: [(1, box, 0.9)]),
+                          segmenter=lambda image, bbox: source_mask)
+    x1, y1, x2, y2 = (0, 2, 158, 99)  # Clipped proportional margin, same as RGB crop.
+    region = source_mask[y1:y2, x1:x2].astype(np.uint8) * 255
+    scaled = cv2.resize(region, (73, 45), interpolation=cv2.INTER_NEAREST)
+    expected = np.zeros((59, 73), np.uint8)
+    expected[7:52] = scaled
+    for candidate in (summary["tracks"][0], summary["passage_evidence"]["intervals"][0]["candidate"]):
+        segmentation = candidate["segmentation"]
+        mask = cv2.imread(str(output / segmentation["best_mask"]), cv2.IMREAD_UNCHANGED)
+        masked = cv2.imread(str(output / segmentation["best_masked"]))
+        crop = cv2.imread(str(output / candidate["best_crop"]))
+        assert mask.dtype == np.uint8 and set(np.unique(mask)) == {0, 255}
+        assert np.array_equal(mask, expected)
+        assert (masked[mask == 0] == 28).all()
+        assert np.array_equal(masked[mask == 255], crop[mask == 255])
+
+
+def test_all_eligible_passages_are_segmented_without_track_limit(tmp_path):
+    evidence = PassageEvidence(confirmation_count=1)
+    image = np.full((HEIGHT, WIDTH, 3), 123, np.uint8)
+    box = (20, 20, 80, 90)
+    calls = []
+    for index in range(41):
+        evidence.observe([{"track_id": key, "confidence": score} for key, score in
+                          ([(index, 0.9)] if index == 0 else [(index - 1, 0.4), (index, 0.9)])],
+                         index, index * 100)
+        evidence.capture_candidate(tmp_path, image, {"track_id": index, "confidence": 0.9,
+                                                    "bbox": box}, 1, 0, 0, 0.1)
+
+    def segmenter(image, bbox):
+        calls.append(bbox)
+        return _box_mask((30, 30, 70, 85))
+
+    evidence.finalize_candidates(tmp_path, (31, 27), 0.1, segmenter)
+    assert len(calls) == 41
+    assert all(item["candidate"]["segmentation"]["status"] == "ok" for item in evidence.intervals)
+    absent = _passages([[(1, 0.9)]])
+    absent.finalize_candidates(tmp_path, (31, 27), 0.1, segmenter)
+    assert len(calls) == 41 and absent.intervals[0]["candidate"]["status"] == "not_available"
+
+
+@pytest.mark.parametrize("location", ["passages/1/.best-crop.tmp.png", "passages/1/.best-mask.tmp.png",
+                                     "passages/1/.best-masked.tmp.png", "tracks/1/.best-mask.tmp.png",
+                                     "tracks/1/.best-masked.tmp.png", "tracks/1/.best-crop.tmp.png",
+                                     "tracks/1/.best-original.tmp.jpg"])
+@pytest.mark.parametrize("failure", ["false", "raise", "replace"])
+def test_artifact_storage_failures_abort_summary(media, monkeypatch, location, failure):
+    write, replace = cv2.imwrite, Path.replace
+
+    def fail_write(path, image):
+        if Path(path).as_posix().endswith(location):
+            if failure == "raise":
+                raise OSError("fixture persistence")
+            if failure == "false":
+                Path(path).write_bytes(b"partial")
+                return False
+        return write(path, image)
+
+    def fail_replace(source, target):
+        if source.as_posix().endswith(location) and failure == "replace":
+            raise OSError("fixture replace")
+        return replace(source, target)
+
+    monkeypatch.setattr(cv2, "imwrite", fail_write)
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError):
+        _run(media, 1, lambda call: [(1, (20, 20, 80, 90), 0.9)],
+             segmenter=lambda image, bbox: _box_mask((30, 30, 70, 85)))
+    output = media[0] / "run"
+    assert not (output / "summary.json").exists()
+    assert cv2.imread(str(output / "passages/1/best-original.jpg")) is not None
+    assert not list(output.rglob("*.tmp.*"))
+
+
+@pytest.mark.parametrize("failure", ["missing", "dimensions"])
+def test_unreadable_saved_passage_aborts_without_summary(media, monkeypatch, failure):
+    read = cv2.imread
+
+    def unreadable(path, *args):
+        if Path(path).as_posix().endswith("passages/1/best-original.jpg"):
+            return None if failure == "missing" else np.zeros((3, 4, 3), np.uint8)
+        return read(path, *args)
+
+    monkeypatch.setattr(cv2, "imread", unreadable)
+    with pytest.raises(OSError, match="decode saved passage"):
+        _run(media, 1, lambda call: [(1, (20, 20, 80, 90), 0.9)])
+    assert not (media[0] / "run/summary.json").exists()
+    assert read(str(media[0] / "run/passages/1/best-original.jpg")) is not None
 
 
 def test_passage_confirmation_frame_not_available_to_old_interval(media, passage_images):

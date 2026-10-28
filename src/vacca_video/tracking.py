@@ -136,7 +136,9 @@ def _validate_output_size(output_size) -> tuple[int, int]:
     return int(output_size[0]), int(output_size[1])
 
 
-def crop_with_padding(image, bbox, output_size=(320, 320), margin=DEFAULT_CROP_MARGIN):
+def crop_with_padding(image, bbox, output_size=(320, 320), margin=DEFAULT_CROP_MARGIN,
+                      *, binary_mask=False):
+    """Shared geometry; label maps use nearest sampling and zero letterboxing."""
     import cv2
     import numpy as np
 
@@ -145,9 +147,13 @@ def crop_with_padding(image, bbox, output_size=(320, 320), margin=DEFAULT_CROP_M
     x1, y1, x2, y2 = padded_region(bbox, width, height, margin)
     crop = image[y1:y2, x1:x2]
     scale = min(target_w / crop.shape[1], target_h / crop.shape[0])
+    if binary_mask:
+        crop = (crop != 0).astype(np.uint8) * 255
     resized = cv2.resize(crop, (max(1, min(target_w, round(crop.shape[1] * scale))),
-                                max(1, min(target_h, round(crop.shape[0] * scale)))))
-    canvas = np.full((target_h, target_w, 3), 28, dtype=np.uint8)
+                                max(1, min(target_h, round(crop.shape[0] * scale)))),
+                         interpolation=cv2.INTER_NEAREST if binary_mask else cv2.INTER_LINEAR)
+    canvas = np.full((target_h, target_w) + image.shape[2:],
+                     0 if binary_mask else 28, dtype=np.uint8)
     top = (target_h - resized.shape[0]) // 2
     left = (target_w - resized.shape[1]) // 2
     canvas[top:top + resized.shape[0], left:left + resized.shape[1]] = resized
@@ -235,6 +241,52 @@ def masked_image(image, mask, background: int = 28):
     result = image.copy()
     result[~mask] = background
     return result
+
+
+def _write_image(target, image):
+    """Publish an image atomically; persistence errors must abort the run."""
+    import cv2
+
+    temporary = target.with_name(f".{target.stem}.tmp{target.suffix}")
+    try:
+        if not cv2.imwrite(str(temporary), image):
+            raise OSError("Could not write tracking artifact")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _segmentation_artifacts(output, relative, image, bbox, others, crop,
+                            output_size, margin, segmenter):
+    """Optional model failure is recoverable; artifact storage failure is not."""
+    import numpy as np
+
+    if segmenter is None:
+        return {"status": "not_requested"}
+    try:
+        mask = np.asarray(segmenter(image, bbox))
+        if mask.ndim != 2 or mask.shape != image.shape[:2]:
+            return {"status": "rejected", "reason": "invalid_mask_shape"}
+        if mask.dtype.kind not in "buif" or not np.isfinite(mask).all():
+            return {"status": "rejected", "reason": "invalid_mask_values"}
+        # Binary labels only: bool, numeric 0/1, or numeric 0/255. The local
+        # adapter returns bool; probabilities and mixed encodings are unsupported.
+        zero = mask == 0
+        if not (np.all(zero | (mask == 1)) or np.all(zero | (mask == 255))):
+            return {"status": "rejected", "reason": "invalid_mask_values"}
+        mask = mask.astype(bool)
+        segmentation = assess_mask(mask, bbox, others)
+    except Exception as exc:
+        return {"status": "failed", "reason": type(exc).__name__}
+    if segmentation["status"] == "ok":
+        mask_crop = crop_with_padding(mask, bbox, output_size, margin, binary_mask=True)
+        # Mask AFTER RGB resizing: retain antialiasing but no background bleed.
+        masked = masked_image(crop, mask_crop != 0)
+        _write_image(output / relative / "best-masked.png", masked)
+        _write_image(output / relative / "best-mask.png", mask_crop)
+        segmentation.update(best_masked=(relative / "best-masked.png").as_posix(),
+                            best_mask=(relative / "best-mask.png").as_posix())
+    return segmentation
 
 
 def load_sam_segmenter(model_path):
@@ -420,15 +472,14 @@ class PassageEvidence:
                                "warnings": []})
         self.pending = None
 
-    def capture_candidate(self, output, image, detection, score, contamination, overlap_iou, crop_margin):
+    def capture_candidate(self, output, image, detection, score, contamination, overlap_iou,
+                          crop_margin, others=()):
         """Persist only the active interval's observed source, with earliest ties.
 
         Called after observe on the same sample, so a confirmation frame belongs
         only to the new interval. No full-resolution passage images are retained.
         The original is a full frame, not an isolated animal or visibility proof.
         """
-        import cv2
-
         if not self.intervals or self.last is None:
             return
         interval = self.intervals[-1]
@@ -442,13 +493,7 @@ class PassageEvidence:
         relative = Path("passages") / str(interval["sequence"]) / "best-original.jpg"
         target = output / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(".best-original.tmp.jpg")
-        try:
-            if not cv2.imwrite(str(temporary), image):
-                raise OSError("Could not write passage candidate image")
-            temporary.replace(target)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _write_image(target, image)
         # Publish provenance only after the image has been successfully replaced.
         frame, timestamp_ms = self.last
         height, width = image.shape[:2]
@@ -460,8 +505,34 @@ class PassageEvidence:
             "quality": {"method": "frame_quality", "score": score,
                         "crop_contamination": contamination, "crop_margin": crop_margin,
                         "iou": overlap_iou, "touches_border": touches_border(detection["bbox"], width, height),
-                        "frame_size": [width, height]},
+                        "frame_size": [width, height], "other_bboxes": [list(box) for box in others]},
             "bcs_eligibility": "not_assessed", "bcs_status": "not_evaluated"}
+
+    def finalize_candidates(self, output, output_size, crop_margin, segmenter=None):
+        """Decode each settled candidate sequentially, never the track-global best.
+
+        Passage segmentation has no track segment_limit. All artifacts come from
+        the persisted JPEG (including its compression), not a retained raw frame.
+        Segmentation is neither anatomical visibility nor unique identity proof.
+        """
+        import cv2
+
+        for interval in self.intervals:
+            candidate = interval["candidate"]
+            if candidate["status"] != "available":
+                continue
+            image = cv2.imread(str(output / candidate["original"]))
+            if image is None or list(image.shape[1::-1]) != candidate["quality"]["frame_size"]:
+                raise OSError("Could not decode saved passage candidate")
+            relative = Path(candidate["original"]).parent
+            bbox = tuple(candidate["bbox"])
+            crop = crop_with_padding(image, bbox, output_size, crop_margin)
+            _write_image(output / relative / "best-crop.png", crop)
+            segmentation = _segmentation_artifacts(
+                output, relative, image, bbox, candidate["quality"]["other_bboxes"],
+                crop, output_size, crop_margin, segmenter)
+            candidate.update(best_crop=(relative / "best-crop.png").as_posix(),
+                             artifact_source="decoded_saved_original_jpeg", segmentation=segmentation)
 
     def summary(self, stats):
         if self.intervals and self.last is not None:
@@ -509,6 +580,8 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
     a missing ``lap`` fails instead of letting Ultralytics install it.
     ``segmenter(image, bbox) -> bool mask`` optionally segments each track's
     best frame (longest tracks first, up to ``segment_limit``).
+    Each available passage candidate is also cropped and optionally segmented
+    from its own saved original, without the legacy track segmentation limit.
     Passage parameters are uncalibrated confidence heuristics, not anatomical
     visibility, BCS, or unique-animal identity. Effective policy is in the summary.
     """
@@ -653,7 +726,7 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
                     # Duplicate IDs have no unique box attribution on this sample.
                     if sum(other["track_id"] == track_id for other in detections) == 1:
                         passages.capture_candidate(output, image, detection, score, contamination,
-                                                   overlap_iou, crop_margin)
+                                                   overlap_iou, crop_margin, others)
                     writer.write(crop_with_padding(image, bbox, output_size, crop_margin))
                     item.clip_frames += 1
                     observations.write(json.dumps({
@@ -668,30 +741,21 @@ def track_video(input_path: Path, output: Path, model_path: Path, tracker: str =
         for writer in writers.values():
             writer.release()
     link_fragments(stats, max_gap_ms)
+    passages.finalize_candidates(output, output_size, crop_margin, segmenter)
     segmented = set(sorted(stats, key=lambda key: -stats[key].observations)[:segment_limit]) if segmenter else set()
     track_summaries = []
     for track_id, item in sorted(stats.items()):
         track_dir = tracks_dir / str(track_id)
         original_name, crop_name = "best-original.jpg", "best-crop.png"
-        cv2.imwrite(str(track_dir / original_name), item.best_frame)
-        cv2.imwrite(str(track_dir / crop_name),
-                    crop_with_padding(item.best_frame, item.best_bbox, output_size, crop_margin))
+        _write_image(track_dir / original_name, item.best_frame)
+        crop = crop_with_padding(item.best_frame, item.best_bbox, output_size, crop_margin)
+        _write_image(track_dir / crop_name, crop)
         warnings = track_warnings(item, width, height)
         segmentation = {"status": "not_requested"}
         if track_id in segmented:
-            try:
-                mask = segmenter(item.best_frame, item.best_bbox)
-                segmentation = assess_mask(mask, item.best_bbox, item.best_others)
-                if segmentation["status"] == "ok":
-                    cv2.imwrite(str(track_dir / "best-masked.png"), crop_with_padding(
-                        masked_image(item.best_frame, mask), item.best_bbox, output_size, crop_margin))
-                    mask_image = cv2.cvtColor(mask.astype("uint8") * 255, cv2.COLOR_GRAY2BGR)
-                    cv2.imwrite(str(track_dir / "best-mask.png"), crop_with_padding(
-                        mask_image, item.best_bbox, output_size, crop_margin))
-                    segmentation.update(best_masked=f"tracks/{track_id}/best-masked.png",
-                                        best_mask=f"tracks/{track_id}/best-mask.png")
-            except Exception as exc:  # Optional enhancement: never lose the track.
-                segmentation = {"status": "failed", "reason": type(exc).__name__}
+            segmentation = _segmentation_artifacts(
+                output, Path("tracks") / str(track_id), item.best_frame, item.best_bbox,
+                item.best_others, crop, output_size, crop_margin, segmenter)
         elif segmenter:
             segmentation = {"status": "skipped", "reason": "segment_limit"}
         track_summaries.append({"track_id": track_id, "observations": item.observations,
