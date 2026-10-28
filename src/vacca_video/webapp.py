@@ -600,8 +600,8 @@ def create_router():
     def get_passages(job_id: str, store: Store = Depends(video_store)):
         """Provisional evidence only; not unique animal counts or per-passage BCS.
 
-        Like tracks, a completed video without tracking status is unavailable:
-        the completed-before-tracking-status lifecycle race is not resolved here.
+        Like tracks, processing videos remain pending until configured stages settle.
+        Legacy completed videos without tracking status remain unavailable.
         Image availability does not establish anatomical visibility, BCS eligibility,
         or validation of the masked representation. No clinical scoring is performed.
         """

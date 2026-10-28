@@ -2,12 +2,87 @@
 
 import json
 import os
+import threading
 
 import pytest
 
 from test_video_tracks_api import client, tracked_job
 from test_video_web import TestClient, submit
 from vacca_video import tracking_job
+
+
+@pytest.mark.parametrize("metadata", ["missing", "running", "completed"])
+def test_worker_keeps_written_tracking_private_until_pipeline_settles(client, monkeypatch, metadata):
+    from test_video_tracks_api import _Process
+    from vacca_video.worker import Worker
+
+    job_id, result, _ = passage_job(client)
+    summary = json.loads((result / "tracking/summary.json").read_text(encoding="utf-8"))
+    summary["tracks"] = [{"track_id": 3, "status": "review", "warnings": [],
+                           "clip": "tracks/3/clip.webm"}]
+    (result / "tracking/summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    store = client.app.state.store
+    store.update(job_id, "pending")
+    if metadata == "missing":
+        (result / tracking_job.TRACKING_STATUS).unlink()
+    else:
+        tracking_job.write_status(result, metadata)
+    worker = Worker(store)
+    entered, release = threading.Event(), threading.Event()
+
+    def hook(directory, stop):
+        entered.set()
+        assert release.wait(5), "test did not release tracking hook"
+        tracking_job.write_status(result, "completed")
+
+    worker.track_video = hook
+    update = store.update
+
+    def finish(identifier, status, error=None):
+        update(identifier, status, error)
+        worker.stop.set()
+
+    monkeypatch.setattr(store, "update", finish)
+    monkeypatch.setattr("vacca_video.worker.subprocess.Popen", lambda *a, **k: _Process())
+    worker.thread.start()
+    try:
+        assert entered.wait(5)
+        assert store.get(job_id)["status"] == "processing"
+        assert submit(client).status_code == 202
+        assert submit(client).status_code == 202
+        assert submit(client).status_code == 429
+        for route in ("tracks", "passages"):
+            assert client.get(f"/api/v1/analyses/{job_id}/{route}").json()["status"] == "pending"
+        for route in ("tracks/3/clip", "passages/1/best-original"):
+            assert client.get(f"/api/v1/analyses/{job_id}/{route}").status_code == 404
+    finally:
+        release.set()
+        worker.stop.set()
+        worker.thread.join(5)
+    assert not worker.thread.is_alive()
+    assert store.get(job_id)["status"] == "completed"
+    assert submit(client).status_code == 202
+    for route in ("tracks", "passages"):
+        assert client.get(f"/api/v1/analyses/{job_id}/{route}").json()["status"] == "completed"
+    for route in ("tracks/3/clip", "passages/1/best-original"):
+        assert client.get(f"/api/v1/analyses/{job_id}/{route}").status_code == 200
+
+
+def test_restart_recovery_hides_partial_pipeline_artifacts(client):
+    job_id, result, _ = passage_job(client)
+    store = client.app.state.store
+    store.update(job_id, "processing")
+    tracking_job.write_status(result, "running")
+    store.recover()
+    assert tracking_job.recover_interrupted(store.directory) == 1
+    assert store.get(job_id)["status"] == "failed"
+    assert json.loads((result / tracking_job.TRACKING_STATUS).read_text()) == {
+        "status": "failed", "reason": "interrupted"}
+    assert (result / "tracking/passages/1/best-original.jpg").is_file()
+    for route in ("tracks", "passages"):
+        assert client.get(f"/api/v1/analyses/{job_id}/{route}").json()["reason"] == "video_not_completed"
+    for route in ("tracks/3/clip", "passages/1/best-original"):
+        assert client.get(f"/api/v1/analyses/{job_id}/{route}").status_code == 404
 
 
 def passage_job(client):

@@ -1,6 +1,7 @@
 """One local job at a time, with inference isolated in a CLI subprocess."""
 
 import math
+import json
 import os
 import subprocess
 import sys
@@ -56,6 +57,37 @@ class Worker:
             self._fault(exc)
         if self.health != "faulted":
             self._set_health("stopped")
+
+    def _finish_tracking(self, directory):
+        from .tracking_job import TRACKING_STATUS, write_status
+
+        result = directory / "result"
+        try:
+            self.track_video(directory, self.stop)
+        except Exception as exc:
+            logger.error("Video tracking hook failed: %s", type(exc).__name__)
+            # Preserve detections, but never publish an unrecorded tracking outcome.
+            try:
+                write_status(result, "failed", "interrupted" if self.stop.is_set() else "process_failed")
+            except Exception as storage_error:
+                logger.error("Video tracking status not saved: %s", type(storage_error).__name__)
+                raise RuntimeError("Tracking terminal status could not be saved.") from None
+        try:
+            recorded = json.loads((result / TRACKING_STATUS).read_text(encoding="utf-8"))
+            if type(recorded) is not dict or recorded.get("status") not in (
+                    "completed", "failed", "disabled"):
+                raise ValueError("Tracking did not settle")
+        except (OSError, UnicodeError, ValueError) as exc:
+            logger.error("Video tracking terminal status unavailable: %s", type(exc).__name__)
+            if self.stop.is_set():
+                try:
+                    write_status(result, "failed", "interrupted")
+                except OSError as storage_error:
+                    logger.error("Video tracking status not saved: %s", type(storage_error).__name__)
+            raise RuntimeError("Tracking terminal status is unavailable; retry the video.") from None
+        # A late stop request must not invalidate an already settled outcome.
+        if recorded.get("status") == "failed" and recorded.get("reason") == "interrupted":
+            raise RuntimeError("El servicio se interrumpió. Volvé a cargar el video para reintentar.")
 
     def _run_loop(self):
         # Principal startup may defer claims until recovery commits successfully.
@@ -122,6 +154,8 @@ class Worker:
                     error = self.finish_video(self.store.directory, job_id, self.stop)
                     if self.stop.is_set():
                         raise RuntimeError("El servicio se interrumpió antes de publicar el resultado.")
+                if self.track_video is not None:
+                    self._finish_tracking(directory)
             except Exception as exc:
                 status = "failed"
                 error = str(exc)
@@ -130,10 +164,3 @@ class Worker:
             except Exception as exc:
                 self._fault(exc)
                 return
-            if status == "completed" and self.track_video is not None:
-                # Optional and after publication: detections are never held back
-                # and a tracking failure never changes the job outcome.
-                try:
-                    self.track_video(directory, self.stop)
-                except Exception as exc:
-                    logger.error("Video tracking hook failed: %s", type(exc).__name__)

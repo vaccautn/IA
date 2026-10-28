@@ -424,10 +424,19 @@ Después de la detección muestreada (y del BCS opcional), el worker ejecuta
 `scripts/track_video.py` en otro subproceso sobre el mismo `input.mp4`:
 ByteTrack, todos los frames (`--sample-fps 0`), hasta los primeros 60 segundos
 (la misma ventana que cubren 300 muestras a 5 FPS) y clips WebM VP8, porque los
-navegadores no reproducen `mp4v`. El paso tiene su propio límite de 5 minutos.
+navegadores no reproducen `mp4v`. El paso tiene su propio límite de 10 minutos.
 
-El tracking es opcional y aislado: nunca cambia el estado ni el error del
-análisis. El resultado queda en `result/tracking/` y el estado en
+El trabajo permanece `processing` hasta que se asienta el estado terminal del
+tracking configurado. Mientras tanto, `/tracks` y `/passages` responden `pending`
+y no publican archivos, aunque ya existan en disco. `completed` significa que
+las etapas configuradas terminaron, no que el BCS sea clínicamente válido.
+Un fallo ordinario del tracking opcional o su desactivación conserva las detecciones
+y permite completar el trabajo, con estado de tracking `failed` o `disabled`.
+Una interrupción durante el tracking deja el trabajo `failed` y el tracking
+`failed/interrupted`, sin borrar las detecciones. Si no se puede persistir el
+estado terminal del tracking, el trabajo falla en vez de anunciar una finalización
+sin metadatos; un fallo de SQLite detiene el worker según su contrato de fallo.
+El resultado queda en `result/tracking/` y el estado en
 `result/tracking-status.json` (`completed`, `failed` con `reason`, o
 `disabled`). Las rutas de archivos de un tracking fallido o interrumpido
 responden 404 aunque haya clips parciales en disco. Los análisis anteriores a

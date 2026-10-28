@@ -1,8 +1,8 @@
 """Optional per-track step of a web job, isolated in its own CLI subprocess.
 
-It runs after the job is published as completed, so detections are never held
-back. Tracking never changes the job outcome: progress and failures are
-recorded in ``result/tracking-status.json``.
+It runs while the job is processing. Ordinary optional failures preserve valid
+detections; the worker publishes completion only after the tracking outcome is
+persisted in ``result/tracking-status.json``. Interruption fails the pipeline.
 """
 
 import json
@@ -107,8 +107,8 @@ def run_tracking(directory, stop):
         write_status(directory / "result", "running")
         status, reason = _run(directory, stop)
     except Exception as exc:
+        status, reason = "failed", "interrupted" if stop.is_set() else "process_failed"
         logger.error("Video tracking failed: %s", type(exc).__name__)
-        status, reason = "failed", "process_failed"
     try:
         write_status(directory / "result", status, reason)
     except OSError as exc:

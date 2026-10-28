@@ -404,30 +404,205 @@ def _worker_run(client, monkeypatch, hook, detection_returncode=0):
         worker.stop.set()
 
     monkeypatch.setattr(store, "update", finished)
+    result = store.directory / job_id / "result"
+    result.mkdir()
+    (result / "detections.jsonl").write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(webapp.subprocess, "Popen",
                         lambda *args, **kwargs: _Process(returncode=detection_returncode))
     worker.loop()
     return store.get(job_id)
 
 
-def test_worker_publishes_detections_before_tracking(client, monkeypatch):
+@pytest.mark.parametrize("state,reason", [("completed", None), ("failed", "process_failed"),
+                                          ("disabled", "disabled_by_configuration")])
+def test_worker_settles_tracking_before_publishing(client, monkeypatch, state, reason):
     calls = []
     store = client.app.state.store
 
     def hook(directory, stop):
         calls.append((directory.name, store.get(directory.name)["status"]))
+        tracking_job.write_status(directory / "result", state, reason)
 
     job = _worker_run(client, monkeypatch, hook)
     assert job["status"] == "completed" and job["error"] is None
-    assert calls == [(job["id"], "completed")]
+    assert calls == [(job["id"], "processing")]
+    directory = store.directory / job["id"]
+    assert _status(directory)["status"] == state
+    assert (directory / "result/detections.jsonl").is_file()
+    if state != "completed":
+        for route in ("tracks", "passages"):
+            response = client.get(f"/api/v1/analyses/{job['id']}/{route}").json()
+            assert (response["status"], response["reason"]) == (state, reason)
 
 
-def test_tracking_hook_errors_never_fail_the_job(client, monkeypatch):
+def test_tracking_hook_errors_record_failure_and_keep_detections(client, monkeypatch):
     def broken(directory, stop):
         raise RuntimeError("fixture")
 
     job = _worker_run(client, monkeypatch, broken)
     assert job["status"] == "completed" and job["error"] is None
+    directory = client.app.state.store.directory / job["id"]
+    assert _status(directory) == {"status": "failed", "reason": "process_failed"}
+    assert (directory / "result/detections.jsonl").is_file()
+
+
+def test_worker_without_tracking_still_completes(client, monkeypatch):
+    assert _worker_run(client, monkeypatch, None)["status"] == "completed"
+
+
+@pytest.mark.parametrize("mode", ["raised", "swallowed", "missing"])
+def test_tracking_status_storage_failure_fails_job(client, monkeypatch, mode):
+    def hook(directory, stop):
+        if mode == "missing":
+            return
+        if mode == "swallowed":
+            return tracking_job.run_tracking(directory, stop)
+        tracking_job.write_status(directory / "result", "running")
+        raise OSError("fixture")
+
+    original = tracking_job.write_status
+
+    def write(result, status, reason=None):
+        if status != "running":
+            raise OSError("fixture terminal write")
+        original(result, status, reason)
+
+    monkeypatch.setattr(tracking_job, "write_status", write)
+    monkeypatch.setattr(tracking_job, "_run", lambda directory, stop: ("completed", None))
+    job = _worker_run(client, monkeypatch, hook)
+    assert job["status"] == "failed" and job["error"]
+
+
+@pytest.mark.parametrize("state,reason,expected", [
+    ("failed", "interrupted", "failed"), ("completed", None, "completed"),
+    ("disabled", "disabled_by_configuration", "completed"),
+])
+def test_tracking_shutdown_uses_settled_outcome(client, monkeypatch, state, reason, expected):
+    def hook(directory, stop):
+        tracking_job.write_status(directory / "result", state, reason)
+        stop.set()
+
+    job = _worker_run(client, monkeypatch, hook)
+    assert job["status"] == expected
+    assert _status(client.app.state.store.directory / job["id"])["status"] == state
+
+
+def test_tracking_cancelled_hook_without_outcome_fails_job(client, monkeypatch):
+    def hook(directory, stop):
+        tracking_job.write_status(directory / "result", "running")
+        stop.set()
+
+    job = _worker_run(client, monkeypatch, hook)
+    assert job["status"] == "failed"
+    assert _status(client.app.state.store.directory / job["id"])["reason"] == "interrupted"
+
+
+def test_worker_shutdown_interrupts_real_tracking_hook(client, monkeypatch):
+    store = client.app.state.store
+    job_id = submit(client).json()["id"]
+    result = store.directory / job_id / "result"
+    result.mkdir()
+    (result / "detections.jsonl").write_text("{}\n", encoding="utf-8")
+    worker = webapp.Worker(store)
+    worker.track_video = tracking_job.run_tracking
+    entered = threading.Event()
+    process = _Process(finished=False, on_enter=entered.set)
+
+    def spawn(command, **kwargs):
+        return process if command[2].endswith("track_video.py") else _Process()
+
+    monkeypatch.setattr(webapp.subprocess, "Popen", spawn)
+    worker.thread.start()
+    try:
+        assert entered.wait(5)
+        assert store.get(job_id)["status"] == "processing"
+    finally:
+        worker.stop.set()
+        worker.thread.join(5)
+    assert not worker.thread.is_alive()
+    assert worker.health == "stopped"
+    assert store.get(job_id)["status"] == "failed"
+    assert _status(result.parent) == {"status": "failed", "reason": "interrupted"}
+    assert process.calls[:2] == ["terminate", ("wait", 5)]
+    assert (result / "detections.jsonl").is_file()
+
+
+@pytest.mark.parametrize("case", ["spawn_during_shutdown", "terminate_during_shutdown",
+                                  "ordinary_spawn_error"])
+def test_real_tracking_hook_classifies_operation_errors_at_shutdown(client, monkeypatch, case):
+    store = client.app.state.store
+    job_id = submit(client).json()["id"]
+    result = store.directory / job_id / "result"
+    result.mkdir()
+    detections = result / "detections.jsonl"
+    detections.write_text("{}\n", encoding="utf-8")
+    worker = webapp.Worker(store)
+    worker.track_video = tracking_job.run_tracking
+    expected_reason = "process_failed" if case == "ordinary_spawn_error" else "interrupted"
+    expected_job = "completed" if case == "ordinary_spawn_error" else "failed"
+
+    class TrackingProcess(_Process):
+        def terminate(self):
+            raise OSError("synthetic tracking termination error")
+
+    def spawn(command, **kwargs):
+        if command[2].endswith("track_video.py"):
+            if case == "terminate_during_shutdown":
+                return TrackingProcess(finished=False, on_enter=worker.stop.set)
+            if case == "spawn_during_shutdown":
+                worker.stop.set()
+            raise OSError("synthetic tracking startup error")
+        return _Process()
+
+    update = store.update
+    published = []
+
+    def finish(identifier, status, error=None):
+        published.append(_status(result.parent))
+        update(identifier, status, error)
+        worker.stop.set()
+
+    monkeypatch.setattr(tracking_job.subprocess, "Popen", spawn)
+    monkeypatch.setattr(store, "update", finish)
+    worker.loop()
+    terminal = {"status": "failed", "reason": expected_reason}
+    assert published == [terminal]
+    assert _status(result.parent) == terminal
+    assert store.get(job_id)["status"] == expected_job
+    assert worker.health == "stopped"
+    assert detections.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_final_job_storage_failure_faults_worker_after_tracking_settles(client, monkeypatch, caplog):
+    store = client.app.state.store
+    worker = webapp.Worker(store)
+    job_id = submit(client).json()["id"]
+    result = store.directory / job_id / "result"
+    result.mkdir()
+    worker.track_video = lambda directory, stop: tracking_job.write_status(result, "completed")
+    writes = []
+
+    def fail_update(identifier, status, error=None):
+        writes.append(status)
+        assert _status(result.parent) == {"status": "completed"}
+        raise OSError("private storage path")
+
+    monkeypatch.setattr(store, "update", fail_update)
+    monkeypatch.setattr(webapp.subprocess, "Popen", lambda *a, **k: _Process())
+    worker.thread.start()
+    try:
+        worker.thread.join(5)
+    finally:
+        worker.stop.set()
+        worker.thread.join(5)
+    assert not worker.thread.is_alive()
+    assert worker.health == "faulted"
+    assert writes == ["completed"]
+    assert store.get(job_id)["status"] == "processing"
+    assert "Video worker stopped after storage failure: OSError" in caplog.text
+    assert "private storage path" not in caplog.text
+    store.recover()
+    assert store.get(job_id)["status"] == "failed"
 
 
 def test_failed_detection_skips_tracking(client, monkeypatch):
