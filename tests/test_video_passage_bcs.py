@@ -96,10 +96,15 @@ def test_per_image_failures_continue(tmp_path, failure, reason):
             if failure == "category":
                 return result(True)
             if failure == "lineage":
-                value = result(); value.lineage = {"run_id": "C:/private"}; return value
+                value = result()
+                value.lineage = {"run_id": "C:/private"}
+                return value
             if failure == "nan":
-                value = result(); value.inference_time_ms = float("nan"); return value
-            if failure == "missing_fields": return SimpleNamespace()
+                value = result()
+                value.inference_time_ms = float("nan")
+                return value
+            if failure == "missing_fields":
+                return SimpleNamespace()
         return result()
     finish(tmp_path, evaluate, wait=.05)
     rows = json.loads((directory / "passage-bcs.json").read_bytes())["passages"]
@@ -116,16 +121,22 @@ def test_invalid_original_never_falls_back(tmp_path, monkeypatch, defect):
     if defect == "absent":
         row["candidate"] = dict(status="not_available", reason="no_candidate_captured",
             bcs_eligibility="not_assessed", bcs_status="not_evaluated")
-    elif defect == "missing": path.unlink()
-    elif defect == "unsafe": row["candidate"]["original"] = "../secret.jpg"
+    elif defect == "missing":
+        path.unlink()
+    elif defect == "unsafe":
+        row["candidate"]["original"] = "../secret.jpg"
     elif defect == "link":
         original = type(path).is_symlink
         monkeypatch.setattr(type(path), "is_symlink", lambda p: p == path or original(p))
-    elif defect == "dimension": Image.new("RGB", (12001, 1)).save(path)
-    else: path.write_bytes(b"invalid")
+    elif defect == "dimension":
+        Image.new("RGB", (12001, 1)).save(path)
+    else:
+        path.write_bytes(b"invalid")
     (directory / "summary.json").write_text(json.dumps(summary))
     calls = []
-    async def evaluate(image, **kwargs): calls.append(image); return result()
+    async def evaluate(image, **kwargs):
+        calls.append(image)
+        return result()
     finish(tmp_path, evaluate)
     assert calls == images[1:]
     rows = json.loads((directory / "passage-bcs.json").read_bytes())["passages"]
@@ -136,14 +147,22 @@ def test_invalid_original_never_falls_back(tmp_path, monkeypatch, defect):
 def test_invalid_global_evidence_fails_before_inference(tmp_path, defect):
     directory, summary, _ = passage_job(tmp_path)
     evidence = summary["passage_evidence"]
-    if defect == "sequence": evidence["intervals"][1]["sequence"] = 1
-    elif defect == "track": evidence["intervals"][0]["candidate"]["track_id"] = 2
-    elif defect == "boundary": evidence["intervals"][0]["end_exclusive"] = False
-    elif defect == "evidence": evidence["status"] = "clinical"
-    else: evidence["intervals"][0]["candidate"]["frame_index"] = 999
+    if defect == "sequence":
+        evidence["intervals"][1]["sequence"] = 1
+    elif defect == "track":
+        evidence["intervals"][0]["candidate"]["track_id"] = 2
+    elif defect == "boundary":
+        evidence["intervals"][0]["end_exclusive"] = False
+    elif defect == "evidence":
+        evidence["status"] = "clinical"
+    else:
+        evidence["intervals"][0]["candidate"]["frame_index"] = 999
     (directory / "summary.json").write_text(json.dumps(summary))
-    async def never(*args, **kwargs): pytest.fail("Malformed evidence must not infer")
-    with pytest.raises(RuntimeError): finish(tmp_path, never)
+    async def never(*args, **kwargs):
+        pytest.fail("Malformed evidence must not infer")
+
+    with pytest.raises(RuntimeError):
+        finish(tmp_path, never)
     assert not (directory / "passage-bcs.json").exists()
 
 
@@ -151,14 +170,19 @@ def test_invalid_global_evidence_fails_before_inference(tmp_path, defect):
 def test_interrupt_or_storage_failure_never_publishes(tmp_path, monkeypatch, mode):
     directory, _, _ = passage_job(tmp_path)
     stop = threading.Event()
-    if mode == "before": stop.set()
+    if mode == "before":
+        stop.set()
     if mode == "write":
-        def fail(*args): raise OSError("disk full")
+        def fail(*args):
+            raise OSError("disk full")
+
         monkeypatch.setattr("vacca_video.artifacts.os.replace", fail)
     async def evaluate(*args, **kwargs):
-        if mode == "during": stop.set()
+        if mode == "during":
+            stop.set()
         return result()
-    with pytest.raises(RuntimeError): finish(tmp_path, evaluate, stop=stop)
+    with pytest.raises(RuntimeError):
+        finish(tmp_path, evaluate, stop=stop)
     assert not (directory / "passage-bcs.json").exists()
     assert not list(directory.glob(".passage-bcs-*"))
 
@@ -183,7 +207,9 @@ def test_worker_phase_order_and_final_persistence(tmp_path, monkeypatch, mode):
     worker.finish_video = legacy
     worker.track_video = None if mode == "no_tracking" else tracking
     if mode == "write_error":
-        def fail(*args): raise OSError("disk full")
+        def fail(*args):
+            raise OSError("disk full")
+
         monkeypatch.setattr("vacca_video.artifacts.os.replace", fail)
         # Tracking status publication is not part of this injected sidecar failure.
         def tracked(job_directory, stop):
@@ -216,7 +242,8 @@ def test_worker_phase_order_and_final_persistence(tmp_path, monkeypatch, mode):
     assert calls[0] == "legacy" and calls[-1] == "settled"
     expected = mode in {"completed", "write_error"}
     assert calls.count("bcs") == (3 if expected else 0)
-    if expected: assert calls[1] == "tracking"
+    if expected:
+        assert calls[1] == "tracking"
     assert store.get("fake")["status"] == ("failed" if mode == "write_error" else "completed")
     assert (directory / "passage-bcs.json").exists() == (mode == "completed")
 
@@ -229,7 +256,8 @@ def test_empty_sidecar_and_summary_digest_validation(tmp_path):
     async def never(*args, **kwargs): pytest.fail("Zero passages must not infer")
     finish(tmp_path, never)
     assert read_passage_bcs(tmp_path, "fake")["passages"] == []
-    with (directory / "summary.json").open("ab") as stream: stream.write(b" ")
+    with (directory / "summary.json").open("ab") as stream:
+        stream.write(b" ")
     with pytest.raises(ValueError, match="Stale"):
         read_passage_bcs(tmp_path, "fake")
 
@@ -245,7 +273,8 @@ def test_sidecar_cannot_join_tampered_bindings(tmp_path, field, value):
     sidecar = json.loads(path.read_bytes())
     sidecar["passages"][0][field] = value
     path.write_text(json.dumps(sidecar))
-    with pytest.raises(ValueError): read_passage_bcs(tmp_path, "fake")
+    with pytest.raises(ValueError):
+        read_passage_bcs(tmp_path, "fake")
 
 
 def test_sidecar_bound_applies_to_reads_and_publication(tmp_path):
@@ -255,7 +284,8 @@ def test_sidecar_bound_applies_to_reads_and_publication(tmp_path):
         publish_passage_bcs(tmp_path, "fake", {"oversize": "x" * PASSAGE_BCS_LIMIT}, lambda: None)
     assert not (directory / "passage-bcs.json").exists()
     (directory / "passage-bcs.json").write_bytes(b" " * (PASSAGE_BCS_LIMIT + 1))
-    with pytest.raises(ValueError): read_tracking_json(tmp_path, "fake", "passage-bcs.json")
+    with pytest.raises(ValueError):
+        read_tracking_json(tmp_path, "fake", "passage-bcs.json")
 
 
 def test_close_interrupts_pending_passage_without_sidecar(tmp_path):

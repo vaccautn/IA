@@ -199,34 +199,58 @@ def test_tracking_gates(client, state, expected):
 def test_invalid_or_legacy_evidence_is_controlled(client, defect):
     job_id, result, evidence = passage_job(client)
     first = evidence["intervals"][0]
-    if defect == "duplicate": evidence["intervals"][1]["sequence"] = 1
-    elif defect == "zero": first["sequence"] = 0
-    elif defect == "string": first["sequence"] = "1"
-    elif defect == "nan": first["start_timestamp_ms"] = float("nan")
-    elif defect == "reverse_time": evidence["intervals"][1]["start_timestamp_ms"] = 1.
-    elif defect == "bad_type": first["candidate"] = []
-    elif defect == "missing_candidate": first.pop("candidate")
+    if defect == "duplicate":
+        evidence["intervals"][1]["sequence"] = 1
+    elif defect == "zero":
+        first["sequence"] = 0
+    elif defect == "string":
+        first["sequence"] = "1"
+    elif defect == "nan":
+        first["start_timestamp_ms"] = float("nan")
+    elif defect == "reverse_time":
+        evidence["intervals"][1]["start_timestamp_ms"] = 1.
+    elif defect == "bad_type":
+        first["candidate"] = []
+    elif defect == "missing_candidate":
+        first.pop("candidate")
     elif defect in ("absolute", "escape", "other_sequence"):
         first["candidate"]["original"] = {"absolute": "C:/secret.jpg", "escape": "../secret.jpg",
                                           "other_sequence": "passages/2/best-original.jpg"}[defect]
-    elif defect == "bcs": first["candidate"]["bcs_status"] = "completed"
-    elif defect == "missing_crop_ref": first["candidate"].pop("best_crop")
-    elif defect == "bad_unresolved": evidence["unresolved_tracks"] = [None]
-    elif defect == "bad_status": evidence["status"] = "clinical"
-    elif defect == "bool_sequence": first["sequence"] = True
-    elif defect == "infinity": first["end_timestamp_ms"] = float("inf")
-    elif defect == "sparse_sequence": evidence["intervals"].pop(1)
-    elif defect == "duplicate_track": evidence["intervals"][1]["track_id"] = first["track_id"]
-    elif defect == "candidate_track": first["candidate"]["track_id"] = 2
-    elif defect == "boundary": first["end_exclusive"] = False
-    elif defect == "missing_mask_ref": first["candidate"]["segmentation"].pop("best_mask")
-    elif defect == "empty": evidence["intervals"] = []; evidence["unresolved_tracks"] = []
+    elif defect == "bcs":
+        first["candidate"]["bcs_status"] = "completed"
+    elif defect == "missing_crop_ref":
+        first["candidate"].pop("best_crop")
+    elif defect == "bad_unresolved":
+        evidence["unresolved_tracks"] = [None]
+    elif defect == "bad_status":
+        evidence["status"] = "clinical"
+    elif defect == "bool_sequence":
+        first["sequence"] = True
+    elif defect == "infinity":
+        first["end_timestamp_ms"] = float("inf")
+    elif defect == "sparse_sequence":
+        evidence["intervals"].pop(1)
+    elif defect == "duplicate_track":
+        evidence["intervals"][1]["track_id"] = first["track_id"]
+    elif defect == "candidate_track":
+        first["candidate"]["track_id"] = 2
+    elif defect == "boundary":
+        first["end_exclusive"] = False
+    elif defect == "missing_mask_ref":
+        first["candidate"]["segmentation"].pop("best_mask")
+    elif defect == "empty":
+        evidence["intervals"] = []
+        evidence["unresolved_tracks"] = []
     save(result, evidence)
     path = result / "tracking/summary.json"
-    if defect == "legacy": path.write_text('{"tracks": []}')
-    elif defect == "json": path.write_text("{")
-    elif defect == "oversize": path.write_text(" " * (4 * 1024 * 1024 + 1))
-    elif defect == "nested": path.write_text("[" * 2000)
+    if defect == "legacy":
+        path.write_text('{"tracks": []}')
+    elif defect == "json":
+        path.write_text("{")
+    elif defect == "oversize":
+        path.write_text(" " * (4 * 1024 * 1024 + 1))
+    elif defect == "nested":
+        path.write_text("[" * 2000)
     data = listing(client, job_id)
     assert data["status"] == ("completed" if defect == "empty" else "unavailable")
     assert data["passages"] == []
