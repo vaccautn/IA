@@ -35,6 +35,10 @@ candidato de una sola detección, o la evaluación secuencial de imágenes origi
 disponibles por pasaje después de un tracking exitoso. La ruta de pasajes no depende
 de que exista el candidato de una sola detección. Ambos flujos web comparten el runtime
 y la compuerta BCS; `/ready/bcs` puede cambiar sin una solicitud directa a `/bcs`.
+Un video web nuevo completado puede iniciar el intento BCS del candidato global,
+seleccionado entre muestras con exactamente una detección de vaca, sin una solicitud
+directa a `/bcs`; el flujo independiente por pasajes evalúa sus imágenes originales
+disponibles tras un tracking exitoso, incluso si no existe ese candidato.
 No todo video inicia una evaluación: puede no haber candidato ni pasajes disponibles,
 fallar el trabajo/tracking o no estar disponible la capacidad. Consulte el
 [flujo de video y BCS](video-web.md#candidato-y-categoría-bcs-experimental).
