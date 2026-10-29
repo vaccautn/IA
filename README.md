@@ -48,9 +48,12 @@ los trabajos antiguos no se evalúan automáticamente. Ver
 La rama de video incorpora una demo independiente con el detector existente:
 MP4 local → frames muestreados → cajas, conteo por frame, JSONL y presentación HTML.
 El CLI/escritorio no necesita backend ni BCS: conserva un candidato original sin
-evaluarlo. La web intenta BCS una sola vez con el runtime real existente cuando
-está disponible; no genera categorías simuladas si falta el paquete. Conserva los
-contratos públicos de `/detect` y `/bcs`.
+evaluarlo. En la web, además del intento opcional sobre el candidato de una sola
+detección, después de un tracking exitoso se puede evaluar BCS secuencialmente
+para cada pasaje con imagen original disponible. Este segundo flujo no depende
+de que exista el candidato anterior. Ambos usan el runtime BCS real cuando está
+disponible; no se generan categorías simuladas si falta el paquete. Se conservan
+los contratos públicos de `/detect` y `/bcs`.
 Consultar [ejecución, demostración y límites](docs/video-prototype.md).
 
 Microservicio de detección de bovinos con YOLO26n ajustado finamente sobre Navid HSM + BCS ScienceDB.
@@ -89,8 +92,9 @@ if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne $catalog.archiv
 ```
 
 La API usa `http://127.0.0.1:8001`. El detector YOLO se carga durante el arranque; el
-paquete BCS se carga **una sola vez y de forma lazy** en la primera evaluación
-(por `POST /bcs` o por un nuevo video elegible en la web). Sin instalación,
+paquete BCS se carga **una sola vez por proceso y de forma lazy** en la primera
+operación que lo necesita: `POST /bcs`, la evaluación web del candidato o las
+evaluaciones secuenciales de pasajes tras un tracking exitoso. Sin instalación,
 `GET /ready/bcs` devuelve `503` con `status: not_installed` y
 mantiene `/health` y `/detect` operativos. Después de instalar, devuelve primero
 `not_loaded` y luego `ready`, pero continúa indicando que el modelo es experimental y no
@@ -595,6 +599,12 @@ IA/
 │   ├── category_split_plan.py ← División determinista por grupos
 │   ├── serving.py           ← Cargador externo validado e inferencia sobre la imagen completa
 │   └── serving_package.py   ← Frontera estricta del paquete BCS privado y su catálogo
+├── src/vacca_video/         ← CLI, tracking, pasajes y API web local de video
+│   ├── pipeline.py          ← Muestreo y procesamiento secuencial de frames
+│   ├── tracking.py          ← Trayectorias temporales, candidatos y artefactos
+│   ├── webapp.py            ← Rutas locales /videos y /api/v1/analyses
+│   ├── worker.py            ← Procesamiento de trabajos aislado
+│   └── passage_bcs.py       ← Sidecar BCS experimental por pasaje
 ├── scripts/
 │   ├── train.py             ← Entrenamiento YOLO de Fase 1
 │   ├── build_combined_v2.py ← Conjunto de datos combinado separado de Fase 1
@@ -604,7 +614,11 @@ IA/
 │   ├── run_baseline.py       ← Línea base reproducible de Fase 1
 │   ├── run_api.py           ← Script de arranque del servidor API
 │   ├── export_bcs_serving_package.py ← Exportación reproducible de state-dict-only
-│   └── smoke_test_api.py    ← Ciclo de vida FastAPI, /health ASGI y HTTP en vivo opcional
+│   ├── smoke_test_api.py    ← Ciclo de vida FastAPI, /health ASGI y HTTP en vivo opcional
+│   ├── process_video.py     ← Procesamiento CLI y reporte offline
+│   ├── track_video.py       ← Exportación CLI de trayectorias temporales
+│   └── export_passage_bcs_labels.py ← Paquete offline de revisión, sin etiquetas asignadas
+├── web/                     ← UI React de la aplicación local de video
 ├── configs/                 ← Archivos YAML de entrenamiento
 ├── data/                    ← (ignorado por Git)
 │   ├── bcs/dataset/         ← Carpetas locales de la fuente fraccional

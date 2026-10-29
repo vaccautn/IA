@@ -32,8 +32,10 @@ conserva los seis fallos; el ZIP y su sidecar sólo pueden cargarse o descargars
 ubicación privada de VACCA Drive del equipo. No deben entrar en Git público ni distribuirse
 desde GitHub.
 `VACCA_BCS_DISABLED=1` mantiene BCS no configurado sin afectar detección; sin esa
-variable, la ausencia del paquete informa `not_installed` y una instalación válida se
-carga sólo en la primera solicitud `/bcs`.
+variable, la ausencia del paquete informa `not_installed`. Una instalación válida
+se carga de forma lazy en la primera operación BCS efectiva: `POST /bcs`, la evaluación
+web del candidato o las evaluaciones secuenciales de pasajes disponibles después del
+tracking. Estas rutas comparten el runtime del proceso.
 
 ## API operativa
 

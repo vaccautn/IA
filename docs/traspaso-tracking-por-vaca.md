@@ -19,8 +19,10 @@ HTTP en [video-web.md](video-web.md).
    detecciones. La galería muestra silueta, estado, advertencias, clip y frame
    original. Acepta MP4 y MOV de celular.
 4. **Recortes para BCS** (`scripts/export_bcs_crops.py`): exporta una imagen por
-   vaca candidata a una planilla para etiquetar 1..5 y arma `data/<1..5>/` para
-   `BCSFolderDataset`, con grupos por animal para dividir sin filtrar.
+   track seleccionado a una planilla para etiquetar 1..5 y arma `data/<1..5>/`
+   para `BCSFolderDataset`. Sus grupos de partición son heurísticos (video + ID
+   temporal y posibles enlaces de fragmentos), no identidades de vacas ni una
+   garantía de que el mismo animal no cruce train/val/test.
 
 ## Puesta en marcha en otra PC
 
@@ -75,10 +77,12 @@ py -3.13 -m venv .venv
    puede medir en serio fragmentación, umbrales de silueta y calidad del mejor
    frame.
 2. **Dataset BCS desde atrás.** El BCS actual es experimental, falló sus 6
-   controles y evalúa la imagen entera. Con `export_bcs_crops.py` etiquetar las
-   siluetas (idealmente con un veterinario), dividir por `group` y reentrenar.
-   Recién con un modelo entrenado sobre recortes por animal tiene sentido un BCS
-   por trayectoria en la galería.
+   controles y evalúa la imagen entera. `export_bcs_crops.py` permite etiquetar
+   siluetas (idealmente con un veterinario); sus `group` no prueban identidad ni
+   aseguran separación por animal. Antes de evaluar generalización por animal,
+   hacen falta IDs revisados y una partición construida a partir de ellos. Solo
+   un modelo validado con datos representativos justificaría plantear BCS por
+   trayectoria en la galería.
 3. **Vecinas no detectadas.** Es el límite que queda en los recortes: si el
    detector no ve a la vaca de al lado, ni la contaminación ni la silueta la
    descuentan. Opciones a medir: reentrenar el detector con tomas de manga, o

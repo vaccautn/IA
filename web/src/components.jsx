@@ -27,7 +27,7 @@ export function History({ jobs, selected, choose }) {
   </section>;
 }
 
-export function Results({ job, count, frame, index, playing, setPlaying, setIndex, tracks }) {
+export function Results({ job, count, frame, index, playing, setPlaying, setIndex, tracks, passages, passagesLoading, passagesError, retryPassages }) {
   const highlight = job?.highlighted_frame;
   return <section className="card results" aria-labelledby="video-results-title"><div className="section-title"><div><h2 id="video-results-title">Resultados del análisis</h2><p>{job?.name ?? "Las detecciones aparecer\xE1n ac\xE1."}</p></div>{job && count > 0 && !["pending", "processing"].includes(job.status) && <div className="download-actions"><a className="secondary" href={`/api/v1/analyses/${job.id}/frames.zip`}>Descargar frames (ZIP)</a><a className="secondary" href={`/api/v1/analyses/${job.id}/results`}>Descargar detecciones (JSONL)</a></div>}</div>
     {job?.status === "pending" && <div className="notice" role="status">En espera. Los videos se procesan de a uno.</div>}
@@ -36,6 +36,7 @@ export function Results({ job, count, frame, index, playing, setPlaying, setInde
     {job?.summary_error && <div className="alert" role="alert">{job.summary_error}</div>}
     {job?.summary?.stop_reason === "frame_limit" && <div className="notice">Resultado parcial: se alcanzó el límite de {MAX_FRAMES} frames.</div>}
     <CandidateBCS job={job} />
+    {job && <Passages job={job} data={passages} loading={passagesLoading} error={passagesError} retry={retryPassages} />}
     <Tracks job={job} tracks={tracks} />
     {highlight && <section className="final-summary" aria-label="Frame destacado por detecciones">
       <h2>{job.status === "failed" || job.summary?.stop_reason === "frame_limit" ? "Resumen de los frames analizados" : "Frame destacado"}</h2>
@@ -52,6 +53,72 @@ export function Results({ job, count, frame, index, playing, setPlaying, setInde
       setIndex(Number(event.target.value));
     }} /><span>{index + 1} / {count}</span></div><p className="hint">Vista de frames muestreados. La reproducción del visor no representa la velocidad original del video.</p></> : <div className="empty result-empty"><Icon size={42} /><strong>{job ? "Preparando las detecciones" : "Tu video, con m\xE1s informaci\xF3n"}</strong><span>Vas a ver cajas, cantidades y el momento de cada detección.</span></div>}
   </section>;
+}
+
+const passageReasons = {
+  legacy_no_passage_evidence: "Este análisis no tiene evidencia de pasajes disponible.",
+  passage_evidence_unreadable: "No se pudo leer la evidencia de pasajes.",
+  passage_bcs_unreadable: "El BCS por pasaje no está disponible; no se muestran categorías.",
+  no_candidate_captured: "No se capturó una imagen original para evaluar.",
+  invalid_original: "La imagen original no pudo evaluarse.",
+  image_rejected: "El servicio rechazó la imagen original; no se usó un recorte.",
+  capacity_busy: "La capacidad BCS estaba ocupada; no se evaluó.",
+  capability_unavailable: "La capacidad BCS no estaba disponible.",
+  inference_failed: "Falló la evaluación BCS.",
+  evaluation_timeout: "La evaluación BCS superó el tiempo de espera.",
+  invalid_outcome: "El resultado BCS no pudo validarse.",
+  video_not_completed: "El video no se completó."
+};
+const passageWarnings = {
+  duplicate_track_id_unresolved: "Hay identificadores de trayectoria duplicados; la atribución no se resolvió.",
+  invalid_confidence_unresolved: "La confianza no fue válida para resolver la atribución.",
+  missing_incumbent_attribution_unresolved: "No se pudo resolver la atribución a partir de la referencia previa.",
+  possible_track_id_reuse_unresolved: "Un identificador de trayectoria podría haberse reutilizado; no se resolvió.",
+  missing_incumbent_reference_unavailable_or_stale: "La referencia previa no está disponible o es antigua; la atribución sigue sin resolverse.",
+  ambiguous_dominance_unresolved: "La evidencia fue ambigua; no se resolvió la atribución.",
+  finalized_track_reentry_unresolved: "La reaparición tras finalizar la trayectoria no se atribuyó.",
+  possible_fragment_identity_unresolved: "La posible continuidad entre pasajes sigue sin resolverse.",
+  recovery_confirmation_exceeds_gap_at_sample_rate: "La confirmación excede el intervalo de recuperación; no se resolvió la atribución.",
+  untracked_detection_attribution_unresolved: "Hay detecciones cuya atribución a un pasaje no se resolvió.",
+};
+
+function Passages({ job, data, loading, error, retry }) {
+  const terminalError = data && data.status !== "completed" && data.status !== "pending";
+  return <section className="passages" aria-labelledby="video-passages-title">
+    <div className="section-title"><div><h3 id="video-passages-title">Pasajes del video</h3><p>Evidencia temporal provisional; los identificadores solo tienen alcance dentro de este video.</p></div></div>
+    {!loading && !error && data?.status === "completed" && <p role="status">Pasadas detectadas: {data.passages.length}</p>}
+    {loading ? <p role="status">Cargando pasajes…</p>
+      : error ? <div className="passage-error" role="alert"><p>No se pudieron cargar los pasajes: {error}</p><button className="secondary" onClick={retry}>Reintentar</button></div>
+      : data?.status === "pending" ? <p role="status"><span className="spinner" /> Actualizando pasajes…</p>
+      : terminalError ? <div className="passage-error" role="status"><p>El endpoint informó {data.status === "failed" ? "un error" : data.status === "disabled" ? "que está deshabilitado" : "que no está disponible"}{data.reason ? `: ${passageReasons[data.reason] ?? data.reason}` : "."}</p><button className="secondary" onClick={retry}>Reintentar</button></div>
+      : !data?.passages?.length ? <>{data?.bcs_status === "unavailable" && <p className="notice" role="status">{passageReasons[data.bcs_reason] ?? "El BCS por pasaje no está disponible; no se muestran categorías."}</p>}<p role="status">No hay pasajes disponibles para este análisis.</p></>
+      : <>
+        {data.bcs_status === "unavailable" && <p className="notice" role="status">{passageReasons[data.bcs_reason] ?? "El BCS por pasaje no está disponible; no se muestran categorías."}</p>}
+        <ol className="passage-grid">{data.passages.map((item) => <PassageCard key={`${job.id}-${item.sequence}-${item.candidate?.best_original_url ?? "none"}`} jobId={job.id} passage={item} />)}</ol>
+      </>}
+    {data && data.status !== "pending" && <>
+      {data.unresolved_count > 0 && <p className="notice" role="status">{data.unresolved_count} atribución{data.unresolved_count === 1 ? "" : "es"} sin resolver: {data.unresolved_tracks.map((item) => `trayectoria ${item.track_id} (${item.first_frame}–${item.last_frame})`).join(", ")}. No implica identidad individual.</p>}
+      {data.warnings?.length > 0 && <ul className="passage-warnings">{data.warnings.map((warning) => <li key={warning}>{passageWarnings[warning] ?? warning}</li>)}</ul>}
+    </>}
+    <p className="hint">Resultados experimentales, no calibrados ni clínicos; no identifican vacas únicas ni confirman visibilidad o elegibilidad. BCS utiliza solo la imagen original completa cuando está disponible; no se sustituyen recortes ni máscaras.</p>
+  </section>;
+}
+
+function PassageCard({ jobId, passage }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const candidate = passage.candidate, original = candidate?.best_original_url;
+  const bcs = passage.bcs;
+  const evaluated = bcs?.status === "evaluated" && bcs.bcs_category != null;
+  const frameDetails = [candidate.frame_index != null && `frame ${candidate.frame_index}`, candidate.timestamp_ms != null && `${(candidate.timestamp_ms / 1000).toFixed(2)} s`].filter(Boolean).join(" · ");
+  return <li className="passage-card">
+    {original && <p>Mejor frame seleccionado para este pasaje{frameDetails ? `: ${frameDetails}` : ""}</p>}
+    {original && !imageFailed ? <img key={`${jobId}-${passage.sequence}-${original}`} src={original} alt={`Imagen original del pasaje ${passage.sequence}`} loading="lazy" onError={() => setImageFailed(true)} /> : <p role="status">Imagen original no disponible.</p>}
+    <div><strong>Pasaje {passage.sequence}</strong><p>{(passage.start_timestamp_ms / 1000).toFixed(2)}–{(passage.end_timestamp_ms / 1000).toFixed(2)} s · Trayectoria {passage.track_id} (solo este video)</p>
+      {evaluated ? <p>Categoría BCS experimental: {bcs.bcs_category} / 5. No validada clínicamente.</p>
+        : <p role="status">No evaluado{bcs?.reason ? `: ${passageReasons[bcs.reason] ?? bcs.reason}` : bcs?.status === "unevaluable" ? ": el resultado no fue evaluable." : ": no hay resultado BCS para este pasaje."}</p>}
+      {passage.warnings?.length > 0 && <ul className="passage-warnings">{passage.warnings.map((warning) => <li key={warning}>{passageWarnings[warning] ?? warning}</li>)}</ul>}
+    </div>
+  </li>;
 }
 
 function CandidateBCS({ job }) {

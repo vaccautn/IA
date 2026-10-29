@@ -9,12 +9,14 @@ PostgreSQL, R2, frontend, cámara, conexión a Internet durante la inferencia ni
 
 La primera entrega se creó en `feature/deteccion-video` desde `develop` en un
 worktree separado. El checkout actual es `IA`. La base original usada es
-`2024ec951c3d54995d6c3147773066b517232199`. Los contratos y el código de `/detect`
-y `/bcs` conservan sus contratos públicos. No hay tracking ni identificación
-individual: el número indica **vacas visibles en un frame**, no animales únicos.
+`2024ec951c3d54995d6c3147773066b517232199`. Los contratos públicos de `/detect`
+y `/bcs` se conservan. La primera entrega no tenía tracking; el checkout actual
+sí ofrece trayectorias temporales, pero no identificación bovina: el número de
+detecciones sigue indicando **vacas detectadas en un frame**, no animales únicos.
 El CLI/escritorio selecciona y conserva un candidato original, pero no calcula
-BCS. Solo la [web local](video-web.md#candidato-y-categoría-bcs-experimental)
-intenta una categoría BCS experimental después de completar la detección.
+BCS. La [web local](video-web.md#candidato-y-categoría-bcs-experimental) puede
+evaluar tanto el candidato global como, después del tracking exitoso, las imágenes
+originales disponibles por pasaje; ambos resultados son experimentales.
 
 ## Por qué esta opción
 

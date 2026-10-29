@@ -30,11 +30,14 @@ $archive = Join-Path $HOME "Downloads\vacca-bcs-category-coral-2026-09-04-experi
 El detector de Fase 1 carga únicamente el artefacto versionado
 `models/deploy/vacca-yolo26n-v1.pt`; no es necesario descargar un peso local ignorado.
 El paquete BCS instalado en `models/private/` se verifica y permanece `not_loaded`
-hasta la primera solicitud elegible de evaluación: por `/bcs` o por un video web nuevo completado
-con un candidato de exactamente una detección de vaca. La carga es diferida y comparte
-el mismo runtime; `/ready/bcs` puede cambiar después del video sin una solicitud directa a `/bcs`.
-No todo video solicita BCS: sin candidato elegible, con un trabajo fallido o con capacidad
-ocupada/no disponible puede no evaluarse. Consulte el [flujo de video y BCS](video-web.md#candidato-y-categoría-bcs-experimental).
+hasta la primera operación elegible: `POST /bcs`, el intento web opcional sobre el
+candidato de una sola detección, o la evaluación secuencial de imágenes originales
+disponibles por pasaje después de un tracking exitoso. La ruta de pasajes no depende
+de que exista el candidato de una sola detección. Ambos flujos web comparten el runtime
+y la compuerta BCS; `/ready/bcs` puede cambiar sin una solicitud directa a `/bcs`.
+No todo video inicia una evaluación: puede no haber candidato ni pasajes disponibles,
+fallar el trabajo/tracking o no estar disponible la capacidad. Consulte el
+[flujo de video y BCS](video-web.md#candidato-y-categoría-bcs-experimental).
 Sin instalación, `/ready/bcs` devuelve
 `not_installed`; un paquete alterado devuelve `unavailable`. La consulta de estado valida
 manifiesto, tarjeta, avisos, existencia, tamaño y digest sin deserializar ni construir el

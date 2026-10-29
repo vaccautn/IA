@@ -12,6 +12,7 @@ export function useVideoAnalysis() {
   if (!listRequests.current) listRequests.current = createRequestOwner();
   if (!uploadRequests.current) uploadRequests.current = createRequestOwner();
   const [tracks, setTracks] = useState(null);
+  const [passageState, setPassageState] = useState(null), [passageRetry, setPassageRetry] = useState(0);
   const job = jobs.find((item) => item.id === selected);
   const count = job?.frames_analyzed ?? 0;
   const jobStatus = job?.status;
@@ -38,6 +39,28 @@ export function useVideoAnalysis() {
       requests.cancel();
     };
   }, [selected, jobStatus]);
+
+  useEffect(() => {
+    const requests = createRequestOwner();
+    let timer;
+    if (!selected) return () => requests.cancel();
+    setPassageState({ jobId: selected, loading: true, data: null, error: "" });
+    function load() {
+      requests.run(
+        (signal) => videoApi.passages(selected, signal),
+        (data) => {
+          setPassageState({ jobId: selected, loading: false, data, error: "" });
+          if (data.status === "pending") timer = setTimeout(load, TRACKS_POLL_INTERVAL_MS);
+        },
+        (error) => setPassageState({ jobId: selected, loading: false, data: null, error: error.message })
+      );
+    }
+    load();
+    return () => {
+      clearTimeout(timer);
+      requests.cancel();
+    };
+  }, [selected, passageRetry]);
 
   useEffect(() => {
     const stop = startPolling(() => listRequests.current.run(
@@ -105,6 +128,9 @@ export function useVideoAnalysis() {
       }
     );
   }
+  const currentPassages = passageState?.jobId === selected ? passageState : null;
   return { jobs, selected, file, busy, error, frame, index, playing, input, job, count, tracks,
+    passages: currentPassages?.data ?? null, passagesLoading: !currentPassages || currentPassages.loading,
+    passagesError: currentPassages?.error ?? "", retryPassages: () => setPassageRetry((value) => value + 1),
     setError, setIndex, setPlaying, choose, chooseFile, upload };
 }

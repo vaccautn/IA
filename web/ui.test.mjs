@@ -36,6 +36,12 @@ const tracks = (id) => ({
   schema_version: "vacca-video-tracks-v1", status: "completed", stop_reason: "end_of_video",
   tracks: [{ ...track(id, 1, "candidate"), best_masked_url: `/api/v1/analyses/${id}/tracks/1/best-masked` }, { ...track(id, 7, "review", ["long_gap_review_required", "other_detection_in_crop_at_best_frame"]), possible_continuation_of: 1 }]
 });
+const passage = (id, sequence, { original = true, bcs = { status: "evaluated", bcs_category: sequence, reason: null, input_representation: "original_only", model_status: "experimental_not_approved" }, warnings = [] } = {}) => ({
+  sequence, track_id: sequence + 10, status: "passage_evidence_candidate", start_frame: sequence, end_frame: sequence + 2,
+  start_timestamp_ms: sequence * 1000, end_timestamp_ms: (sequence + 2) * 1000, end_exclusive: true,
+  transition_method: "initial_confidence", candidate: { status: original ? "available" : "not_available", bcs_eligibility: "not_assessed", bcs_status: "not_evaluated", ...(original ? { frame_index: sequence * 10, timestamp_ms: sequence * 1000 } : {}), best_original_url: original ? `/api/v1/analyses/${id}/passages/${sequence}/best-original` : null }, warnings, bcs
+});
+const passageList = (id, passages = []) => ({ schema_version: "vacca-video-passages-v1", status: "completed", bcs_status: "completed", evidence_status: "provisional_evidence_not_unique_animal_identity", identity_semantics: "temporal_track_id_within_video", calibration: "uncalibrated_confidence_proxy_not_visibility_or_bcs", passages, unresolved_count: 1, unresolved_tracks: [{ track_id: 91, first_frame: 2, last_frame: 4, first_timestamp_ms: 200, last_timestamp_ms: 400, possible_continuation_of: null, possible_continued_by: null, status: "unresolved_passage_attribution" }], warnings: ["untracked_detection_attribution_unresolved"] });
 
 function deferred() {
   let resolve;
@@ -95,7 +101,7 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
   async function fixture(t) {
     const page = await browser.newPage();
     page.setDefaultTimeout(5000);
-    const errors = [], calls = { history: 0, upload: 0, frames: 0 };
+    const errors = [], calls = { history: 0, upload: 0, frames: 0, passages: 0 };
     page.on("pageerror", (error) => errors.push(error.message));
     t.after(async () => {
       await page.close();
@@ -110,9 +116,9 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
       const timeout = window.setTimeout, interval = window.setInterval;
       const clearTimeout = window.clearTimeout, clearInterval = window.clearInterval;
       window.setTimeout = (callback, delay, ...args) => {
-        if (delay !== 2000) return timeout(callback, delay, ...args);
+        if (delay !== 2000 && delay !== 3000) return timeout(callback, delay, ...args);
         const id = next--;
-        timers.set(id, { callback: () => callback(...args), repeat: false });
+        timers.set(id, { callback: () => callback(...args), repeat: false, delay });
         return id;
       };
       window.setInterval = (callback, delay, ...args) => {
@@ -124,12 +130,13 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
       window.clearTimeout = (id) => { timers.delete(id); clearTimeout(id); };
       window.clearInterval = (id) => { timers.delete(id); clearInterval(id); };
       window.timerCounts = () => ({
-        poll: [...timers.values()].filter((timer) => !timer.repeat).length,
+        poll: [...timers.values()].filter((timer) => timer.delay === 2000).length,
+        passage: [...timers.values()].filter((timer) => timer.delay === 3000).length,
         playback: [...timers.values()].filter((timer) => timer.repeat).length
       });
-      window.advanceVideoTimers = (repeat) => {
+      window.advanceVideoTimers = (repeat, delay) => {
         for (const [id, timer] of [...timers]) {
-          if (timer.repeat !== repeat) continue;
+          if (timer.repeat !== repeat || (delay && timer.delay !== delay)) continue;
           if (!repeat) timers.delete(id);
           timer.callback();
         }
@@ -147,7 +154,8 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
       history: () => reply([job("a"), job("b")]),
       upload: () => reply(job("created", 0), 202),
       frames: (id, index) => reply(frame(id, index)),
-      tracks: (id) => reply(tracks(id))
+      tracks: (id) => reply(tracks(id)),
+      passages: () => reply(passageList("a")), passageImageFails: false
     };
     await page.route("**/api/v1/**", async (route) => {
       const request = route.request(), endpoint = new URL(request.url());
@@ -170,8 +178,14 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
         const result = await mock.tracks(endpoint.pathname.split("/")[4]);
         return route.fulfill({ status: result.status, contentType: "application/json", body: JSON.stringify(result.body) });
       }
+      if (endpoint.pathname.endsWith("/passages")) {
+        calls.passages++;
+        const result = await mock.passages(endpoint.pathname.split("/")[4]);
+        return route.fulfill({ status: result.status, contentType: "application/json", body: JSON.stringify(result.body) });
+      }
       if (/\/frames\/\d+\/image$/.test(endpoint.pathname) || endpoint.pathname.endsWith("/candidate/image")
-        || /\/tracks\/\d+\/(best-crop|best-original|best-masked)$/.test(endpoint.pathname)) {
+        || /\/(tracks\/\d+\/(best-crop|best-original|best-masked)|passages\/\d+\/best-original)$/.test(endpoint.pathname)) {
+        if (endpoint.pathname.includes("/passages/") && mock.passageImageFails) return route.fulfill({ status: 404 });
         return route.fulfill({ contentType: "image/svg+xml", body: svg });
       }
       let result;
@@ -423,6 +437,186 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     await page.locator('.viewer img[src="/api/v1/analyses/b/frames/0/image"]').waitFor();
   });
 
+  await t.test("passage gallery preserves endpoint order, originals, evaluated-only categories and attribution warnings", async (t) => {
+    const { page, mock } = await fixture(t);
+    mock.passages = (id) => reply({ ...passageList(id, [
+      passage(id, 2, { warnings: ["unknown <warning>"] }),
+      passage(id, 1, { bcs: { status: "unevaluable", bcs_category: null, reason: "image_rejected", input_representation: "original_only" } }),
+      passage(id, 3, { original: false, bcs: null })
+    ]), bcs_status: "unavailable", bcs_reason: "passage_bcs_unreadable", warnings: ["unknown <endpoint>"] });
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    await page.getByRole("region", { name: "Pasajes del video" }).waitFor();
+    const gallery = page.getByRole("region", { name: "Pasajes del video" });
+    const cards = gallery.locator(".passage-card");
+    assert.equal(await cards.count(), 3);
+    assert.match(await cards.nth(0).textContent(), /Pasaje 2.*Categoría BCS experimental: 2/);
+    assert.equal(await cards.nth(0).locator("img").getAttribute("src"), "/api/v1/analyses/a/passages/2/best-original");
+    assert.match(await cards.nth(1).textContent(), /Pasaje 1.*No evaluado.*rechazó.*imagen/i);
+    assert.equal(await cards.nth(1).getByText(/Categoría BCS experimental:/).count(), 0);
+    assert.match(await cards.nth(2).textContent(), /Imagen original no disponible.*No evaluado/);
+    assert.equal(await cards.nth(2).locator("img").count(), 0);
+    assert.match(await gallery.textContent(), /BCS por pasaje no está disponible/);
+    assert.match(await gallery.textContent(), /1 atribución sin resolver.*91/);
+    assert.ok((await gallery.textContent()).includes("unknown <warning>") && (await gallery.textContent()).includes("unknown <endpoint>"));
+    assert.equal(await page.locator("warning").count(), 0, "Unknown markup remains text, not elements");
+    assert.match(await gallery.textContent(), /provisional.*no tienen alcance|provisional.*solo tienen alcance/i);
+    assert.match(await gallery.textContent(), /no identifican vacas únicas/i);
+    assert.equal(await page.getByRole("region", { name: "BCS del frame seleccionado" }).count(), 0);
+    assert.equal(await page.getByRole("region", { name: "Trayectorias por vaca" }).locator(".track").count(), 2);
+    mock.passageImageFails = true;
+    mock.passages = (id) => reply(passageList(id, [passage(id, 7)]));
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    const failedImage = page.getByRole("region", { name: "Pasajes del video" }).locator(".passage-card").filter({ hasText: "Pasaje 7" });
+    await failedImage.getByText("Imagen original no disponible.").waitFor();
+    assert.equal(await failedImage.locator("img").count(), 0, "A failed original renders text, not substitute media");
+  });
+
+  await t.test("completed empty passages retain unresolved attribution and endpoint warnings", async (t) => {
+    const { page, mock } = await fixture(t);
+    mock.passages = (id) => reply({ ...passageList(id), passages: [], bcs_status: "completed", warnings: ["untracked_detection_attribution_unresolved", "unknown <endpoint>"] });
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    const gallery = page.getByRole("region", { name: "Pasajes del video" });
+    await gallery.getByText(/No hay pasajes disponibles/).waitFor();
+    assert.match(await gallery.textContent(), /1 atribución sin resolver.*trayectoria 91/);
+    assert.match(await gallery.textContent(), /detecciones cuya atribución a un pasaje no se resolvió/);
+    assert.ok((await gallery.textContent()).includes("unknown <endpoint>"));
+    assert.equal(await gallery.getByText("Pasadas detectadas: 0", { exact: true }).count(), 1);
+    assert.equal(await gallery.locator(".passage-card").count(), 0, "The empty state has an explicit empty-response setup");
+  });
+
+  await t.test("non-empty passage gallery remains distinct beside global candidate BCS", async (t) => {
+    const { page, mock, flush } = await fixture(t);
+    const candidate = { frame_index: 17, timestamp_ms: 1200, detector_confidence: 0.9 };
+    mock.history = () => reply([{ ...job("a"), summary: { candidate, bcs: { status: "completed", bcs_category: 4, model_status: "experimental_not_approved", package_id: "fixture", reason: null } } }, job("b")]);
+    mock.passages = (id) => reply(passageList(id, [passage(id, 4)]));
+    const settled = await page.evaluate(() => window.apiSettled);
+    await page.evaluate(() => window.advanceVideoTimers(false, 2000));
+    await flush(settled + 1);
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    const gallery = page.getByRole("region", { name: "Pasajes del video" });
+    await gallery.getByText("Pasaje 4").waitFor();
+    await page.getByRole("region", { name: "BCS del frame seleccionado" }).getByText("Categoría experimental BCS: 4 / 5", { exact: true }).waitFor();
+    assert.match(await gallery.textContent(), /provisional/);
+    assert.match(await gallery.textContent(), /no identifican vacas únicas/i);
+    assert.equal(await page.getByRole("region", { name: "Trayectorias por vaca" }).locator(".track").count(), 2);
+  });
+
+  await t.test("completed passage count excludes unresolved tracks and labels each supplied best frame with its BCS", async (t) => {
+    const { page, mock } = await fixture(t);
+    mock.passages = (id) => reply(passageList(id, [
+      passage(id, 2),
+      passage(id, 1, { bcs: { status: "unevaluable", bcs_category: null, reason: "image_rejected", input_representation: "original_only" } })
+    ]));
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    const gallery = page.getByRole("region", { name: "Pasajes del video" });
+    await gallery.getByText("Pasadas detectadas: 2", { exact: true }).waitFor();
+    const cards = gallery.locator(".passage-card");
+    assert.equal(await cards.count(), 2);
+    assert.match(await cards.nth(0).textContent(), /Mejor frame seleccionado para este pasaje: frame 20 · 2\.00 s/);
+    assert.match(await cards.nth(0).textContent(), /Categoría BCS experimental: 2 \/ 5/);
+    assert.match(await cards.nth(1).textContent(), /Mejor frame seleccionado para este pasaje: frame 10 · 1\.00 s/);
+    assert.match(await cards.nth(1).textContent(), /No evaluado: El servicio rechazó la imagen original/);
+    assert.equal(await cards.nth(1).getByText(/Categoría BCS experimental:/).count(), 0);
+    assert.match(await gallery.textContent(), /no calibrados ni clínicos/);
+  });
+
+  await t.test("pending and unavailable passage states keep count unknown and escape unknown reasons", async (t) => {
+    const { page, mock } = await fixture(t);
+    for (const [status, reason] of [["disabled", "unknown <reason>"], ["unavailable", "unknown <unavailable>"]]) {
+      mock.passages = () => reply({ status, reason, passages: [], bcs_status: "not_evaluated" });
+      await page.getByRole("button", { name: /b\.mp4/ }).click();
+      await page.getByRole("button", { name: /a\.mp4/ }).click();
+      const gallery = page.getByRole("region", { name: "Pasajes del video" });
+      await page.waitForFunction((value) => document.querySelector(".passages")?.textContent.includes(value), reason);
+      assert.equal(await gallery.getByText(/Pasadas detectadas:/).count(), 0, `${status} count stays unknown`);
+      assert.equal(await page.locator("reason, unavailable").count(), 0, "Unknown reasons remain text, not markup");
+    }
+  });
+
+  await t.test("passage endpoint errors are not empty success, retry works and empty completion is explicit", async (t) => {
+    const { page, mock } = await fixture(t);
+    mock.passages = (id) => reply({ status: "failed", reason: "video_not_completed", passages: [], bcs_status: "not_evaluated" });
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await page.getByRole("region", { name: "Pasajes del video" }).getByText(/El endpoint informó.*video no se completó/i).waitFor();
+    assert.equal(await page.getByRole("region", { name: "Pasajes del video" }).getByText(/Pasadas detectadas:/).count(), 0);
+    mock.passages = (id) => reply(passageList(id));
+    await page.getByRole("region", { name: "Pasajes del video" }).getByRole("button", { name: "Reintentar" }).click();
+    await page.getByRole("region", { name: "Pasajes del video" }).getByText(/No hay pasajes disponibles/).waitFor();
+  });
+
+  await t.test("pending passage refresh ignores job completion, discards stale selections, retries and stops on unmount", async (t) => {
+    const { page, mock, flush, calls } = await fixture(t);
+    const oldA = deferred(), oldAStarted = deferred();
+    let aRequests = 0;
+    mock.passages = (id) => id === "a" && ++aRequests === 1 ? (oldAStarted.resolve(), oldA.promise) : reply(passageList(id, [passage(id, id === "a" ? 7 : 8)]));
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await page.getByRole("region", { name: "Pasajes del video" }).getByText("Pasaje 8").waitFor();
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    await oldAStarted.promise;
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    const returnedToA = page.getByRole("region", { name: "Pasajes del video" });
+    await returnedToA.getByText("Pasaje 7").waitFor();
+    const beforeOldA = await page.evaluate(() => window.apiSettled);
+    oldA.resolve(reply(passageList("a", [passage("a", 99)])));
+    await flush(beforeOldA + 1);
+    assert.equal(await returnedToA.getByText("Pasaje 99").count(), 0, "A→B→A ignores the first A request");
+    const pending = deferred(), started = deferred();
+    mock.passages = (id) => id === "b" ? (started.resolve(), pending.promise) : reply(passageList(id, [passage(id, 8)]));
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await started.promise;
+    assert.equal(await page.getByRole("region", { name: "Pasajes del video" }).getByText(/Pasadas detectadas:/).count(), 0, "Loading count is unknown");
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    const gallery = page.getByRole("region", { name: "Pasajes del video" });
+    await gallery.getByText("Pasaje 8").waitFor();
+    const settled = await page.evaluate(() => window.apiSettled);
+    pending.resolve(reply(passageList("b", [passage("b", 99)])));
+    await flush(settled + 1);
+    assert.equal(await gallery.getByText("Pasaje 99").count(), 0);
+    const lateError = deferred(), errorStarted = deferred();
+    mock.passages = (id) => id === "b" ? (errorStarted.resolve(), lateError.promise) : reply(passageList(id, [passage(id, 8)]));
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await errorStarted.promise;
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    await gallery.getByText("Pasaje 8").waitFor();
+    const beforeLateError = await page.evaluate(() => window.apiSettled);
+    lateError.resolve(reply({ detail: "Falla obsoleta" }, 500));
+    await flush(beforeLateError + 1);
+    assert.equal(await page.getByRole("alert").count(), 0, "Stale errors stay out of the selected analysis UI");
+    const beforePending = calls.passages;
+    mock.passages = (id) => reply({ status: "pending", passages: [], bcs_status: "not_evaluated" });
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await gallery.getByText(/Actualizando pasajes/).waitFor();
+    assert.equal(await gallery.getByText(/Pasadas detectadas:/).count(), 0, "Pending count is unknown");
+    assert.equal(calls.passages, beforePending + 1, "The selected completed job triggers its first independent passage request");
+    assert.equal(await page.evaluate(() => window.timerCounts().passage), 1, "Pending response schedules one passage refresh");
+    mock.passages = (id) => reply(passageList(id, [passage(id, 4)]));
+    await page.evaluate(() => window.advanceVideoTimers(false, 3000));
+    await gallery.getByText("Pasaje 4").waitFor();
+    assert.equal(calls.passages, beforePending + 2, "Only one pending refresh ran before terminal settlement");
+    assert.equal(await page.evaluate(() => window.timerCounts().passage), 0, "Terminal response stops passage polling");
+    mock.passages = () => reply({ detail: "Falla simulada" }, 500);
+    await page.getByRole("button", { name: /a\.mp4/ }).click();
+    await gallery.getByRole("button", { name: "Reintentar" }).waitFor();
+    assert.equal(await gallery.getByText(/Pasadas detectadas:/).count(), 0, "Request-error count is unknown");
+    mock.passages = (id) => reply(passageList(id));
+    await gallery.getByRole("button", { name: "Reintentar" }).click();
+    await gallery.getByText(/No hay pasajes disponibles/).waitFor();
+    mock.passages = (id) => reply({ status: "pending", passages: [], bcs_status: "not_evaluated" });
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await gallery.getByText(/Actualizando pasajes/).waitFor();
+    assert.equal(await page.evaluate(() => window.timerCounts().passage), 1, "A pending selected passage request owns a scheduled refresh");
+    const requestsBeforeUnmount = calls.passages;
+    await page.evaluate(() => window.unmountVideo());
+    assert.equal(await page.evaluate(() => window.timerCounts().passage), 0, "Unmount clears the scheduled passage timeout");
+    await page.evaluate(() => window.advanceVideoTimers(false, 3000));
+    assert.equal(calls.passages, requestsBeforeUnmount, "Unmount prevents the scheduled refresh request");
+  });
+
   await t.test("pending tracks show detections first and refresh until tracking finishes", async (t) => {
     const { page, mock, calls } = await fixture(t);
     await page.getByRole("region", { name: "Trayectorias por vaca" }).getByText("2 trayectorias · 1 para revisión").waitFor();
@@ -434,6 +628,7 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
     const gallery = page.getByRole("region", { name: "Trayectorias por vaca" });
     await gallery.getByText(/Calculando trayectorias/).waitFor();
     await page.locator('.viewer img[src="/api/v1/analyses/b/frames/0/image"]').waitFor();
+    await page.evaluate(() => window.advanceVideoTimers(false, 3000));
     await gallery.getByText("2 trayectorias · 1 para revisión").waitFor({ timeout: 6000 });
     assert.equal(answered, 2);
     assert.equal(await page.evaluate(() => window.timerCounts().poll), 1, "Track refresh never uses the history poll timer");
@@ -442,33 +637,37 @@ test("real video hook and rendered interactions with simulated API", { timeout: 
 
   await t.test("React unmount stops timers and ignores in-flight history/frame/upload results", async (t) => {
     const { page, mock, calls, flush, selectFile } = await fixture(t);
-    const pending = [deferred(), deferred(), deferred()];
-    const started = [deferred(), deferred(), deferred()];
+    const pending = [deferred(), deferred(), deferred(), deferred()];
+    const started = [deferred(), deferred(), deferred(), deferred()];
     mock.history = () => { started[0].resolve(); return pending[0].promise; };
     mock.frames = () => { started[1].resolve(); return pending[1].promise; };
     mock.upload = () => { started[2].resolve(); return pending[2].promise; };
+    mock.passages = () => { started[3].resolve(); return pending[3].promise; };
     await page.getByRole("button", { name: "Reproducir frames" }).click();
     await page.waitForFunction(() => window.timerCounts().playback === 1);
     await page.evaluate(() => window.advanceVideoTimers(false));
     await page.getByRole("slider").fill("1");
     await selectFile();
     await page.getByRole("button", { name: "Procesar video" }).click();
-    await Promise.all(started.map((item) => item.promise));
+    await Promise.all(started.slice(0, 3).map((item) => item.promise));
     // Seeking paused the earlier playback; start it again to verify unmount
     // clears an active interval as well as the in-flight polling cycle.
     await page.getByRole("button", { name: "Reproducir frames" }).click();
     await page.waitForFunction(() => window.timerCounts().playback === 1);
     const settled = await page.evaluate(() => window.apiSettled);
+    await page.getByRole("button", { name: /b\.mp4/ }).click();
+    await started[3].promise;
     const before = { ...calls };
     await page.evaluate(() => window.unmountVideo());
-    assert.deepEqual(await page.evaluate(() => window.timerCounts()), { poll: 0, playback: 0 });
+    assert.deepEqual(await page.evaluate(() => window.timerCounts()), { poll: 0, passage: 0, playback: 0 });
     pending[0].resolve(reply([job("stale")]));
     pending[1].resolve(reply(frame("a", 1)));
     pending[2].resolve(reply(job("late-upload", 0), 202));
-    await flush(settled + 3);
+    pending[3].resolve(reply(passageList("a", [passage("a", 99)])));
+    await flush(settled + 4);
     await page.evaluate(() => { window.advanceVideoTimers(false); window.advanceVideoTimers(true); });
     assert.deepEqual(calls, before);
-    assert.deepEqual(await page.evaluate(() => window.timerCounts()), { poll: 0, playback: 0 });
+    assert.deepEqual(await page.evaluate(() => window.timerCounts()), { poll: 0, passage: 0, playback: 0 });
     assert.equal(await page.locator("#root").textContent(), "");
   });
 });

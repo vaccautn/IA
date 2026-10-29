@@ -35,6 +35,15 @@ determinista; ese proveedor de prueba no es el runtime de la aplicación.
 3. Leer el resultado o la explicación de por qué no pudo evaluarse. No se realiza
    un reintento automático.
 
+Este resultado corresponde al candidato global del resumen: una muestra de una
+sola detección. Es un camino BCS opcional, no el único del video. Tras un tracking
+exitoso, la API también evalúa secuencialmente cada pasaje que tenga una imagen
+original disponible; ese camino no necesita que el candidato global exista. Los
+resultados por pasaje se consultan en
+[`GET /api/v1/analyses/{id}/passages`](#experimental-per-passage-bcs). Ambos caminos
+comparten runtime y compuerta BCS; la primera operación que llegue al runtime puede
+desencadenar la carga diferida del paquete.
+
 La selección compara solo los frames analizados (hasta 300 a 5 FPS), no todos
 los frames del video. Descarta cero o varias detecciones; un empate de confianza
 conserva el primer frame decodificado elegible. No usa las trayectorias ni
@@ -48,11 +57,12 @@ de vistas previas (120 en CLI/escritorio). Si excede los límites BCS existentes
 inválida; no se transforma para forzar su aceptación.
 
 Tras finalizar el CLI por `frame_limit` o `end_of_source`, el worker solicita una
-evaluación al loop de la API principal. Reutiliza su runtime BCS y el **mismo
-gate de capacidad 1 que `/bcs`**, sin un tercer modelo ni solicitudes HTTP al
-propio servicio. La adquisición tiene el límite existente de 0,1 segundos;
-la espera del worker para BCS tiene un máximo de 60 segundos adicional al CLI.
-Si vence, se publica `not_evaluated/evaluation_timeout`, no una categoría tardía.
+evaluación del candidato global al loop de la API principal. Reutiliza su runtime
+BCS y el **mismo gate de capacidad 1 que `/bcs`**, sin un tercer modelo ni
+solicitudes HTTP al propio servicio. La adquisición tiene el límite existente de
+0,1 segundos; la espera del worker para esta evaluación tiene un máximo de 60
+segundos adicional al CLI. Si vence, se publica `not_evaluated/evaluation_timeout`,
+no una categoría tardía.
 Cancelar la espera o cerrar el servicio no cancela una operación nativa ya
 iniciada ni libera su permiso antes de que termine. El cierre no espera
 indefinidamente esa operación: puede finalizar después del ciclo de vida, con
@@ -78,9 +88,10 @@ relevantes de `summary.bcs` (no códigos HTTP del trabajo de video):
 | `failed` / `inference_failed` | Falló la inferencia opcional. |
 | `failed` / `metadata_write_failed` | No se confirmó la publicación del resultado; la API no afirma una categoría guardada. |
 
-Sin candidato se informa `not_evaluated/no_eligible_frame`. Trabajos antiguos sin estos campos
-siguen siendo legibles y no se evalúan retroactivamente. Videos fallidos o
-interrumpidos no exponen BCS como completado.
+Sin candidato global, `summary.bcs` informa `not_evaluated/no_eligible_frame`; aun así,
+el flujo de pasajes puede evaluar por separado sus originales disponibles tras un
+tracking exitoso. Trabajos antiguos sin estos campos siguen siendo legibles y no se
+evalúan retroactivamente. Videos fallidos o interrumpidos no exponen BCS como completado.
 
 El resumen incluye procedencia del detector, caja en coordenadas originales,
 timestamp/fuente e índice decodificado; `sample_ordinal` es base cero y no es
@@ -239,6 +250,15 @@ While the job is `pending` or `processing`, no passages, categories or files are
 exposed. There is no raw sidecar route. Job completion follows all configured
 stages, including sequential passage evaluation on the same parent BCS runtime/gate.
 
+En la web local, seleccioná un análisis completado y revisá **Pasajes del video**:
+las tarjetas conservan el orden de la API, muestran la imagen original disponible y
+solo presentan categoría cuando el resultado indica `evaluated`. Un motivo visible
+explica los casos sin evaluación. Estos resultados son provisionales, no clínicos y
+no identifican vacas únicas; las trayectorias siguen en su sección independiente.
+La web muestra el total solo cuando la respuesta se completa y etiqueta la imagen de
+cada tarjeta como su mejor frame seleccionado, junto con el BCS experimental o su
+motivo de no evaluación. No es el candidato global ni un recorte de trayectoria.
+
 | Método/ruta | Contrato |
 | --- | --- |
 | POST /api/v1/analyses?filename=nombre.mp4 | Body binario MP4 o MOV de QuickTime (`.mov`, grabaciones de celular), no multipart; devuelve 202 y trabajo persistido |
@@ -290,7 +310,15 @@ El nombre recibido es solo una etiqueta; las rutas se generan desde UUIDs.
 
 - MP4 de hasta 50 MiB, tres trabajos activos como máximo y uno procesándose.
 - Muestreo a 5 FPS, hasta 300 frames (aproximadamente 60 segundos de contenido).
-- Tiempo de ejecución máximo de 10 minutos por trabajo.
+- Límites de espera por etapa, no un máximo global ni un SLA de extremo a extremo:
+  - El subproceso de detección tiene un presupuesto de polling de hasta 10 minutos.
+  - El subproceso opcional de tracking tiene otro presupuesto independiente de hasta 10 minutos.
+  - La espera del BCS del candidato global es de hasta 60 segundos.
+  - Los BCS de pasajes disponibles se ejecutan secuencialmente, con hasta 60 segundos
+    de espera por imagen original elegible; no hay un presupuesto agregado para todos
+    los pasajes.
+  Estos tiempos se suman a las etapas que se ejecuten. Un timeout limita la espera
+  del worker, pero no garantiza cancelar una operación nativa de inferencia ya iniciada.
 - El resultado indica cuando se alcanzó el límite de frames; no afirma haber
   analizado el video completo en ese caso.
 - Se guardan JPEGs y JSONL; no se genera otro MP4 en el flujo web. Evita depender
@@ -447,9 +475,12 @@ ausencia de bloqueo global de imagen/BCS. No cargan pesos ni procesan videos rea
 
 Después de la detección muestreada (y del BCS opcional), el worker ejecuta
 `scripts/track_video.py` en otro subproceso sobre el mismo `input.mp4`:
-ByteTrack, todos los frames (`--sample-fps 0`), hasta los primeros 60 segundos
-(la misma ventana que cubren 300 muestras a 5 FPS) y clips WebM VP8, porque los
-navegadores no reproducen `mp4v`. El paso tiene su propio límite de 10 minutos.
+ByteTrack, todos los frames (`--sample-fps 0`), hasta 60 segundos o 1200 frames,
+lo que ocurra primero, y clips WebM VP8, porque los navegadores no reproducen
+`mp4v`. A 30 FPS, el límite de 1200 frames puede detener el tracking cerca de
+40 segundos, antes del límite nominal de 60 segundos usado para las 300 muestras
+de detección a 5 FPS. El subproceso tiene su propio presupuesto de hasta 10
+minutos, independiente del presupuesto de detección.
 
 El trabajo permanece `processing` hasta que se asienta el estado terminal del
 tracking configurado. Mientras tanto, `/tracks` y `/passages` responden `pending`

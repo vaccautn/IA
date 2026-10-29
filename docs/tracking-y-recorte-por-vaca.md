@@ -49,12 +49,19 @@ Si falta `lap`, el comando falla sin dejar que Ultralytics lo instale.
 
 ## Galería web
 
-Cada análisis web completado ejecuta este mismo comando con ByteTrack, clips
-WebM, un límite de 60 segundos y 1200 frames, y la silueta si
-`models/segmentation/mobile_sam.pt` existe. La galería muestra la silueta (o el
-mejor recorte), el estado
-(`Candidata` o `Revisar`), las advertencias, el clip y el frame original de cada
-trayectoria. El contrato HTTP está en [video-web.md](video-web.md).
+Cuando el tracking web está habilitado, cada análisis completado ejecuta este
+comando con ByteTrack, clips WebM,
+`--max-seconds 60` y `--max-frames 1200`, y solicita silueta si
+`models/segmentation/mobile_sam.pt` existe. La detección web analiza hasta 300
+muestras a 5 FPS (60 segundos nominales). El tracking lee cada frame denso y se
+detiene al alcanzar 60 segundos **o** 1200 frames, lo que ocurra primero; por
+ejemplo, a 30 FPS el límite de frames puede detenerlo cerca de 40 segundos. Por
+eso las ventanas efectivas de detección y tracking no necesariamente coinciden.
+La galería muestra silueta (o recorte),
+estado (`Candidata` o `Revisar`), advertencias, clip y frame original por
+trayectoria. La misma etapa escribe evidencia provisional de pasajes, que no
+equivale a identidad de animal. El contrato HTTP actual, incluidos `/tracks` y
+`/passages`, está en [video-web.md](video-web.md).
 
 ## Salida
 
@@ -134,8 +141,14 @@ y lo tapado por otra vaca no se reconstruye.
 ## Recortes para entrenar BCS
 
 El modelo BCS actual (`models/catalog/bcs-category-coral-2026-09-04`) se
-entrenó con imágenes completas y no pasó sus controles de aceptación. Para
-reentrenarlo con vistas desde atrás por animal:
+entrenó con imágenes completas y no pasó sus controles de aceptación. El flujo
+legado `export_bcs_crops.py` puede preparar recortes de tracks para un dataset
+etiquetado; no es la ruta de revisión de pasajes actual. Para exportar un paquete
+de revisión nuevo, vacío y sin ejecutar modelos, usar
+`scripts/export_passage_bcs_labels.py` según el camino rápido del
+[README](../README.md#offline-passage-label-review-validate-before-scoring).
+
+El flujo legado de recortes por track es:
 
 ```powershell
 # 1. Exportar las candidatas (una corrida por video) y una planilla vacía
@@ -151,11 +164,19 @@ python scripts/export_bcs_crops.py materialize outputs\bcs-labeling\lote-1\label
   (`image_kind`). `--include-review` agrega las trayectorias en revisión.
 - Nunca se asigna una categoría automáticamente; filas vacías se omiten y
   cualquier valor fuera de 1..5 cancela sin copiar nada.
-- Un mismo video no puede exportarse desde dos trackers (duplicaría animales).
-- `group` identifica al animal dentro del video (un fragmento vinculado hereda
-  el grupo de su trayectoria anterior). `groups.json` permite dividir
-  train/val/test por animal y no por imagen, para no filtrar el mismo animal
-  entre particiones.
+- La exportación rechaza dos corridas del mismo video (por hash cuando el archivo
+  está disponible, si no por la ruta registrada) para evitar duplicar sus
+  muestras al comparar trackers. Esto no convierte los tracks en identidades.
+- `group` es una clave heurística para particionar: combina el SHA-256 del video
+  (o el nombre de la corrida si no se puede leer el archivo) con el `track_id`;
+  si hay un `possible_continuation_of` enlazado, el
+  fragmento puede heredar el grupo anterior. Un ID temporal no verificado ni un
+  enlace heurístico prueban que dos tracks sean el mismo animal. Los tracks
+  distintos del mismo video pueden recibir grupos distintos, por lo que
+  `groups.json` no garantiza ausencia de fuga por animal **ni** mantiene junto
+  todo el video entre train/val/test. Para validar identidad o evitar fuga real
+  hacen falta IDs/etiquetas de animales revisados por humanos y una estrategia de
+  partición acorde a esa identidad.
 
 ## Validación del material actual
 
