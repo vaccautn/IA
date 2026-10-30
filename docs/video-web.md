@@ -267,6 +267,8 @@ motivo de no evaluación. No es el candidato global ni un recorte de trayectoria
 | POST /api/v1/analyses?filename=nombre.mp4 | Body binario MP4 o MOV de QuickTime (`.mov`, grabaciones de celular), no multipart; devuelve 202 y trabajo persistido |
 | GET /api/v1/analyses | Últimos 100 trabajos, más recientes primero |
 | GET /api/v1/analyses/{id} | Trabajo y resumen final si está disponible |
+| DELETE /api/v1/analyses/{id}/artifacts | Limpieza idempotente de los archivos temporales de un trabajo terminal; conserva su registro local |
+| POST /api/v1/analyses/{id}/retry | Reanuda un trabajo `failed` con su fuente retenida; conserva el mismo ID |
 | GET /api/v1/analyses/{id}/frames?offset=0&limit=30 | items y total; máximo 100 por página |
 | GET /api/v1/analyses/{id}/frames/{index}/image | JPEG anotado del frame seleccionado |
 | GET /api/v1/analyses/{id}/candidate/image | PNG original del candidato BCS, ruta fija local del trabajo; nunca una ruta recibida en el resumen |
@@ -278,6 +280,24 @@ motivo de no evaluación. No es el candidato global ni un recorte de trayectoria
 | GET /api/v1/analyses/{id}/tracks/{track_id}/best-original | JPEG del frame original completo elegido, sin anotaciones |
 | GET /api/v1/analyses/{id}/tracks/{track_id}/best-masked | PNG de la silueta (fondo gris plano); 404 si la máscara no fue aceptada |
 | GET /api/v1/analyses/{id}/tracks/{track_id}/best-mask | PNG de la máscara binaria alineada con best-crop |
+
+`POST /api/v1/analyses` acepta la cabecera opcional `Idempotency-Key` (UUID). Si se
+repite la misma clave con los mismos bytes, devuelve el mismo trabajo incluso si ya
+terminó o sus archivos se limpiaron; la clave con contenido distinto responde `409`.
+Los clientes anteriores pueden omitir la cabecera y conservan el comportamiento
+existente. El servicio guarda el digest en su SQLite como tombstone idempotente.
+
+La ruta de limpieza responde `204` si se eliminó el árbol de archivos del trabajo o
+si ya estaba vacío. Mientras el trabajo siga `pending` o `processing`, responde `409`.
+Solo borra archivos debajo del directorio privado del UUID del trabajo; mantiene en
+SQLite el estado terminal, el nombre y la identidad idempotente para que un replay no
+vuelva a crear ni procesar un trabajo.
+La limpieza y el reintento se serializan por trabajo durante la validación del estado y
+la operación de archivos. Si la limpieza gana, el tombstone permanece y el reintento
+responde `409`; si el reintento gana, la limpieza observa el nuevo estado activo y
+responde `409`. El reintento conserva `input.mp4`, elimina el directorio `result` parcial
+y el log anterior, y recién entonces confirma el estado `pending`; el worker regenera su
+directorio de salida al procesar el trabajo.
 
 Las imágenes se sirven como `image/jpeg` con sus mismos bytes; la opción
 `?download=true` agrega una disposición de descarga con nombre

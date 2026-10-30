@@ -3,13 +3,14 @@
 from contextlib import asynccontextmanager
 from ipaddress import ip_address
 import json
+import hashlib
 import shutil
 import subprocess as subprocess  # Compatibility for existing worker callers.
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 from typing import Literal
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 import tempfile
 import zipfile
@@ -55,6 +56,55 @@ SUMMARY_UNAVAILABLE_DETAIL = (
     "No se pudo leer el resumen guardado; las detecciones y el historial siguen disponibles."
 )
 _JOB_RESPONSE_LIST_ADAPTER = TypeAdapter(list[JobResponse])
+
+
+def _validated_idempotency_key(raw):
+    if raw is None:
+        return None
+    if type(raw) is not str:
+        raise HTTPException(422, "Idempotency-Key debe ser un UUID válido.")
+    try:
+        value = UUID(raw)
+    except (ValueError, AttributeError):
+        raise HTTPException(422, "Idempotency-Key debe ser un UUID válido.") from None
+    return str(value)
+
+
+def _job_directory_for_cleanup(store: Store, job_id: str):
+    try:
+        canonical_id = UUID(job_id).hex
+    except (ValueError, AttributeError):
+        raise HTTPException(404, "Análisis no encontrado") from None
+    if canonical_id != job_id:
+        raise HTTPException(404, "Análisis no encontrado")
+
+    root = store.directory.resolve()
+    directory = store.directory / canonical_id
+    if directory.is_symlink():
+        raise HTTPException(409, "No se puede limpiar una ruta de análisis insegura")
+    resolved = directory.resolve(strict=False)
+    if resolved.parent != root:
+        raise HTTPException(409, "No se puede limpiar una ruta de análisis insegura")
+    return directory
+
+
+def _input_digest(path, *, expected_size: int | None) -> str:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        header = stream.read(32)
+        if len(header) < 12 or b"ftyp" not in header:
+            raise HTTPException(409, "No se puede reintentar un archivo de video inválido.")
+        digest.update(header)
+        size += len(header)
+        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+            size += len(chunk)
+            if size > MAX_UPLOAD:
+                raise HTTPException(409, "El archivo retenido supera el límite de reintento.")
+            digest.update(chunk)
+    if expected_size is not None and size != expected_size:
+        raise HTTPException(409, "El archivo retenido cambió desde la admisión original.")
+    return digest.hexdigest()
 
 
 def _ensure_job_response_serializable(response):
@@ -386,46 +436,137 @@ def create_router():
     )
     async def upload(
         request: Request, filename: str = Query(min_length=1, max_length=200),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         store: Store = Depends(video_admission_store),
     ):
+        idempotency_key = _validated_idempotency_key(idempotency_key)
         if not filename.lower().endswith((".mp4", ".mov")):
             raise HTTPException(415, "Elegí un video MP4 o MOV.")
+        known = (
+            store.get_by_idempotency_key(idempotency_key)
+            if idempotency_key is not None
+            else None
+        )
         with store.connect() as conn:
             active = conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
             ).fetchone()[0]
-        if active >= WEB_MAX_ACTIVE_JOBS:
+        if active >= WEB_MAX_ACTIVE_JOBS and known is None:
             raise HTTPException(
                 429, "Hay tres videos en espera. Esperá a que terminen."
             )
-        if shutil.disk_usage(store.directory).free < MAX_UPLOAD + RESERVE:
+        if known is None and shutil.disk_usage(store.directory).free < MAX_UPLOAD + RESERVE:
             raise HTTPException(
                 507,
                 "No hay espacio suficiente. Liberá espacio antes de cargar otro video.",
             )
         job_id = uuid4().hex
-        directory = store.directory / job_id
-        directory.mkdir()
-        target = directory / "input.mp4"
+        directory = store.directory / job_id if known is None else None
+        target = directory / "input.mp4" if directory is not None else None
+        if directory is not None:
+            directory.mkdir()
         size = 0
+        source_digest = hashlib.sha256()
+        header = bytearray()
         try:
-            with target.open("xb") as stream:
+            stream_context = target.open("xb") if target is not None else None
+            try:
                 async for chunk in request.stream():
                     size += len(chunk)
                     if size > MAX_UPLOAD:
                         raise HTTPException(413, "El límite por video es 50 MB.")
-                    stream.write(chunk)
-            with target.open("rb") as stream:
-                header = stream.read(32)
+                    if len(header) < 32:
+                        header.extend(chunk[: 32 - len(header)])
+                    source_digest.update(chunk)
+                    if stream_context is not None:
+                        stream_context.write(chunk)
+            finally:
+                if stream_context is not None:
+                    stream_context.close()
             if size < 12 or b"ftyp" not in header:
                 raise HTTPException(415, "El archivo no tiene una cabecera MP4 válida.")
-            if not request.app.state.video.add_job_if_available(job_id, filename):
+            digest = source_digest.hexdigest()
+            if known is not None:
+                if known.get("source_sha256") != digest:
+                    raise HTTPException(
+                        409,
+                        "Idempotency-Key ya se usó con otro contenido.",
+                    )
+                return detail(store, known)
+            if not request.app.state.video.add_job_if_available(
+                job_id, filename, idempotency_key, digest, size
+            ):
                 raise HTTPException(503, UNAVAILABLE_DETAIL)
         except BaseException:
-            target.unlink(missing_ok=True)
-            directory.rmdir()
+            if directory is not None:
+                shutil.rmtree(directory, ignore_errors=True)
             raise
         return detail(store, store.get(job_id))
+
+    @router.delete(
+        "/api/v1/analyses/{job_id}/artifacts",
+        status_code=204,
+        responses={204: {"description": "Se eliminaron los artefactos; se conserva el registro terminal."},
+                   404: {"model": VideoErrorResponse},
+                   409: {"model": VideoErrorResponse}},
+    )
+    def delete_analysis_artifacts(
+        job_id: str, store: Store = Depends(video_store)
+    ):
+        with store.lock_job(job_id):
+            job = store.get(job_id)
+            if job["status"] in ("pending", "processing"):
+                raise HTTPException(409, "No se pueden eliminar artefactos de un análisis activo.")
+            if job["status"] not in ("completed", "failed"):
+                raise HTTPException(409, "El análisis todavía no alcanzó un estado terminal.")
+            directory = _job_directory_for_cleanup(store, job_id)
+            if directory.exists():
+                if not directory.is_dir():
+                    raise HTTPException(409, "No se puede limpiar una ruta de análisis insegura")
+                shutil.rmtree(directory)
+            return Response(status_code=204)
+
+    @router.post(
+        "/api/v1/analyses/{job_id}/retry",
+        status_code=202,
+        response_model=JobResponse,
+        response_model_exclude_unset=True,
+        responses={404: {"model": VideoErrorResponse}, 409: {"model": VideoErrorResponse}},
+    )
+    def retry_failed_analysis(job_id: str, store: Store = Depends(video_admission_store)):
+        with store.lock_job(job_id):
+            job = store.get(job_id)
+            if job["status"] in ("pending", "processing"):
+                return detail(store, job)
+            if job["status"] != "failed":
+                raise HTTPException(409, "Solo se puede reintentar un análisis fallido.")
+
+            directory = _job_directory_for_cleanup(store, job_id)
+            input_path = directory / "input.mp4"
+            if input_path.is_symlink() or not input_path.is_file():
+                raise HTTPException(409, "No se puede reintentar: el video fuente ya no está disponible.")
+            digest = _input_digest(input_path, expected_size=job.get("source_size"))
+            if digest != job.get("source_sha256"):
+                raise HTTPException(409, "No se puede reintentar: el video fuente cambió.")
+
+            with store.connect() as conn:
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
+                ).fetchone()[0]
+            if active >= WEB_MAX_ACTIVE_JOBS:
+                raise HTTPException(429, "Hay tres videos en espera. Esperá a que terminen.")
+
+            result_directory = directory / "result"
+            worker_log = directory / "worker.log"
+            if result_directory.is_symlink() or worker_log.is_symlink():
+                raise HTTPException(409, "No se puede reintentar desde una ruta de artefacto insegura.")
+            if result_directory.exists():
+                if not result_directory.is_dir():
+                    raise HTTPException(409, "No se puede reintentar desde un resultado inseguro.")
+                shutil.rmtree(result_directory)
+            worker_log.unlink(missing_ok=True)
+            job = store.retry_failed(job_id)
+            return detail(store, job)
 
     @router.get(
         "/api/v1/analyses/{job_id}", response_model=JobResponse,
