@@ -40,7 +40,7 @@ sola detección. Es un camino BCS opcional, no el único del video. Tras un trac
 exitoso, la API también evalúa secuencialmente cada pasaje que tenga una imagen
 original disponible; ese camino no necesita que el candidato global exista. Los
 resultados por pasaje se consultan en
-[`GET /api/v1/analyses/{id}/passages`](#experimental-per-passage-bcs). Ambos caminos
+[`GET /api/v1/analyses/{id}/passages`](#bcs-experimental-por-pasaje). Ambos caminos
 comparten runtime y compuerta BCS; la primera operación que llegue al runtime puede
 desencadenar la carga diferida del paquete.
 
@@ -225,30 +225,33 @@ ausentes; `error` y `summary` del trabajo mantienen sus valores nulos explícito
 
 OpenAPI y explorador interactivo: http://127.0.0.1:8001/docs.
 
-### Experimental per-passage BCS
+### BCS experimental por pasaje
 
-`GET /api/v1/analyses/{id}/passages` preserves `vacca-video-passages-v1` and adds
-`passage.bcs`: a typed `evaluated` or `unevaluable` result, nullable category
-`1..5`, controlled reason, `input_representation: original_only`, experimental
-model status, package, timing, sanitized lineage and input SHA-256 when present.
-It exposes neither private paths nor BCS confidence. Inference uses the full
-original frame, which may contain other cows; it never classifies crops or masks.
-The category is experimental, not clinically validated; the model is not approved.
+`GET /api/v1/analyses/{id}/passages` conserva `vacca-video-passages-v1` y agrega
+`passage.bcs`: un resultado tipado `evaluated` o `unevaluable`, una categoría
+nullable `1..5`, un motivo controlado, `input_representation: original_only`, el
+estado experimental del modelo, el paquete, la temporización, la procedencia
+sanitizada y, si está presente, el SHA-256 de entrada. No expone rutas privadas ni
+la confianza de BCS. La inferencia usa el frame original completo, que puede incluir
+otras vacas; nunca clasifica recortes ni máscaras. La categoría es experimental,
+no está validada clínicamente y el modelo no está aprobado.
 
-| List-level `bcs_status` | Meaning |
+| `bcs_status` del listado | Significado |
 | --- | --- |
-| `completed` | Full sidecar bound to the summary, ordered intervals and current images; may include `unevaluable` passages without categories. |
-| `not_evaluated` | Absent sidecar (legacy/no configured phase), or job not yet completed; does not imply inference failure. |
-| `unavailable` | Unreadable, oversized, invalid or stale sidecar; `bcs_reason: passage_bcs_unreadable`, all results null, valid images retained. |
+| `completed` | Sidecar completo vinculado al resumen, los intervalos ordenados y las imágenes actuales; puede incluir pasajes `unevaluable` sin categorías. |
+| `not_evaluated` | Sidecar ausente (legado/fase no configurada) o trabajo aún sin completar; no implica un fallo de inferencia. |
+| `unavailable` | Sidecar ilegible, demasiado grande, inválido o desactualizado; `bcs_reason: passage_bcs_unreadable`, todos los resultados nulos y las imágenes válidas conservadas. |
 
-Candidate availability is separate from BCS availability. For compatibility,
-`candidate.bcs_status: not_evaluated` remains a **deprecated** tracking-producer
-snapshot, not the current inference state; use `passage.bcs` instead.
-`candidate.bcs_eligibility: not_assessed` still means clinical eligibility was not
-assessed. All passages remain chronological, including those without candidates.
-While the job is `pending` or `processing`, no passages, categories or files are
-exposed. There is no raw sidecar route. Job completion follows all configured
-stages, including sequential passage evaluation on the same parent BCS runtime/gate.
+La disponibilidad del candidato es independiente de la disponibilidad de BCS. Por
+compatibilidad, `candidate.bcs_status: not_evaluated` sigue siendo una instantánea
+**obsoleta** del productor de tracking, no el estado actual de inferencia; usar
+`passage.bcs` en su lugar. `candidate.bcs_eligibility: not_assessed` sigue
+significando que no se evaluó la elegibilidad clínica. Todos los pasajes se
+mantienen en orden cronológico, incluidos los que no tienen candidatos. Mientras
+el trabajo esté `pending` o `processing`, no se exponen pasajes, categorías ni
+archivos. No existe una ruta para el sidecar sin procesar. El trabajo se completa
+después de todas las etapas configuradas, incluida la evaluación secuencial de
+pasajes con el mismo runtime/control de BCS principal.
 
 En la web local, seleccioná un análisis completado y revisá **Pasajes del video**:
 las tarjetas conservan el orden de la API, muestran la imagen original disponible y

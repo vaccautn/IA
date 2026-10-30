@@ -146,7 +146,7 @@ legado `export_bcs_crops.py` puede preparar recortes de tracks para un dataset
 etiquetado; no es la ruta de revisión de pasajes actual. Para exportar un paquete
 de revisión nuevo, vacío y sin ejecutar modelos, usar
 `scripts/export_passage_bcs_labels.py` según el camino rápido del
-[README](../README.md#offline-passage-label-review-validate-before-scoring).
+[README](../README.md#revisión-offline-de-etiquetas-de-pasajes-validar-antes-de-puntuar).
 
 El flujo legado de recortes por track es:
 
