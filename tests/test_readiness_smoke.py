@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
+import uvicorn
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -24,12 +25,8 @@ from vacca_api import main as api_main  # noqa: E402
 class LauncherReadinessTests(unittest.TestCase):
     def test_default_invocation_reaches_uvicorn_with_local_defaults(self) -> None:
         calls: list[dict[str, object]] = []
-        fake_uvicorn = SimpleNamespace(
-            run=lambda *args, **kwargs: calls.append({"args": args, **kwargs})
-        )
-
         with self.assertLogs(run_api.logger, level="INFO") as logs:
-            with patch.dict(sys.modules, {"uvicorn": fake_uvicorn}), patch.object(
+            with patch.object(uvicorn, "run", lambda *args, **kwargs: calls.append({"args": args, **kwargs})), patch.object(
                 sys, "argv", ["run_api.py"]
             ):
                 run_api.main()
@@ -62,11 +59,7 @@ class LauncherReadinessTests(unittest.TestCase):
 
     def test_cli_overrides_are_forwarded_to_uvicorn(self) -> None:
         calls: list[dict[str, object]] = []
-        fake_uvicorn = SimpleNamespace(
-            run=lambda *args, **kwargs: calls.append({"args": args, **kwargs})
-        )
-
-        with patch.dict(sys.modules, {"uvicorn": fake_uvicorn}), patch.object(
+        with patch.object(uvicorn, "run", lambda *args, **kwargs: calls.append({"args": args, **kwargs})), patch.object(
             sys,
             "argv",
             ["run_api.py", "--host", "0.0.0.0", "--port", "3000", "--reload"],

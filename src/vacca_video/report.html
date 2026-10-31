@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VACCA · Detección en video</title>
+<style>
+:root{color-scheme:dark;--bg:#101b18;--panel:#182723;--muted:#a8bab1;--line:#32443c;--green:#9ee7ae}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf4ef;font:16px/1.55 system-ui,sans-serif}
+main{max-width:1200px;margin:auto;padding:38px 24px}header{display:flex;justify-content:space-between;gap:20px;align-items:center}
+.brand{letter-spacing:.18em;font-weight:800;color:var(--green)}.tag{font-size:12px;border:1px solid var(--line);padding:6px 12px;border-radius:30px}
+h1{font-size:clamp(28px,4vw,46px);line-height:1.15;margin:28px 0 12px;letter-spacing:-.04em}h2{font-size:18px;margin:0 0 14px}
+p{color:var(--muted)}.lead{max-width:740px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:26px 0}
+.stat,.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}.stat b{display:block;font-size:30px;font-weight:600}.stat span{font-size:13px;color:var(--muted)}
+.layout{display:grid;grid-template-columns:minmax(0,2.5fr) minmax(230px,1fr);gap:18px}.screen{background:#08100d;border-radius:8px;overflow:hidden;min-height:210px;display:grid;place-items:center}
+img{max-width:100%;display:block;width:100%;height:auto}input[type=range]{width:100%;accent-color:var(--green);margin:18px 0}
+button,a.button{background:var(--green);color:#12241a;border:0;border-radius:7px;padding:10px 15px;font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block}
+button.secondary{background:#2b4035;color:#fff}button:disabled{opacity:.4;cursor:default}.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.time{margin-left:auto;font-variant-numeric:tabular-nums}
+dl{margin:0}dt{color:var(--muted);font-size:13px;margin-top:16px}dd{margin:3px 0;overflow-wrap:anywhere}#current-count{font-size:50px;color:var(--green);line-height:1.1}
+.notice{border-left:3px solid var(--green);padding:10px 16px;background:#1c3025;margin:20px 0}.notice.warn{border-color:#e9bc67;background:#302a1c}
+.downloads{display:flex;gap:12px;flex-wrap:wrap;margin-top:24px}a{color:var(--green)}.small{font-size:13px}.footer{margin-top:28px;padding-top:18px;border-top:1px solid var(--line)}[hidden]{display:none!important}
+@media(max-width:750px){.layout{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}main{padding:24px 16px}.time{margin-left:0}}
+</style>
+</head>
+<body><main>
+<header><div class="brand">VACCA / VISIÓN</div><span class="tag">PROTOTIPO · VIDEO GRABADO</span></header>
+<h1>Las detecciones, frame a frame.</h1>
+<p class="lead">Revisión de vacas visibles con el detector de VACCA. Cada imagen muestra sus propias detecciones; el conteo corresponde a ese instante, no a animales únicos.</p>
+<div id="status" class="notice" role="status">Cargando resultados locales…</div>
+<section class="stats" aria-label="Resumen">
+<div class="stat"><b id="analyzed">—</b><span>frames analizados</span></div>
+<div class="stat"><b id="max-cows">—</b><span>máximo simultáneo</span></div>
+<div class="stat"><b id="fps">—</b><span>FPS de procesamiento</span></div>
+<div class="stat"><b id="inference">—</b><span>ms / inferencia media</span></div>
+</section>
+<div class="layout"><section class="card" aria-label="Explorador de frames">
+<div class="screen"><img id="frame" alt="Frame analizado con recuadros de detección" hidden><p id="empty">No hay frames disponibles.</p></div>
+<input id="seek" type="range" min="0" max="0" value="0" aria-label="Frame analizado" disabled>
+<div class="controls"><button id="play" disabled>Reproducir</button><button id="prev" class="secondary" disabled aria-label="Frame anterior">←</button><button id="next" class="secondary" disabled aria-label="Frame siguiente">→</button><span id="time" class="time">00:00.000</span></div>
+<p id="preview-note" class="small"></p>
+</section><aside class="card"><h2>En este frame</h2><div id="current-count">—</div><p style="margin-top:4px">vacas visibles</p><dl><dt>Frame del video original</dt><dd id="index">—</dd><dt>Tiempo de inferencia</dt><dd id="frame-ms">—</dd><dt>Archivo</dt><dd id="source">—</dd><dt>Modelo</dt><dd id="model">—</dd><dt>Confianza mínima</dt><dd id="confidence">—</dd></dl></aside></div>
+<div class="downloads"><a id="video-link" class="button" href="annotated.mp4" download hidden>Descargar video anotado</a><a href="detections.jsonl" download>Resultados por frame · JSONL</a><a href="summary.json" download>Resumen de ejecución · JSON</a></div>
+<p class="small">El MP4 contiene los frames analizados a frecuencia constante, sin audio; su duración es aproximada. Para tiempos exactos, consultá este explorador y el JSONL. Si tu navegador no reproduce el codec del MP4, abrilo con un reproductor compatible.</p>
+<div class="footer"><p class="small">Sin identificación individual, RFID ni condición corporal. Los FPS incluyen lectura, detección y escritura; no son una medición de latencia de cámara en vivo. Compartí la carpeta completa para conservar la presentación.</p></div>
+</main>
+<script src="summary.js"></script><script src="frames.js"></script>
+<script>
+(() => {
+  const summary = window.VACCA_SUMMARY;
+  const frames = window.VACCA_FRAMES || [];
+  const el = id => document.getElementById(id);
+  const put = (id, value) => { el(id).textContent = value ?? '—'; };
+  if (!summary) { put('status', 'No se pudo leer el resumen. Abrí report.html junto a summary.js y frames.js.'); return; }
+  put('analyzed', summary.frames_analyzed); put('max-cows', summary.max_cows_in_frame);
+  put('fps', summary.processing_fps); put('inference', summary.mean_inference_ms);
+  put('source', summary.source.name); put('model', summary.model.name);
+  put('confidence', Math.round(summary.model.confidence * 100) + '%');
+  let message = summary.status === 'completed' ? 'Procesamiento completado.' : summary.status === 'cancelled' ? 'Procesamiento cancelado. Resultados parciales.' : 'El procesamiento falló. Resultados parciales.';
+  if (summary.stop_reason === 'frame_limit') message += ' Se alcanzó el límite configurado: se analizó una parte del video.';
+  if (summary.timestamp_fallback_frames) message += ' Algunos tiempos fueron estimados usando los FPS del archivo.';
+  if (summary.error) message += ' ' + summary.error;
+  put('status', message);
+  if (summary.status !== 'completed' || summary.stop_reason === 'frame_limit') el('status').classList.add('warn');
+  if (summary.annotated_video) el('video-link').hidden = false;
+  put('preview-note', `Este explorador incluye ${frames.length} de ${summary.frames_analyzed} frames analizados. El JSONL y el MP4 incluyen todos los frames procesados.`);
+  if (!frames.length) return;
+  let position = 0, timer = null;
+  const clock = ms => { const t = Math.round(ms); return `${String(Math.floor(t / 60000)).padStart(2,'0')}:${String(Math.floor(t / 1000) % 60).padStart(2,'0')}.${String(t % 1000).padStart(3,'0')}`; };
+  const show = i => {
+    position = Math.max(0, Math.min(frames.length - 1, i)); const f = frames[position];
+    el('frame').src = f.image; el('frame').hidden = false; el('empty').hidden = true;
+    el('seek').value = position; put('time', clock(f.timestamp_ms));
+    put('current-count', f.detection_count); put('index', f.frame_index); put('frame-ms', f.inference_time_ms + ' ms');
+    el('prev').disabled = position === 0; el('next').disabled = position === frames.length - 1;
+  };
+  const pause = () => { if (timer !== null) clearTimeout(timer); timer = null; put('play','Reproducir'); };
+  const schedule = () => {
+    if (position >= frames.length - 1) { pause(); return; }
+    timer = setTimeout(() => { show(position + 1); schedule(); }, Math.max(1, frames[position + 1].timestamp_ms - frames[position].timestamp_ms));
+  };
+  el('play').disabled = frames.length < 2; el('seek').disabled = false; el('seek').max = frames.length - 1;
+  el('play').onclick = () => { if (timer !== null) { pause(); return; } if (position === frames.length - 1) show(0); put('play','Pausar'); schedule(); };
+  el('prev').onclick = () => { pause(); show(position - 1); };
+  el('next').onclick = () => { pause(); show(position + 1); };
+  el('seek').oninput = event => { pause(); show(Number(event.target.value)); };
+  document.addEventListener('visibilitychange', () => { if (document.hidden) pause(); });
+  show(0);
+})();
+</script></body></html>

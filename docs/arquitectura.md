@@ -19,8 +19,8 @@ outputs/bcs-category-coral-v1/
   ↓ exportación única, verificación de equivalencia y ZIP determinista privado
   artifacts/private/bcs-category-coral-2026-09-04/*.zip (distribución privada de prototipo)
   → models/private/bcs-category-coral-2026-09-04/
-  ↓ manifiesto + model_state.pt; carga lazy, sólo después de /bcs
-POST /bcs → bcs_category: 1..5
+  ↓ manifiesto + model_state.pt; carga diferida ante la primera evaluación elegible
+POST /bcs, candidato web o pasajes disponibles tras tracking → BCS 1..5
 ```
 
 El paquete privado es un artefacto experimental no aprobado para producción; sus pesos y
@@ -60,8 +60,20 @@ CUDA.
 `/bcs` lee la carga una vez y entrega los bytes a `BCSRuntime` de forma diferida; nunca
 invoca YOLO. Después de una instalación autorizada desde la ubicación privada de VACCA
 Drive, sin override el runtime puede seleccionar el paquete privado como
-`experimental_not_approved`; si falta, informa `not_installed`; la primera solicitud
-carga exactamente una vez. El modo
+`experimental_not_approved`; si falta, informa `not_installed`. La primera operación BCS
+elegible intenta la carga: puede ser una solicitud `/bcs`, la evaluación web del candidato
+seleccionado entre muestras con exactamente una detección, o las evaluaciones secuenciales
+de imágenes originales disponibles por pasaje después de un tracking exitoso. Estas rutas
+comparten runtime y compuerta BCS; el estado puede cambiar sin una solicitud directa a
+`/bcs`. La evaluación por pasajes no depende del candidato seleccionado anteriormente.
+Un video web nuevo completado puede iniciar el intento BCS del candidato global,
+seleccionado entre muestras con exactamente una detección de vaca, sin una solicitud directa a `/bcs`;
+el flujo independiente por pasajes evalúa sus imágenes originales
+disponibles tras un tracking exitoso, incluso si no existe ese candidato.
+No todo video solicita BCS: puede no haber candidato ni pasajes disponibles, fallar el
+trabajo/tracking o no estar disponible la capacidad. Consulte el
+[flujo de video y BCS](video-web.md#candidato-y-categoría-bcs-experimental).
+El modo
 `VACCA_BCS_DISABLED=1` queda `unconfigured` con estado `none`. Si aparece cualquiera de
 las variables heredadas, exige el par completo y conserva el cargador externo con estado
 `external_unclassified`. La construcción o carga BCS fallida no impide el arranque,

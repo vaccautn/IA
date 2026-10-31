@@ -9,6 +9,12 @@ import pytest
 from _pytest.mark import Expression, MarkMatcher
 
 
+@pytest.fixture(autouse=True)
+def isolate_video_history(tmp_path, monkeypatch):
+    """Lifespan tests must never claim real user jobs or write user history."""
+    monkeypatch.setenv("VACCA_VIDEO_DATA", str(tmp_path / "video-history"))
+
+
 def pytest_addoption(parser) -> None:
     group = parser.getgroup("private BCS model")
     group.addoption(

@@ -13,6 +13,37 @@ fue AdamW y la agenda de tasa de aprendizaje fue coseno.
 
 Ninguno de los dos usa SGD, MuSGD ni entropía cruzada de cinco clases.
 
+## Validación local del descriptor YOLO
+
+El entrenador admite **sólo detección**. En una corrida normal, `scripts/train.py`
+carga el `data.yaml` con `yaml.safe_load` y valida un esquema declarativo antes de
+construir `YOLO`. Se permiten `train`, `val` (o su alias `validation`) y
+`test`/`minival` opcionales; cada split puede ser un directorio local, una lista de
+directorios o un manifiesto `.txt` con rutas locales existentes. Las líneas `./...`
+de un manifiesto se resuelven desde el propio manifiesto. Si se omite `path`, la
+raíz es el directorio del `data.yaml`; un `path` relativo explícito se resuelve
+desde el directorio de trabajo y debe existir allí. No se busca una raíz
+alternativa en el directorio del YAML ni en la caché global de datasets.
+
+El descriptor debe declarar `names` o `nc`, y ambos deben concordar cuando estén
+presentes. Se rechazan splits ausentes, rutas remotas, claves no admitidas y el
+campo `download` (también dentro de metadatos), en lugar de delegar hooks o
+descargas de datos a Ultralytics. Prepare el conjunto localmente. Esta comprobación
+valida estructura y existencia de rutas, no el contenido de imágenes, la calidad
+de etiquetas ni la procedencia del conjunto.
+
+En `--resume`, `YOLO` primero carga el checkpoint confiable y Ultralytics restaura
+sus argumentos de corrida. El entrenador de detección vuelve a validar entonces
+que la tarea efectiva sea `detect` y que el `data.yaml` restaurado cumpla el esquema,
+antes de que el cargador de datasets lo abra. Así se cubre un descriptor efectivo
+distinto del configurado, sin redirigir otras tareas a `DetectionTrainer`.
+
+Este control no autentica, firma ni valida la procedencia de pesos o checkpoints.
+`pretrained` y `--resume` deben provenir de una fuente confiable del operador; un
+peso `pretrained` ausente aún puede activar el comportamiento de resolución de
+Ultralytics existente. La política de confianza de modelos (TD07) sigue pendiente;
+no se infiere ninguna garantía para checkpoints no confiables.
+
 ## Detector YOLO26n
 
 El detector servido es el ajuste fino `combined-v2` de

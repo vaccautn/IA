@@ -19,6 +19,7 @@ api = [
     "python-multipart==0.0.32",
 ]
 yolo = ["ultralytics==8.4.115"]
+tracking = ["lap==0.5.13"]
 bcs = [
     "PyYAML==6.0.3",
     "torch==2.13.0+cpu",
@@ -28,6 +29,9 @@ bcs = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+vacca_video = ["report.html"]
+
 [tool.ruff]
 target-version = "py313"
 line-length = 88
@@ -36,6 +40,7 @@ line-length = 88
 select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "private_model: requires only the externally received private BCS ZIP and sidecar; consumer tests never require source checkpoints",
     "private_model_installed: explicitly permits tests to inspect the fixed private install destination",

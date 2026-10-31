@@ -146,8 +146,13 @@ $sourceCheckpoint = "outputs\bcs-category-coral-v1\weights\best.pt"
 Ese comando productor no forma parte del flujo consumidor y no debe ejecutarse sin el
 checkpoint, `checkpoint_set.json` y metadatos de origen compatibles.
 
-Después de descargar desde la ubicación privada e instalar el ZIP, BCS queda seleccionado y carga el paquete de forma lazy en la
-primera solicitud `/bcs`. Sin instalación `/ready/bcs` responde `503 not_installed`; luego
+Después de descargar desde la ubicación privada e instalar el ZIP, BCS queda
+seleccionado y carga el paquete de forma lazy en la primera operación elegible:
+`POST /bcs`, el intento web sobre el candidato de una sola detección o las
+evaluaciones secuenciales de pasajes disponibles después del tracking exitoso.
+Las rutas web comparten runtime; la evaluación por pasaje no depende del
+candidato de una sola detección. Sin instalación `/ready/bcs` responde
+`503 not_installed`; luego
 de instalar responde `503 not_loaded` y después `200 ready`,
 pero conserva `model_status: experimental_not_approved`. La deshabilitación de emergencia
 es exactamente `VACCA_BCS_DISABLED=1`; otros valores fallan cerrados. Si se define

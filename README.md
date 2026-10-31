@@ -1,5 +1,61 @@
 # VACCA Vision — API de detección bovina y BCS ordinal
 
+## Offline passage-label review (validate before scoring)
+
+From `IA`, create a **new** blank-label pack from one tracking run:
+
+```powershell
+.venv/Scripts/python.exe -B scripts/export_passage_bcs_labels.py outputs/short4cow-recovery-20261028 --source-video ../Videos/gemini_generated_video_b27b0d61.mp4 --output outputs/bcs-passage-review-originals-20261028
+```
+
+`labels.csv` has one row per ordered provisional passage, including candidate-less
+intervals with an explicit reason and empty image references. `export.json` records
+source SHA256, summary-byte SHA256, interval/frame/temporal-track provenance and status.
+The v2 manifest declares `input_representation: full_original_frame_only`.
+`original` copies that passage's `best-original.jpg` byte-for-byte, without cropping,
+resizing or re-encoding; `representations` is `full_original` for available candidates.
+The full frame can include multiple animals and surrounding context; this choice
+is **not validation proof**. Compatibility columns `crop`, `mask` and `masked` stay
+empty, even with accepted segmentation. Derivative references/files are ignored;
+`segmentation_status`, when present, is source metadata only. Whole-track best
+images are never used, and missing originals never fall back to derivatives.
+
+All `bcs_category`, `rump_visible` and `notes` cells start blank. Future expert
+annotations may use BCS categories `1`..`5`, visibility `yes`/`no`/`uncertain`, and
+free-text notes **after agreeing anatomical visibility and category criteria**;
+this tool neither validates completed sheets nor sets quality thresholds. Blank
+labels are not clinical unevaluable results. No scoring, API category, dataset
+materialization, automatic split or performance metric is produced.
+
+Every row shares a source-video `group_id` (leakage prevention, **not cow identity**).
+Use more independent videos and expert labels on the same representation before
+evaluation; local data directories and a whole-image baseline do not establish those labels.
+An explicit source file is hashed and must match any recorded source digest. Without
+it, full SHA256 metadata (`input_sha256`, `video_sha256` or `source_video_sha256`) is
+required; basenames are never identities. The output parent must already exist.
+Existing outputs, overlapping input/output trees, linked paths, malformed metadata
+and missing required original files fail without publishing a partial pack.
+No models or weights are loaded. Existing mixed-representation packs are not rewritten.
+
+## Prototipo de video grabado
+
+**Web local en la API principal:** desde `IA`, ejecutar
+`.venv\Scripts\python.exe scripts/run_api.py --open` y cargar un MP4 nuevo en
+http://127.0.0.1:8001/videos/. Permite consultar el historial y explorar detecciones;
+los trabajos antiguos no se evalúan automáticamente. Ver
+[arranque, candidato y categoría BCS experimental](docs/video-web.md).
+
+La rama de video incorpora una demo independiente con el detector existente:
+MP4 local → frames muestreados → cajas, conteo por frame, JSONL y presentación HTML.
+El CLI/escritorio no necesita backend ni BCS: conserva un candidato original sin
+evaluarlo. En la web, además del intento opcional sobre el candidato de una sola
+detección, después de un tracking exitoso se puede evaluar BCS secuencialmente
+para cada pasaje con imagen original disponible. Este segundo flujo no depende
+de que exista el candidato anterior. Ambos usan el runtime BCS real cuando está
+disponible; no se generan categorías simuladas si falta el paquete. Se conservan
+los contratos públicos de `/detect` y `/bcs`.
+Consultar [ejecución, demostración y límites](docs/video-prototype.md).
+
 Microservicio de detección de bovinos con YOLO26n ajustado finamente sobre Navid HSM + BCS ScienceDB.
 **mAP50: 0.974 · mAP50-95: 0.610 · Precisión: 0.976 · Exhaustividad: 0.924**
 
@@ -36,8 +92,10 @@ if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne $catalog.archiv
 ```
 
 La API usa `http://127.0.0.1:8001`. El detector YOLO se carga durante el arranque; el
-paquete BCS se carga **una sola vez y de forma lazy** en la primera solicitud `POST
-/bcs`. Sin instalación, `GET /ready/bcs` devuelve `503` con `status: not_installed` y
+paquete BCS se carga **una sola vez por proceso y de forma lazy** en la primera
+operación que lo necesita: `POST /bcs`, la evaluación web del candidato o las
+evaluaciones secuenciales de pasajes tras un tracking exitoso. Sin instalación,
+`GET /ready/bcs` devuelve `503` con `status: not_installed` y
 mantiene `/health` y `/detect` operativos. Después de instalar, devuelve primero
 `not_loaded` y luego `ready`, pero continúa indicando que el modelo es experimental y no
 aprobado. La presencia del paquete **no es aprobación de producción ni de uso clínico**.
@@ -541,6 +599,12 @@ IA/
 │   ├── category_split_plan.py ← División determinista por grupos
 │   ├── serving.py           ← Cargador externo validado e inferencia sobre la imagen completa
 │   └── serving_package.py   ← Frontera estricta del paquete BCS privado y su catálogo
+├── src/vacca_video/         ← CLI, tracking, pasajes y API web local de video
+│   ├── pipeline.py          ← Muestreo y procesamiento secuencial de frames
+│   ├── tracking.py          ← Trayectorias temporales, candidatos y artefactos
+│   ├── webapp.py            ← Rutas locales /videos y /api/v1/analyses
+│   ├── worker.py            ← Procesamiento de trabajos aislado
+│   └── passage_bcs.py       ← Sidecar BCS experimental por pasaje
 ├── scripts/
 │   ├── train.py             ← Entrenamiento YOLO de Fase 1
 │   ├── build_combined_v2.py ← Conjunto de datos combinado separado de Fase 1
@@ -550,7 +614,11 @@ IA/
 │   ├── run_baseline.py       ← Línea base reproducible de Fase 1
 │   ├── run_api.py           ← Script de arranque del servidor API
 │   ├── export_bcs_serving_package.py ← Exportación reproducible de state-dict-only
-│   └── smoke_test_api.py    ← Ciclo de vida FastAPI, /health ASGI y HTTP en vivo opcional
+│   ├── smoke_test_api.py    ← Ciclo de vida FastAPI, /health ASGI y HTTP en vivo opcional
+│   ├── process_video.py     ← Procesamiento CLI y reporte offline
+│   ├── track_video.py       ← Exportación CLI de trayectorias temporales
+│   └── export_passage_bcs_labels.py ← Paquete offline de revisión, sin etiquetas asignadas
+├── web/                     ← UI React de la aplicación local de video
 ├── configs/                 ← Archivos YAML de entrenamiento
 ├── data/                    ← (ignorado por Git)
 │   ├── bcs/dataset/         ← Carpetas locales de la fuente fraccional
