@@ -1,9 +1,10 @@
-# Historical snapshot — 12 October 2026
+# Instantánea histórica — 12 de octubre de 2026
 
-This document preserves the original local setup notes as historical context.
-They describe a separate video service on port 8010 and are not current operating
-instructions. Use the [current unified video guide](video-web.md), which runs
-the main API and video UI together on port 8001 and documents current BCS limits.
+Este documento conserva las notas originales de configuración local como contexto
+histórico. Describen un servicio de video separado en el puerto 8010 y no son
+instrucciones operativas vigentes. Consultar la [guía unificada actual de video](video-web.md),
+que ejecuta juntas la API principal y la interfaz de video en el puerto 8001, y
+documenta los límites actuales de BCS.
 
 # IA e IA-video: estado y arranque local
 

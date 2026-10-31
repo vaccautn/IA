@@ -1,49 +1,49 @@
-# Tasks: IA Web Passage Validation
+# Tareas: validación de pasajes en la web de IA
 
-## Review Workload Forecast
+## Previsión de carga de revisión
 
-| Field | Value |
+| Campo | Valor |
 |-------|-------|
-| Estimated changed lines | ~801 audited feature lines + ≤180 focused UI/test refinement lines = ≤981 total; 1,200-line exception |
-| 400-line budget risk | High |
-| Chained PRs recommended | No — one bounded work unit fits the explicitly approved 1,200-line review envelope |
-| Suggested split | Single local validation-UI work unit |
-| Delivery strategy | auto-forecast |
-| Chain strategy | size-exception (explicitly accepted bounded local work; no chain) |
+| Líneas modificadas estimadas | ~801 líneas de funcionalidad auditadas + ≤180 líneas de refinamiento enfocado de interfaz/pruebas = ≤981 en total; excepción de 1,200 líneas |
+| Riesgo del límite de 400 líneas | High |
+| PR encadenados recomendados | No — una unidad de trabajo acotada cabe en el límite de revisión de 1,200 líneas aprobado explícitamente |
+| División sugerida | Una única unidad de trabajo de interfaz de validación local |
+| Estrategia de entrega | auto-forecast |
+| Estrategia de cadena | size-exception (trabajo local acotado aceptado explícitamente; sin cadena) |
 
-Decision needed before apply: No
-Chained PRs recommended: No
-Chain strategy: size-exception
-400-line budget risk: High
+Decisión necesaria antes de apply: No
+PR encadenados recomendados: No
+Estrategia de cadena: size-exception
+Riesgo del límite de 400 líneas: High
 
-The prior verification footprint was 777 lines; the amended spec adds 24 lines, so the current audited feature footprint is about 801. Allow up to 180 additional changed lines for this focused UI/test refinement and its task amendment (projected total ≤981, at least 219 below the accepted 1,200 cap). The default 400-line budget risk remains High; the user explicitly accepted `size:exception` for this bounded local work, with no chain, commits, or PRs. Preserve and exclude the 192-line pre-existing documentation baseline.
+La verificación anterior abarcó 777 líneas; la especificación enmendada agrega 24, por lo que la funcionalidad auditada actual abarca unas 801 líneas. Se permiten hasta 180 líneas modificadas adicionales para este refinamiento acotado de interfaz/pruebas y la enmienda de tareas correspondiente (total proyectado ≤981, al menos 219 por debajo del límite aceptado de 1,200). El riesgo predeterminado del límite de 400 líneas sigue siendo High; el usuario aceptó explícitamente `size:exception` para este trabajo local acotado, sin cadenas, commits ni PR. Preservar y excluir la base preexistente de 192 líneas de documentación.
 
-### Suggested Work Units
+### Unidades de trabajo sugeridas
 
-| Unit | Goal | Likely PR | Notes |
+| Unidad | Objetivo | PR probable | Notas |
 |------|------|-----------|-------|
-| 1 | Finish count/best-frame labels and remaining rendered regressions in the local UI | Single bounded work unit | Accepted size:exception; no chain, commits, backend/R2/dependency work |
+| 1 | Completar las etiquetas de conteo/mejor frame y las regresiones renderizadas restantes en la interfaz local | Una única unidad de trabajo acotada | Excepción de tamaño aceptada; sin cadena, commits ni trabajo de backend/R2/dependencias |
 
-## Phase 1: Rendered UI RED tests
+## Fase 1: pruebas RED de interfaz renderizada
 
-- [x] 1.1 In `web/ui.test.mjs`, reuse existing fixture/routes and add focused failing rendered-App tests for ordered originals/evaluated versus missing or unevaluable results, labels/warnings, empty/error states, and separation from candidate BCS/tracks; combine assertions and avoid exhaustive combinations.
-- [x] 1.2 Add compact failing lifecycle tests in `web/ui.test.mjs` for pending refresh independent of job status, retry, stale response after selection change/switch-back, and unmount cleanup; keep defaults terminal to protect timer assertions.
+- [x] 1.1 En `web/ui.test.mjs`, reutilizar las fixtures/rutas existentes y agregar pruebas enfocadas fallidas de la App renderizada para originales ordenados/resultados evaluados frente a resultados ausentes o no evaluables, etiquetas/advertencias, estados vacíos/de error y separación del BCS del candidato/los tracks; combinar aserciones y evitar combinaciones exhaustivas.
+- [x] 1.2 Agregar pruebas compactas fallidas del ciclo de vida en `web/ui.test.mjs` para actualización pendiente independiente del estado del trabajo, reintento, respuesta desactualizada tras cambiar/volver a cambiar la selección y limpieza al desmontar; mantener los valores predeterminados terminales para proteger las aserciones de temporizadores.
 
-## Phase 2: Minimal GREEN UI implementation
+## Fase 2: implementación GREEN mínima de la interfaz
 
-- [x] 2.1 Add `videoApi.passages(id, signal)` in `web/src/api.js`; encode the ID, pass the abort signal, and preserve existing successful HTTP response handling.
-- [x] 2.2 Add independently owned passage state and `retryPassages` in `web/src/useVideoAnalysis.js`; use request-owner cleanup, selected-ID tagging, and the existing 3-second interval only while passages remain pending.
-- [x] 2.3 In `web/src/components.jsx` and `web/src/style.css`, render the ordered passage gallery, supplied originals only, evaluated categories only, distinct missing/unavailable/reason states, warnings, unresolved attribution, and concise provisional/non-clinical labels; preserve global candidate and tracks sections.
+- [x] 2.1 Agregar `videoApi.passages(id, signal)` en `web/src/api.js`; codificar el ID, pasar la señal de cancelación y conservar el manejo existente de respuestas HTTP satisfactorias.
+- [x] 2.2 Agregar estado de pasajes con control independiente y `retryPassages` en `web/src/useVideoAnalysis.js`; usar limpieza del propietario de la solicitud, etiquetado del ID seleccionado y el intervalo existente de 3 segundos solo mientras los pasajes sigan pendientes.
+- [x] 2.3 En `web/src/components.jsx` y `web/src/style.css`, mostrar la galería de pasajes ordenados, solo los originales proporcionados, solo las categorías evaluadas, estados diferenciados de ausencia/no disponibilidad/motivo, advertencias, atribución sin resolver y etiquetas concisas de carácter provisional/no clínico; preservar las secciones del candidato global y de tracks.
 
-## Phase 3: Verification and bounded documentation
+## Fase 3: verificación y documentación acotada
 
-- [x] 3.1 Run `npm --prefix web test`; make the RED cases pass and verify existing rendered-app regressions, including request ownership, pending completion, and image failure fallback.
-- [x] 3.2 Run `npm --prefix web run build` and existing synthetic route/coordinator checks from the repository root: `.venv\Scripts\python.exe -m pytest tests/test_video_passages_api.py tests/test_video_passage_bcs.py -q`.
-- [x] 3.3 After the gallery works, add a concise local-use instruction to `docs/video-web.md` explaining how to inspect ordered passage evidence and its provisional limits; preserve all pre-existing doc hunks.
+- [x] 3.1 Ejecutar `npm --prefix web test`; hacer pasar los casos RED y verificar las regresiones existentes de la aplicación renderizada, incluida la propiedad de solicitudes, la finalización de estados pendientes y la alternativa ante fallos de imagen.
+- [x] 3.2 Ejecutar `npm --prefix web run build` y las comprobaciones sintéticas existentes de rutas/coordinador desde la raíz del repositorio: `.venv\Scripts\python.exe -m pytest tests/test_video_passages_api.py tests/test_video_passage_bcs.py -q`.
+- [x] 3.3 Cuando funcione la galería, agregar a `docs/video-web.md` una instrucción concisa de uso local que explique cómo inspeccionar la evidencia ordenada de pasajes y sus límites provisionales; preservar todos los fragmentos preexistentes del documento.
 
-## Phase 4: Passage count and best-frame refinement (RED → GREEN)
+## Fase 4: refinamiento del conteo de pasajes y del mejor frame (RED → GREEN)
 
-- [x] 4.1 In `web/ui.test.mjs`, add rendered RED assertions for `Pasadas detectadas: N` and completed-empty `: 0` from `passages.length` (not unresolved tracks); require “Mejor frame seleccionado para este pasaje” beside each supplied original and its BCS or reason.
-- [x] 4.2 In the same existing harness, cover count unknown for pending, request error, and failed/disabled/unavailable responses; assert disabled/unavailable reasons and escaped unknown reasons plus the explicit non-clinical caveat.
-- [x] 4.3 In `web/src/components.jsx`, render `Pasadas detectadas: N` only for completed results and “Mejor frame seleccionado para este pasaje” for each supplied original; retain BCS/reason and provisional-scope behavior.
-- [x] 4.4 Run `npm --prefix web test`; confirm the new RED cases pass without auxiliary stdin/data-URL test harnesses.
+- [x] 4.1 En `web/ui.test.mjs`, agregar aserciones RED renderizadas para `Pasadas detectadas: N` y `: 0` cuando la respuesta completada está vacía, usando `passages.length` (no tracks sin resolver); exigir “Mejor frame seleccionado para este pasaje” junto a cada original proporcionado y su BCS o motivo.
+- [x] 4.2 En el mismo arnés existente, cubrir que el conteo sea desconocido ante estados pendientes, errores de solicitud y respuestas `failed`/`disabled`/`unavailable`; comprobar los motivos de deshabilitado/no disponible y los motivos desconocidos escapados, además de la advertencia explícita de carácter no clínico.
+- [x] 4.3 En `web/src/components.jsx`, mostrar `Pasadas detectadas: N` solo para resultados completados y “Mejor frame seleccionado para este pasaje” para cada original proporcionado; conservar el comportamiento de BCS/motivos y el alcance provisional.
+- [x] 4.4 Ejecutar `npm --prefix web test`; confirmar que pasan los nuevos casos RED sin arneses auxiliares de stdin/data-URL.

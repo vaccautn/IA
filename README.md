@@ -1,41 +1,50 @@
 # VACCA Vision — API de detección bovina y BCS ordinal
 
-## Offline passage-label review (validate before scoring)
+## Revisión offline de etiquetas de pasajes (validar antes de puntuar)
 
-From `IA`, create a **new** blank-label pack from one tracking run:
+Desde `IA`, crear un paquete **nuevo** de etiquetas en blanco a partir de una ejecución de tracking:
 
 ```powershell
 .venv/Scripts/python.exe -B scripts/export_passage_bcs_labels.py outputs/short4cow-recovery-20261028 --source-video ../Videos/gemini_generated_video_b27b0d61.mp4 --output outputs/bcs-passage-review-originals-20261028
 ```
 
-`labels.csv` has one row per ordered provisional passage, including candidate-less
-intervals with an explicit reason and empty image references. `export.json` records
-source SHA256, summary-byte SHA256, interval/frame/temporal-track provenance and status.
-The v2 manifest declares `input_representation: full_original_frame_only`.
-`original` copies that passage's `best-original.jpg` byte-for-byte, without cropping,
-resizing or re-encoding; `representations` is `full_original` for available candidates.
-The full frame can include multiple animals and surrounding context; this choice
-is **not validation proof**. Compatibility columns `crop`, `mask` and `masked` stay
-empty, even with accepted segmentation. Derivative references/files are ignored;
-`segmentation_status`, when present, is source metadata only. Whole-track best
-images are never used, and missing originals never fall back to derivatives.
+`labels.csv` contiene una fila por cada pasaje provisional ordenado, incluidos los
+intervalos sin candidato, con un motivo explícito y referencias de imagen vacías.
+`export.json` registra el SHA256 de la fuente, el SHA256 de los bytes del resumen,
+la procedencia de intervalos, frames y tracks temporales, y el estado. El manifiesto
+v2 declara `input_representation: full_original_frame_only`. `original` copia el
+`best-original.jpg` de ese pasaje byte por byte, sin recortar, cambiar el tamaño ni
+volver a codificar; `representations` es `full_original` para los candidatos
+disponibles. El frame completo puede incluir varios animales y el contexto que los
+rodea; esta elección **no constituye una prueba de validación**. Las columnas de
+compatibilidad `crop`, `mask` y `masked` permanecen vacías, incluso si la
+segmentación fue aceptada. Se ignoran las referencias y los archivos derivados;
+si está presente, `segmentation_status` es solo metadato de origen. Nunca se usan
+las mejores imágenes de tracks completos y la falta de originales nunca se
+resuelve recurriendo a derivados.
 
-All `bcs_category`, `rump_visible` and `notes` cells start blank. Future expert
-annotations may use BCS categories `1`..`5`, visibility `yes`/`no`/`uncertain`, and
-free-text notes **after agreeing anatomical visibility and category criteria**;
-this tool neither validates completed sheets nor sets quality thresholds. Blank
-labels are not clinical unevaluable results. No scoring, API category, dataset
-materialization, automatic split or performance metric is produced.
+Todas las celdas `bcs_category`, `rump_visible` y `notes` comienzan en blanco. En el
+futuro, las anotaciones expertas podrán usar las categorías BCS `1`..`5`, los valores
+de visibilidad `yes`/`no`/`uncertain` y notas de texto libre **una vez acordados los
+criterios anatómicos de visibilidad y categoría**; esta herramienta no valida las
+planillas completadas ni establece umbrales de calidad. Las etiquetas en blanco no
+son resultados clínicos no evaluables. No se generan puntuaciones, categorías de
+API, materializaciones de conjuntos de datos, particiones automáticas ni métricas
+de rendimiento.
 
-Every row shares a source-video `group_id` (leakage prevention, **not cow identity**).
-Use more independent videos and expert labels on the same representation before
-evaluation; local data directories and a whole-image baseline do not establish those labels.
-An explicit source file is hashed and must match any recorded source digest. Without
-it, full SHA256 metadata (`input_sha256`, `video_sha256` or `source_video_sha256`) is
-required; basenames are never identities. The output parent must already exist.
-Existing outputs, overlapping input/output trees, linked paths, malformed metadata
-and missing required original files fail without publishing a partial pack.
-No models or weights are loaded. Existing mixed-representation packs are not rewritten.
+Todas las filas comparten un `group_id` del video de origen (para prevenir fugas,
+**no representa la identidad de una vaca**). Antes de evaluar, usar más videos
+independientes y etiquetas expertas para una misma representación; los directorios
+locales de datos y una línea base de imágenes completas no establecen esas etiquetas.
+Si se especifica un archivo de origen, se calcula su hash y debe coincidir con
+cualquier digest de origen registrado. Si no se especifica, se requieren metadatos
+SHA256 completos (`input_sha256`, `video_sha256` o `source_video_sha256`); los
+nombres base nunca se consideran identificadores. El directorio padre de salida
+debe existir previamente. Las salidas existentes, los árboles de entrada/salida
+superpuestos, las rutas enlazadas, los metadatos malformados y la falta de archivos
+originales obligatorios provocan un error sin publicar un paquete parcial. No se
+cargan modelos ni pesos. Los paquetes existentes con representaciones mixtas no
+se reescriben.
 
 ## Prototipo de video grabado
 
@@ -122,6 +131,7 @@ en los estados no cargado, listo, resultado y error.
 - [Arquitectura](docs/arquitectura.md): responsabilidades, flujos y límites entre detección, constructor BCS y servicio.
 - [Algoritmos de entrenamiento](docs/algoritmos-entrenamiento.md): YOLO26n y BCS CORAL, pérdida, optimizador y evidencia de las corridas.
 - [API](docs/api.md): servicio, contratos actuales y resolución de problemas.
+- [Tracking y recortes BCS](docs/tracking-y-recorte-por-vaca.md): contrato histórico de exportación por track, incluida la exigencia de verificar el video original.
 - [Guía operativa de entrenamiento BCS](docs/bcs-training-runbook.md): ejecución nueva,
   reanudación, progreso, registros y entrega a la API.
 - [Reporte de línea base BCS del 4 de septiembre de 2026](reports/bcs-category-baseline-2026-09-04.md):

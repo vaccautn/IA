@@ -143,6 +143,12 @@ $env:VACCA_BCS_CHECKPOINT_SHA256 = "<EXACT_SHA256_FROM_OVERNIGHT_VALIDATION>"
 | `GET` | `/metrics` | Ninguna | Contadores y latencias path-free por capacidad para operación del prototipo. |
 | `GET` | `/ui` | Ninguna | UI HTML de prototipo; 404 si falta el archivo. |
 
+La API de video local también ofrece `POST /api/v1/analyses?filename=...` con body
+binario (no multipart), lecturas de estado/pasajes y
+`DELETE /api/v1/analyses/{id}/artifacts` para limpiar artefactos terminales. El header
+opcional `Idempotency-Key` permite reintentar el mismo contenido sin crear un segundo
+trabajo; su detalle está en la [guía de video web](video-web.md).
+
 FastAPI agrega `/docs`, `/redoc` y `/openapi.json`. El OpenAPI declara los cuerpos
 exitosos y los errores `400`, `413`, `500` y `503` de `/detect`, además de `400`, `413`,
 `500` y `503` de `/bcs`; las solicitudes sin `file` conservan la validación `422` de FastAPI.
@@ -286,7 +292,7 @@ Estados y códigos HTTP:
 |---|---:|---|
 | `unconfigured` | 503 | `BCS capability is not configured.`; `model_status: none` en la deshabilitación de emergencia |
 | `not_installed` | 503 | `BCS private serving package is not installed.`; obtenga el ZIP desde la ubicación privada de VACCA Drive del equipo o del mantenedor |
-| `not_loaded` | 503 | `BCS capability is configured but not loaded.`; incluye el estado experimental del paquete |
+| `not_loaded` | 503 | `BCS capability is configured but not loaded.`; es el estado esperado antes de la primera inferencia y no indica que el paquete esté ausente; incluye el estado experimental del paquete |
 | `ready` | 200 | `BCS capability is ready.`; el paquete continúa sin aprobación de producción |
 | `unavailable` | 503 | `BCS capability is unavailable.`; el fallo queda cacheado hasta reiniciar |
 
