@@ -162,13 +162,18 @@ python scripts/export_bcs_crops.py materialize outputs\bcs-labeling\lote-1\label
 
 - Se exporta la silueta si fue aceptada; si no, el recorte rectangular
   (`image_kind`). `--include-review` agrega las trayectorias en revisión.
+- La exportación requiere que el video original citado en `summary.json` exista y
+  pueda leerse para calcular su SHA-256. Si falta, falla antes de crear la salida;
+  no sustituye la identidad por el nombre de la corrida ni por el basename del video.
+- Los nombres de imágenes incluyen el SHA-256 completo del video. Se prevalidan
+  los recortes y los destinos antes de copiar; una colisión aborta sin sobrescribir
+  archivos. La carpeta de salida debe ser nueva y nunca se reutiliza una salida previa.
 - Nunca se asigna una categoría automáticamente; filas vacías se omiten y
   cualquier valor fuera de 1..5 cancela sin copiar nada.
-- La exportación rechaza dos corridas del mismo video (por hash cuando el archivo
-  está disponible, si no por la ruta registrada) para evitar duplicar sus
-  muestras al comparar trackers. Esto no convierte los tracks en identidades.
-- `group` es una clave heurística para particionar: combina el SHA-256 del video
-  (o el nombre de la corrida si no se puede leer el archivo) con el `track_id`;
+- La exportación rechaza dos corridas del mismo video por SHA-256 para evitar
+  duplicar sus muestras al comparar trackers. Esto no convierte los tracks en identidades.
+- `group` es una clave heurística para particionar: combina el SHA-256 verificado del
+  video con el `track_id`;
   si hay un `possible_continuation_of` enlazado, el
   fragmento puede heredar el grupo anterior. Un ID temporal no verificado ni un
   enlace heurístico prueban que dos tracks sean el mismo animal. Los tracks

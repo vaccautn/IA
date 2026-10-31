@@ -131,6 +131,7 @@ en los estados no cargado, listo, resultado y error.
 - [Arquitectura](docs/arquitectura.md): responsabilidades, flujos y límites entre detección, constructor BCS y servicio.
 - [Algoritmos de entrenamiento](docs/algoritmos-entrenamiento.md): YOLO26n y BCS CORAL, pérdida, optimizador y evidencia de las corridas.
 - [API](docs/api.md): servicio, contratos actuales y resolución de problemas.
+- [Tracking y recortes BCS](docs/tracking-y-recorte-por-vaca.md): contrato histórico de exportación por track, incluida la exigencia de verificar el video original.
 - [Guía operativa de entrenamiento BCS](docs/bcs-training-runbook.md): ejecución nueva,
   reanudación, progreso, registros y entrega a la API.
 - [Reporte de línea base BCS del 4 de septiembre de 2026](reports/bcs-category-baseline-2026-09-04.md):

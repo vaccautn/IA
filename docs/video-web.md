@@ -157,9 +157,10 @@ el deslizador o reproducir la secuencia y descargar las detecciones JSONL.
 
 ## Aislamiento y estética
 
-El trabajo está en `feature/deteccion-video`, en el checkout `IA`. La interfaz y
-sus rutas se integran en `vacca_api`; los repositorios backend/frontend del equipo
-no requieren cambios. No es una integración productiva con usuarios o permisos.
+La UI local y sus rutas pertenecen al checkout `IA` y se integran en `vacca_api`;
+no importan código de los repositorios backend/frontend. La integración autenticada
+de análisis de sesiones es un recorrido separado, coordinado por el backend y
+documentado más abajo. Esta UI local no agrega usuarios ni permisos multiusuario.
 
 La interfaz es React. Se copiaron como snapshot la paleta CSS de
 `frontend/src/index.css`, Manrope y los recursos de marca de `frontend/public`
@@ -389,21 +390,21 @@ No se incluye un Dockerfile que reutilice los locks de Windows en Linux: eso
 requiere resolver y probar dependencias de otra plataforma. El arranque local
 anterior es el camino validado para esta entrega.
 
-## Conexión futura con VACCA
+## Relación con el backend de VACCA
 
-1. Mover los componentes del módulo a `features/videos` en el frontend y montarlos
-   bajo ProtectedRoute/AppLayout; reemplazar el adaptador `api.js` por httpClient
-   con JWT y las rutas que acuerde el backend. No copiar este shell encima del suyo.
-2. Reemplazar Store por trabajos autorizados del backend y almacenamiento R2.
-   El backend debe resolver los problemas de ownership identificados en
-   [la revisión de integración](revision-integracion-vacca-2026-10-01.md).
-3. Convertir Worker en consumidor de trabajos reclamados al backend, conservando
-   el procesador. Añadir lease, heartbeat, idempotencia y publicación de artefactos.
-4. Mantener versión y significado del resultado, agregando pruebas de contrato
-   entre ambos repositorios. La subida binaria local puede adaptarse a multipart
-   o a URLs firmadas; esa diferencia queda contenida en el adaptador HTTP.
+La integración de análisis de sesiones ya está implementada en el backend: este
+recibe la carga autenticada del frontend, admite el trabajo en IA mediante loopback,
+importa pasajes e imágenes según el orden guardado de la sesión y solicita la limpieza
+del video fuente después de persistir los resultados. El contrato correspondiente
+está documentado en `backend/docs/routers/analisis_video.md` dentro del repositorio
+backend.
 
-Es una base aislada para integrar, no la integración productiva ya terminada.
+Esta UI de IA continúa siendo un prototipo local independiente, con historial SQLite
+propio y sin usuarios ni permisos multiusuario. No es la UI autenticada de sesiones ni
+el almacenamiento de trabajos del backend. El backend puede usar R2 (predeterminado)
+o almacenamiento local configurado explícitamente; R2 no es un requisito del flujo.
+La interoperabilidad entre ambos recorridos se mantiene en sus contratos HTTP y no
+implica que esta UI se publique como interfaz de producción.
 
 ## Validación registrada de video y BCS
 
