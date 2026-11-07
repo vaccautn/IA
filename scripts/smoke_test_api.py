@@ -24,7 +24,6 @@ sys.path.insert(0, str(ROOT / "src"))
 from vacca_api import main as api_main  # noqa: E402
 from vacca_api.detection import DEFAULT_MODEL  # noqa: E402
 from vacca_api.schemas import BCSReadinessResponse, BCSResponse, DetectResponse, HealthResponse  # noqa: E402
-from vacca_bcs.serving_package import PRIVATE_PACKAGE_ID  # noqa: E402
 
 logger = logging.getLogger(__name__)
 LIVE_DETECT_INVALID_DETAIL = "File must be an image (JPEG or PNG)"
@@ -174,11 +173,14 @@ def _validate_bcs_before(readiness: BCSReadinessResponse) -> None:
         )
     if readiness.status != "not_loaded":
         raise SmokeCheckError(f"BCS readiness before inference was {readiness.status!r}")
+    # Los checks de detección y video no necesitan cargar PyTorch/BCS.
+    from vacca_bcs.serving_package import PRIVATE_PACKAGE_ID
     if readiness.model_status != "experimental_not_approved" or readiness.package_id != PRIVATE_PACKAGE_ID:
         raise SmokeCheckError("BCS smoke check requires the installed bundled experimental package")
 
 
 def _validate_bcs_response(body: object) -> BCSResponse:
+    from vacca_bcs.serving_package import PRIVATE_PACKAGE_ID
     response = BCSResponse.model_validate(body)
     if response.status != "ok" or response.bcs_category not in {1, 2, 3, 4, 5}:
         raise SmokeCheckError("BCS response category/status contract failed")

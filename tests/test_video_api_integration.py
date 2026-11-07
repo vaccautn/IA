@@ -666,6 +666,9 @@ def test_candidate_persistence_failure_keeps_cli_worker_and_api_completed(client
     from test_video_candidate import detection
     from vacca_video.bcs import VideoBCSCoordinator
     from vacca_video.worker import Worker
+    # platform.system() puede usar subprocess en Windows. El Popen simulado
+    # de este test sólo representa el CLI de video, no ese sondeo del sistema.
+    monkeypatch.setattr("scripts.process_video.platform.system", lambda: "Windows-test")
     job_id = submit(client).json()["id"]
     store = main.app.state.video.store
     original_write = cv2.imwrite
