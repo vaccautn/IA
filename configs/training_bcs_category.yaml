@@ -1,0 +1,26 @@
+# Configuración local de entrenamiento CORAL para categorías BCS 1..5.
+data_root: data/bcs-category-v1
+output_dir: outputs/bcs-category-coral-v1
+epochs: 30
+batch_size: 64
+lr: 0.0003
+weight_decay: 0.0001
+optimizer: AdamW
+lr_schedule: cosine
+warmup_epochs: 2
+patience: 8
+num_workers: 0
+val_num_workers: 2
+val_seed: 43
+progress_every_batches: 50
+imgsz: 224
+device: auto
+seed: 42
+# Sólo controles de aceptación de ingeniería provisionales; no constituyen validación clínica.
+provisional_acceptance_gates:
+  macro_f1_min: 0.75
+  balanced_accuracy_min: 0.75
+  class_f1_min: 0.70
+  class_within_one_min: 0.95
+  class_error_ge_2_max: 0.05
+  ordinal_mae_max: 0.35
