@@ -244,10 +244,11 @@ nueva ni una validación del BCS real sobre video.
 
 1. **Primera presentación:** ejecutar este CLI, mostrar el HTML y compartir el
    JSONL/MP4 y la configuración. Repetir con un video real antes de afirmar calidad.
-2. **Integración web:** backend crea un trabajo autorizado y registra su estado;
-   un worker invoca el núcleo de procesamiento y publica resultados. Frontend
-   consume el estado/resultados. Conservar los esquemas versionados o adaptar
-   explícitamente el contrato acordado; el CLI no es un gestor de trabajos durable.
+2. **Integración de sesiones (implementada):** el backend crea y autoriza el trabajo,
+   conserva el estado y el snapshot ordenado, y consume la API IA local; el frontend
+   usa sus rutas autenticadas para cargar, consultar y recuperar el análisis. IA
+   conserva su API y UI local independientes. El CLI por sí solo no es un gestor de
+   trabajos durable; el contrato del recorrido integrado pertenece al backend.
 3. **Cámara:** implementar una fuente con frames y tiempos monotónicos, cola
    acotada, descarte de atraso y reconexión. Un iterable compatible no resuelve por
    sí solo transporte, tiempo real ni sincronización con el navegador.

@@ -1,58 +1,58 @@
-# Proposal: IA Web Passage Validation
+# Propuesta: validación de pasajes en la web de IA
 
-## Intent
+## Intención
 
-Expose the existing ordered `/passages` results in the disposable local IA validation web so reviewers can inspect original passage images and experimental BCS outcomes—or understandable reasons when a passage was not evaluated. This makes actual endpoint behavior observable without mistaking provisional, video-scoped evidence for animal identity or clinical validation.
+Exponer los resultados ordenados existentes de `/passages` en la web local descartable de validación de IA, para que quienes revisan puedan inspeccionar las imágenes originales de los pasajes y los resultados experimentales de BCS, o motivos comprensibles cuando un pasaje no se haya evaluado. Esto permite observar el comportamiento real del endpoint sin confundir evidencia provisional y limitada a un video con la identidad del animal o una validación clínica.
 
-## Scope
+## Alcance
 
-### In Scope
-- Add frontend API/state handling for the selected analysis's existing passages endpoint, including pending refresh and reset/cancellation when selection changes.
-- Render passages in endpoint order with original images when supplied, experimental BCS only when evaluated, readable non-evaluation reasons otherwise, and endpoint/unresolved warnings.
-- Clearly label results and track references as provisional and identity-limited; retain existing global candidate BCS and tracks as distinct concepts.
-- Extend rendered UI tests for ordering, images, evaluated/unevaluable results, pending/terminal/error states, and analysis selection changes.
+### Incluido en el alcance
+- Agregar manejo de API/estado en el frontend para el endpoint de pasajes existente del análisis seleccionado, incluida la actualización mientras esté pendiente y el reinicio/cancelación cuando cambie la selección.
+- Mostrar los pasajes en el orden del endpoint, con imágenes originales cuando se proporcionen, BCS experimental solo cuando se haya evaluado, motivos legibles de no evaluación en los demás casos y advertencias del endpoint/de atribución sin resolver.
+- Etiquetar claramente los resultados y las referencias a tracks como provisionales y limitados respecto de la identidad; mantener diferenciados los conceptos existentes de BCS del candidato global y de los tracks.
+- Ampliar las pruebas de interfaz renderizada para cubrir el orden, las imágenes, los resultados evaluados/no evaluables, los estados pendiente/terminal/error y los cambios de análisis seleccionado.
 
-### Out of Scope
-- Changes to backend routes/schemas, R2 or remote services, production architecture/productization, dependencies, models, or generated validation outputs/data.
-- Claims or inference about unique-animal identity, clinical validity, calibration, or visibility/eligibility.
+### Fuera del alcance
+- Cambios en rutas/esquemas del backend, R2 o servicios remotos, arquitectura/productización para producción, dependencias, modelos o datos/resultados de validación generados.
+- Afirmaciones o inferencias sobre identidad individual del animal, validez clínica, calibración o visibilidad/elegibilidad.
 
-## Capabilities
+## Capacidades
 
-### New Capabilities
-- `ia-web-passage-validation`: Local validation UI for viewing ordered provisional passage evidence and endpoint status.
+### Capacidades nuevas
+- `ia-web-passage-validation`: interfaz local de validación para consultar evidencia provisional de pasajes ordenados y el estado del endpoint.
 
-### Modified Capabilities
-- None. No existing OpenSpec specs are present.
+### Capacidades modificadas
+- Ninguna. No existen especificaciones OpenSpec previas.
 
-## Approach
+## Enfoque
 
-Reuse the existing video API client, analysis hook, React UI, and rendered-app test harness. Consume the backend's existing passage list and original-image URLs; keep passage request lifecycle separate from global analysis, candidate BCS, and tracks. Do not infer semantics beyond the endpoint response.
+Reutilizar el cliente existente de la API de video, el hook de análisis, la interfaz React y el arnés de pruebas de la aplicación renderizada. Consumir la lista de pasajes y las URL de imágenes originales existentes del backend; mantener el ciclo de vida de las solicitudes de pasajes separado del análisis global, el BCS del candidato y los tracks. No inferir semánticas que excedan la respuesta del endpoint.
 
-## Affected Areas
+## Áreas afectadas
 
-| Area | Impact | Description |
+| Área | Impacto | Descripción |
 |---|---|---|
-| `web/src/api.js`, `web/src/useVideoAnalysis.js` | Modified | Fetch and manage selected-analysis passage state. |
-| `web/src/components.jsx`, `web/src/style.css` | Modified | Present ordered, clearly provisional passage evidence and statuses. |
-| `web/ui.test.mjs` | Modified | Verify rendering, ordering, lifecycle, and failure cases deterministically. |
+| `web/src/api.js`, `web/src/useVideoAnalysis.js` | Modificados | Obtener y administrar el estado de pasajes del análisis seleccionado. |
+| `web/src/components.jsx`, `web/src/style.css` | Modificados | Presentar evidencia y estados de pasajes ordenados y claramente provisionales. |
+| `web/ui.test.mjs` | Modificado | Verificar de forma determinista el renderizado, el orden, el ciclo de vida y los casos de fallo. |
 
-## Risks
+## Riesgos
 
-| Risk | Likelihood | Mitigation |
+| Riesgo | Probabilidad | Mitigación |
 |---|---|---|
-| Experimental categories or video-scoped tracks are mistaken for clinical results or animal identity. | Med | Label provisional status, show warnings, and render categories only for evaluated BCS outcomes. |
-| Passage requests outlive or overwrite the selected analysis. | Med | Tie refresh/reset and stale-response handling to selected-job lifecycle; cover selection changes in UI tests. |
+| Las categorías experimentales o los tracks limitados a un video se confunden con resultados clínicos o con la identidad animal. | Med | Etiquetar el estado provisional, mostrar advertencias y renderizar categorías solo para resultados BCS evaluados. |
+| Las solicitudes de pasajes sobreviven al análisis seleccionado o lo sobrescriben. | Med | Vincular la actualización/reinicialización y el manejo de respuestas desactualizadas al ciclo de vida del trabajo seleccionado; cubrir los cambios de selección en las pruebas de interfaz. |
 
-## Rollback Plan
+## Plan de reversión
 
-Revert the isolated frontend passage UI/API/hook changes and their tests. The existing backend endpoint and global candidate/tracks behavior remain unchanged.
+Revertir los cambios aislados de interfaz/API/hook de pasajes en el frontend y sus pruebas. El endpoint existente del backend y el comportamiento del candidato global/los tracks permanecen sin cambios.
 
-## Dependencies
+## Dependencias
 
-- Existing `GET /api/v1/analyses/{job_id}/passages` response and passage-original image URLs; no new dependency.
+- Respuesta existente de `GET /api/v1/analyses/{job_id}/passages` y URL de imágenes originales de pasajes; no se agrega ninguna dependencia.
 
-## Success Criteria
+## Criterios de éxito
 
-- [ ] The selected analysis's passages render in endpoint order with supplied original images; only evaluated outcomes show experimental categories, while other outcomes show readable reasons/status.
-- [ ] Pending, terminal, and error/unavailable states and unresolved-attribution caveats are visible without blocking or conflating global candidate/tracks results.
-- [ ] Deterministic rendered UI tests cover completed, pending, failure, and selected-analysis changes without model inference or generated-data changes.
+- [ ] Los pasajes del análisis seleccionado se muestran en el orden del endpoint con las imágenes originales proporcionadas; solo los resultados evaluados muestran categorías experimentales y los demás muestran motivos/estados legibles.
+- [ ] Los estados pendiente, terminal y error/no disponible, así como las advertencias sobre atribución sin resolver, son visibles sin bloquear ni confundir los resultados del candidato global/los tracks.
+- [ ] Las pruebas deterministas de interfaz renderizada cubren los estados completado, pendiente y fallido, además de los cambios del análisis seleccionado, sin inferencia de modelos ni cambios en los datos generados.

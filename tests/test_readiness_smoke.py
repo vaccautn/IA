@@ -577,6 +577,60 @@ class LiveSmokeReadinessTests(unittest.TestCase):
 
 
 class ProjectDependencyMetadataTests(unittest.TestCase):
+    def _assert_service_url_uses_shell_syntax(self, readme: str) -> None:
+        # Bare assignments are valid in dotenv files, not PowerShell commands.
+        commands = re.sub(
+            r"(?ms)^ {0,3}(?P<fence>(?P<marker>`|~)(?P=marker){2,})dotenv[ \t]*\r?\n"
+            r".*?^ {0,3}(?P=fence)(?P=marker)*[ \t]*$",
+            "",
+            readme,
+        )
+        self.assertNotRegex(commands, r"(?m)^\s*IA_SERVICE_URL=")
+
+    def test_service_url_syntax_allows_dotenv_and_powershell_examples(self) -> None:
+        assignment = "IA_SERVICE_URL=http://127.0.0.1:8001"
+        for fence in ("```", "~~~~"):
+            with self.subTest(fence=fence):
+                self._assert_service_url_uses_shell_syntax(
+                    f"  {fence}dotenv\n{assignment}\n  {fence}\n"
+                    '```powershell\n$env:IA_SERVICE_URL = "http://ia-api:8001/detect"\n```\n'
+                )
+
+    def test_service_url_syntax_rejects_bare_shell_assignments(self) -> None:
+        assignment = "IA_SERVICE_URL=http://ia-api:8001/detect"
+        examples = (
+            f"{assignment}\n",
+            f"```powershell\n{assignment}\n```\n",
+            f"```powershell\n{assignment} python scripts/run_api.py\n```\n",
+            f"```dotenv\n{assignment}\n```\n"
+            f"```powershell\n{assignment}\n```\n",
+            f"```dotenv\n{assignment}\n",
+        )
+        for example in examples:
+            with self.subTest(example=example):
+                with self.assertRaises(AssertionError):
+                    self._assert_service_url_uses_shell_syntax(example)
+
+    def test_service_url_syntax_stops_at_longer_dotenv_closing_fence(self) -> None:
+        assignment = "IA_SERVICE_URL=http://ia-api:8001/detect"
+        for marker in ("`", "~"):
+            with self.subTest(marker=marker):
+                dotenv = f"{marker * 3}dotenv\n{assignment}\n{marker * 4}\n"
+                with self.assertRaises(AssertionError):
+                    self._assert_service_url_uses_shell_syntax(
+                        dotenv + f"{marker * 3}powershell\n"
+                        f"{assignment} python scripts/run_api.py\n{marker * 3}\n"
+                    )
+                self._assert_service_url_uses_shell_syntax(dotenv)
+
+    def test_service_url_syntax_keeps_unmatched_dotenv_fences(self) -> None:
+        for opener, closer in (("````", "```"), ("~~~~", "~~~"), ("```", "~~~")):
+            with self.subTest(opener=opener, closer=closer):
+                with self.assertRaises(AssertionError):
+                    self._assert_service_url_uses_shell_syntax(
+                        f"{opener}dotenv\nIA_SERVICE_URL=http://127.0.0.1:8001\n{closer}\n"
+                    )
+
     def test_project_declares_only_reproducible_cpython_313_target(self) -> None:
         metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
@@ -678,7 +732,7 @@ class ProjectDependencyMetadataTests(unittest.TestCase):
         )
         self.assertIn('$env:IA_SERVICE_URL = "http://ia-api:8001/detect"', readme)
         self.assertIn('$env:IA_SERVICE_URL = "http://192.0.2.10:8001/detect"', readme)
-        self.assertNotRegex(readme, r"(?m)^\s*IA_SERVICE_URL=")
+        self._assert_service_url_uses_shell_syntax(readme)
         self.assertIn('& python -m venv "${deployRoot}\\.venv"', readme)
 
 

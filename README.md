@@ -1,41 +1,261 @@
 # VACCA Vision — API de detección bovina y BCS ordinal
 
-## Offline passage-label review (validate before scoring)
+## Inicio local: qué ejecutar y en qué orden
 
-From `IA`, create a **new** blank-label pack from one tracking run:
+**Para probar IA sola**, preparar únicamente `IA` y abrir `/ui` (imágenes) o
+`/videos/` (video local). **Para usar VACCA completa**, iniciar PostgreSQL → IA →
+backend → frontend, con una terminal independiente para cada servidor.
+
+| Componente | Directorio de trabajo | Dirección local | Dependencias |
+| --- | --- | --- | --- |
+| PostgreSQL 16 | `backend` | `localhost:5433` (contenedor: `5432`) | Docker con Compose |
+| IA | `IA` | `http://127.0.0.1:8001` | Python 3.13 x64, entorno y detector local |
+| Backend | `backend` | `http://127.0.0.1:8000` | Python 3.12+, PostgreSQL y migraciones |
+| Frontend principal | `frontend` | `http://localhost:5173` | Node.js y pnpm; backend para datos/login |
+
+Los comandos siguientes son para **Windows PowerShell**, con los repositorios
+hermanos en `C:\Users\renzo\repos\Proyeto Final`; ajustar esa ruta si corresponde.
+Cada bloque indica su directorio. No es necesario activar los entornos virtuales:
+se usa el intérprete de cada repo para evitar mezclar dependencias.
+Ejecutar los comandos uno por uno y detenerse si alguno falla. Mantener abiertas
+las terminales de los servidores; `Ctrl+C` detiene cada proceso.
+
+### Primera instalación: IA
+
+```powershell
+Set-Location "C:\Users\renzo\repos\Proyeto Final\IA"
+py -3.13 -m venv .venv
+.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-cpu.txt -r requirements-api.txt
+.venv\Scripts\python.exe -m pip install --no-deps --no-build-isolation -e ".[yolo,api]"
+Test-Path models\deploy\vacca-yolo26n-v1.pt
+```
+
+La comprobación debe devolver `True`. Ese es el detector versionado y cargado al
+arrancar: no hace falta entrenar ni descargar datasets. IA no necesita `.env`,
+PostgreSQL, R2 ni los otros dos repos para sus pantallas locales. El camino
+reproducible usa CPU; las condiciones de CUDA están en [Requisitos](#requisitos).
+
+**Solo para video con tracking/pasajes**, instalar además la dependencia opcional
+fijada (no está incluida en los locks CPU/API):
+
+```powershell
+# Desde IA; instalación adicional, separada del camino bloqueado con hashes.
+.venv\Scripts\python.exe -m pip install lap==0.5.13
+```
+
+Sin `lap`, el tracking falla explícitamente, aunque la detección puede completarse.
+`VACCA_VIDEO_TRACKING=0` desactiva esa etapa; no sirve para validar el flujo de
+pasajes de la aplicación completa. `models/segmentation/mobile_sam.pt` es opcional
+para siluetas, no un requisito de arranque ni del BCS sobre originales completos.
+
+**Solo para la pantalla local `/videos/`**, compilar su interfaz una vez desde
+`IA/web` (y repetir si cambia su código). Requiere Node.js/npm; el runtime Python
+no necesita Node. Este build no es el repo `frontend` ni requiere iniciar Vite:
+
+```powershell
+Set-Location "C:\Users\renzo\repos\Proyeto Final\IA\web"
+npm ci
+npm run build
+```
+
+BCS es independiente del detector: seguir el
+[camino de instalación del paquete privado](#camino-rápido-desde-un-clon-limpio-sin-entrenamiento)
+solo si se necesitan categorías experimentales. Se instala bajo
+`models/private/`; el catálogo público no contiene esos pesos. Sin el paquete,
+`/ready/bcs` responde `503` y no se generan categorías ficticias. Los proveedores
+simulados de las pruebas no son un modo de arranque con inferencia real.
+
+### Primera instalación: backend y base de datos
+
+Requiere Docker en ejecución y Python 3.12 o superior. Si se usa Python 3.13 para
+ambos repos, los entornos `.venv` deben seguir siendo independientes.
+
+```powershell
+Set-Location "C:\Users\renzo\repos\Proyeto Final\backend"
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+if (!(Test-Path -LiteralPath ".env")) { New-Item -ItemType File -Path ".env" | Out-Null }
+notepad .env
+```
+
+No se distribuye un `.env.example` de backend. Usar esta plantilla sin secretos y
+**reemplazar todos los `<...>`** antes de continuar; no sobrescribir un `.env`
+existente ni incorporarlo a Git:
+
+```dotenv
+SECRET_KEY=<secreto-privado-nuevo-de-al-menos-32-bytes>
+POSTGRES_DB=<nombre-local-de-base>
+POSTGRES_USER=<usuario-local>
+POSTGRES_PASSWORD=<clave-local-propia>
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5433
+STORAGE_BACKEND=local
+LOCAL_STORAGE_ROOT=<ruta-absoluta-fuera-de-los-repos>/vacca-media
+LOCAL_STORAGE_PUBLIC_BASE_URL=http://127.0.0.1:8000
+IA_SERVICE_URL=http://127.0.0.1:8001
+CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+```
+
+Los valores `POSTGRES_*` deben coincidir con la base creada por Compose. Elegir
+valores locales simples para usuario/clave: la URL de conexión se construye por
+interpolación, sin codificar caracteres reservados de URL. El almacenamiento
+`local` evita credenciales R2; no es el predeterminado y exige una clave propia y
+una ruta absoluta de medios fuera del repositorio. No usar claves de producción.
+
+```powershell
+# Desde backend, después de guardar la configuración.
+docker compose up -d
+docker compose ps
+# Esperar a que db esté healthy antes de aplicar migraciones.
+.venv\Scripts\python.exe -m alembic upgrade head
+# Solo la primera vez: solicita email, contraseña y nombre propios.
+.venv\Scripts\python.exe scripts/crear_superusuario.py
+```
+
+No es necesario cargar datos demo para arrancar. Las migraciones sí son necesarias:
+el arranque de la API no crea el esquema. La versión actual del backend requiere
+`c3a9e7b2d6f1` (diario durable de reintentos de importación de video, posterior a
+`f4d8c2a1b6e9`). Aplicar `upgrade head` antes de iniciar el backend actualizado;
+recargar el código no agrega la columna. Para detalles, consultar el
+[README del backend](../backend/README.md#setup-local).
+
+### Primera instalación: frontend principal
+
+Usar Node.js **22.13 o superior dentro de la rama 22**, o Node.js 24, y pnpm
+disponible en `PATH`. El lock actual de Vite 8/ESLint 10 no admite Node 18.
+
+```powershell
+Set-Location "C:\Users\renzo\repos\Proyeto Final\frontend"
+pnpm install
+```
+
+No es obligatorio crear un `.env`: el cliente usa por defecto
+`http://127.0.0.1:8000/api`. Para forzar la API local sin leer ni sobrescribir
+configuración existente, definir `$env:VITE_API_BASE_URL` antes de `pnpm dev`, como
+en el bloque siguiente. La URL debe incluir `/api`; nunca poner secretos en
+variables `VITE_*`, ya que se exponen al navegador.
+
+### Reinicio diario: tres terminales
+
+Con la instalación y configuración anteriores completas, no repetir `pip install`,
+`pnpm install`, la creación del usuario ni el build de video en cada arranque.
+
+**Terminal 1 — IA** (también es el único servidor necesario para probar IA sola):
+
+```powershell
+Set-Location "C:\Users\renzo\repos\Proyeto Final\IA"
+.venv\Scripts\python.exe scripts/run_api.py
+# Alternativa para abrir automáticamente /videos/: agregar --open al comando.
+```
+
+**Terminal 2 — PostgreSQL y backend**:
+
+```powershell
+Set-Location "C:\Users\renzo\repos\Proyeto Final\backend"
+docker compose up -d
+docker compose ps
+# Con db healthy; aplica también migraciones nuevas al cambiar de revisión.
+.venv\Scripts\python.exe -m alembic upgrade head
+.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+**Terminal 3 — frontend**:
+
+```powershell
+Set-Location "C:\Users\renzo\repos\Proyeto Final\frontend"
+$env:VITE_API_BASE_URL = "http://127.0.0.1:8000/api"
+pnpm dev
+```
+
+Abrir la dirección que informe Vite (normalmente `http://localhost:5173`) e ingresar
+con el usuario creado. El navegador consume backend; backend consume IA por
+loopback. Mantener una sola instancia de IA y `WEB_CONCURRENCY` ausente o en `1`.
+Para detener PostgreSQL sin borrar su volumen: `docker compose stop` desde backend.
+
+### Comprobación y problemas frecuentes
+
+Desde otra terminal, con los servicios activos:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8001/health
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+
+Swagger: `http://127.0.0.1:8001/docs` y `http://127.0.0.1:8000/docs`.
+IA: imágenes en `/ui`, video local en `/videos/`. El health del backend devuelve
+`status: ok`, pero **no verifica PostgreSQL, almacenamiento ni IA**. Tampoco un
+health exitoso de IA confirma que BCS o tracking estén disponibles.
+
+| Síntoma | Revisar primero |
+| --- | --- |
+| IA no inicia o falla la carga del detector | Python 3.13, ambos locks y el archivo `models/deploy/vacca-yolo26n-v1.pt`; leer el error de la terminal. |
+| `/videos/` devuelve `503` | Build de `IA/web`; si fallan también las rutas de análisis, dependencias `cv2`/`ultralytics`, permisos/espacio de `outputs/web` y log del worker. |
+| No aparecen pasajes o falla tracking | Instalar `lap==0.5.13` y revisar que `VACCA_VIDEO_TRACKING` no sea `0`; reiniciar IA después de corregir el entorno. |
+| `/ready/bcs` devuelve `503` | Sin paquete privado es esperado; consultar el estado y la sección de instalación BCS, no sustituirlo por un stub. |
+| Backend no conecta o faltan tablas | Docker, estado healthy, puerto `5433`, valores de `.env` y `alembic upgrade head`. Cambiar `.env` no cambia credenciales de un volumen PostgreSQL ya inicializado; no borrar datos para resolverlo. |
+| Fallan archivos sin R2 | Selección explícita `STORAGE_BACKEND=local`, secreto propio y ruta absoluta escribible fuera del repo. |
+| Frontend no conecta o tiene errores CORS | URL con `/api`, backend activo y origen exacto de Vite en `CORS_ALLOWED_ORIGINS`; reiniciar los procesos tras cambiar configuración. |
+
+Para imágenes de evaluaciones, backend llama primero a `/detect` y exige al menos
+una detección `cow` con confianza **≥ 0,80**; el detector IA usa **0,25** por defecto.
+Superada esa validación, envía la imagen completa a `/bcs`. Si BCS no está disponible
+o no entrega categoría, puede guardar la imagen dejando la CC pendiente; una respuesta
+BCS malformada se rechaza. La CC manual existente prevalece. No hay una regla explícita
+que rechace varias vacas ni un selector del animal objetivo para BCS: recomendar una
+foto individual no equivale a garantizar la atribución. Consultar el
+[contrato de imágenes](../backend/docs/routers/evaluacion.md#imágenes-adjuntas-evidencia-visual)
+para distinguir rechazo, confianza insuficiente, servicio y almacenamiento.
+
+Para un video de sesión real, registrar primero los ingresos ordenados en una
+sesión abierta desde el frontend. La UI local de IA no sustituye ese flujo
+autenticado. Los límites y contratos están en [video-web.md](docs/video-web.md);
+los resultados BCS siguen siendo experimentales y no aprobados clínicamente.
+
+## Revisión offline de etiquetas de pasajes (validar antes de puntuar)
+
+Desde `IA`, crear un paquete **nuevo** de etiquetas en blanco a partir de una ejecución de tracking:
 
 ```powershell
 .venv/Scripts/python.exe -B scripts/export_passage_bcs_labels.py outputs/short4cow-recovery-20261028 --source-video ../Videos/gemini_generated_video_b27b0d61.mp4 --output outputs/bcs-passage-review-originals-20261028
 ```
 
-`labels.csv` has one row per ordered provisional passage, including candidate-less
-intervals with an explicit reason and empty image references. `export.json` records
-source SHA256, summary-byte SHA256, interval/frame/temporal-track provenance and status.
-The v2 manifest declares `input_representation: full_original_frame_only`.
-`original` copies that passage's `best-original.jpg` byte-for-byte, without cropping,
-resizing or re-encoding; `representations` is `full_original` for available candidates.
-The full frame can include multiple animals and surrounding context; this choice
-is **not validation proof**. Compatibility columns `crop`, `mask` and `masked` stay
-empty, even with accepted segmentation. Derivative references/files are ignored;
-`segmentation_status`, when present, is source metadata only. Whole-track best
-images are never used, and missing originals never fall back to derivatives.
+`labels.csv` contiene una fila por cada pasaje provisional ordenado, incluidos los
+intervalos sin candidato, con un motivo explícito y referencias de imagen vacías.
+`export.json` registra el SHA256 de la fuente, el SHA256 de los bytes del resumen,
+la procedencia de intervalos, frames y tracks temporales, y el estado. El manifiesto
+v2 declara `input_representation: full_original_frame_only`. `original` copia el
+`best-original.jpg` de ese pasaje byte por byte, sin recortar, cambiar el tamaño ni
+volver a codificar; `representations` es `full_original` para los candidatos
+disponibles. El frame completo puede incluir varios animales y el contexto que los
+rodea; esta elección **no constituye una prueba de validación**. Las columnas de
+compatibilidad `crop`, `mask` y `masked` permanecen vacías, incluso si la
+segmentación fue aceptada. Se ignoran las referencias y los archivos derivados;
+si está presente, `segmentation_status` es solo metadato de origen. Nunca se usan
+las mejores imágenes de tracks completos y la falta de originales nunca se
+resuelve recurriendo a derivados.
 
-All `bcs_category`, `rump_visible` and `notes` cells start blank. Future expert
-annotations may use BCS categories `1`..`5`, visibility `yes`/`no`/`uncertain`, and
-free-text notes **after agreeing anatomical visibility and category criteria**;
-this tool neither validates completed sheets nor sets quality thresholds. Blank
-labels are not clinical unevaluable results. No scoring, API category, dataset
-materialization, automatic split or performance metric is produced.
+Todas las celdas `bcs_category`, `rump_visible` y `notes` comienzan en blanco. En el
+futuro, las anotaciones expertas podrán usar las categorías BCS `1`..`5`, los valores
+de visibilidad `yes`/`no`/`uncertain` y notas de texto libre **una vez acordados los
+criterios anatómicos de visibilidad y categoría**; esta herramienta no valida las
+planillas completadas ni establece umbrales de calidad. Las etiquetas en blanco no
+son resultados clínicos no evaluables. No se generan puntuaciones, categorías de
+API, materializaciones de conjuntos de datos, particiones automáticas ni métricas
+de rendimiento.
 
-Every row shares a source-video `group_id` (leakage prevention, **not cow identity**).
-Use more independent videos and expert labels on the same representation before
-evaluation; local data directories and a whole-image baseline do not establish those labels.
-An explicit source file is hashed and must match any recorded source digest. Without
-it, full SHA256 metadata (`input_sha256`, `video_sha256` or `source_video_sha256`) is
-required; basenames are never identities. The output parent must already exist.
-Existing outputs, overlapping input/output trees, linked paths, malformed metadata
-and missing required original files fail without publishing a partial pack.
-No models or weights are loaded. Existing mixed-representation packs are not rewritten.
+Todas las filas comparten un `group_id` del video de origen (para prevenir fugas,
+**no representa la identidad de una vaca**). Antes de evaluar, usar más videos
+independientes y etiquetas expertas para una misma representación; los directorios
+locales de datos y una línea base de imágenes completas no establecen esas etiquetas.
+Si se especifica un archivo de origen, se calcula su hash y debe coincidir con
+cualquier digest de origen registrado. Si no se especifica, se requieren metadatos
+SHA256 completos (`input_sha256`, `video_sha256` o `source_video_sha256`); los
+nombres base nunca se consideran identificadores. El directorio padre de salida
+debe existir previamente. Las salidas existentes, los árboles de entrada/salida
+superpuestos, las rutas enlazadas, los metadatos malformados y la falta de archivos
+originales obligatorios provocan un error sin publicar un paquete parcial. No se
+cargan modelos ni pesos. Los paquetes existentes con representaciones mixtas no
+se reescriben.
 
 ## Prototipo de video grabado
 
@@ -105,6 +325,10 @@ deserializar ni construir el modelo; si el paquete falta o está alterado, infor
 
 Para una verificación mínima:
 
+Las consultas GET funcionan en Windows PowerShell 5.1. El envío de archivos con
+`Invoke-RestMethod -Form` requiere PowerShell 7; en 5.1 usar Swagger (`/docs`) para
+la carga multipart.
+
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8001/health
 Invoke-RestMethod http://127.0.0.1:8001/ready/bcs # not_installed antes de instalar; not_loaded después
@@ -122,6 +346,7 @@ en los estados no cargado, listo, resultado y error.
 - [Arquitectura](docs/arquitectura.md): responsabilidades, flujos y límites entre detección, constructor BCS y servicio.
 - [Algoritmos de entrenamiento](docs/algoritmos-entrenamiento.md): YOLO26n y BCS CORAL, pérdida, optimizador y evidencia de las corridas.
 - [API](docs/api.md): servicio, contratos actuales y resolución de problemas.
+- [Tracking y recortes BCS](docs/tracking-y-recorte-por-vaca.md): contrato histórico de exportación por track, incluida la exigencia de verificar el video original.
 - [Guía operativa de entrenamiento BCS](docs/bcs-training-runbook.md): ejecución nueva,
   reanudación, progreso, registros y entrega a la API.
 - [Reporte de línea base BCS del 4 de septiembre de 2026](reports/bcs-category-baseline-2026-09-04.md):
@@ -289,6 +514,9 @@ validación operativa de un candidato.
 `http://127.0.0.1:8001/docs` — documentación interactiva; puede probar los endpoints directamente desde el navegador.
 
 ### Opción 3: curl / PowerShell
+
+El parámetro `-Form` de estos ejemplos requiere PowerShell 7, no Windows
+PowerShell 5.1. Para este último, usar la carga de archivos de Swagger.
 
 ```powershell
 # Health check

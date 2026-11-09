@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -72,6 +73,83 @@ def test_same_video_from_two_trackers_is_rejected(tmp_path, video):
     with pytest.raises(ValueError, match="un solo tracker"):
         export_crops([first, second], tmp_path / "out")
     assert not (tmp_path / "out").exists()
+
+
+def test_missing_original_video_identity_is_rejected_before_copying(tmp_path, monkeypatch):
+    runs_root = tmp_path / "runs"
+    first_root = runs_root / "first"
+    second_root = runs_root / "second"
+    first_root.mkdir(parents=True)
+    second_root.mkdir(parents=True)
+    first = _run(first_root, "run", first_root / "same-name.mp4", [_track(1)])
+    second = _run(second_root, "run", second_root / "same-name.mp4", [_track(1)])
+    copied = []
+    monkeypatch.setattr("vacca_video.bcs_export.shutil.copyfile", lambda *args: copied.append(args))
+
+    with pytest.raises(ValueError, match="video original.*identidad"):
+        export_crops([first, second], tmp_path / "out")
+
+    assert copied == []
+    assert not (tmp_path / "out").exists()
+
+
+def test_same_video_basename_with_distinct_sources_gets_distinct_export_names(tmp_path):
+    first_source = tmp_path / "first" / "same-name.mp4"
+    second_source = tmp_path / "second" / "same-name.mp4"
+    first_source.parent.mkdir()
+    second_source.parent.mkdir()
+    first_source.write_bytes(b"synthetic video one")
+    second_source.write_bytes(b"synthetic video two")
+    first = _run(tmp_path / "runs-a", "run", first_source, [_track(1)])
+    second = _run(tmp_path / "runs-b", "run", second_source, [_track(1)])
+    (first / "tracks/1/best-crop.png").write_bytes(b"crop from first source")
+    (second / "tracks/1/best-crop.png").write_bytes(b"crop from second source")
+
+    result = export_crops([first, second], tmp_path / "out")
+
+    rows = _rows(tmp_path / "out")
+    assert result["images"] == 2
+    assert rows[0]["video"] == rows[1]["video"] == "same-name.mp4"
+    assert rows[0]["video_sha256"] != rows[1]["video_sha256"]
+    assert rows[0]["image"] != rows[1]["image"]
+    assert {
+        row["video_sha256"]: (tmp_path / "out/images" / row["image"]).read_bytes()
+        for row in rows
+    } == {
+        hashlib.sha256(first_source.read_bytes()).hexdigest(): b"crop from first source",
+        hashlib.sha256(second_source.read_bytes()).hexdigest(): b"crop from second source",
+    }
+
+
+def test_duplicate_planned_crop_name_is_rejected_before_copying(tmp_path, video, monkeypatch):
+    run = _run(tmp_path, "run", video, [_track(1)])
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    summary["tracks"].append(dict(summary["tracks"][0]))
+    (run / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    copied = []
+    monkeypatch.setattr("vacca_video.bcs_export.shutil.copyfile", lambda *args: copied.append(args))
+
+    with pytest.raises(ValueError, match="destino de imagen duplicado"):
+        export_crops([run], tmp_path / "out")
+
+    assert copied == []
+    assert not (tmp_path / "out").exists()
+
+
+def test_export_refuses_reusing_an_existing_output_without_overwriting(tmp_path, video, monkeypatch):
+    run = _run(tmp_path, "run", video, [_track(1)])
+    output = tmp_path / "out"
+    export_crops([run], output)
+    labels = output / "labels.csv"
+    original_labels = labels.read_bytes()
+    copied = []
+    monkeypatch.setattr("vacca_video.bcs_export.shutil.copyfile", lambda *args: copied.append(args))
+
+    with pytest.raises(ValueError, match="ya existe"):
+        export_crops([run], output)
+
+    assert labels.read_bytes() == original_labels
+    assert copied == []
 
 
 def test_materialize_builds_category_folders_and_groups(tmp_path, video):

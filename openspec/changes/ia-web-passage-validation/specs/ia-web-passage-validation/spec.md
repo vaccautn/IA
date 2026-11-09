@@ -1,99 +1,99 @@
-# IA Web Passage Validation Specification
+# Especificación de validación de pasajes en la web de IA
 
-## Purpose
+## Propósito
 
-Specify the disposable local validation UI for inspecting the existing ordered passage endpoint without implying animal identity, clinical validity, or product readiness.
+Especificar la interfaz local descartable de validación para inspeccionar el endpoint existente de pasajes ordenados sin implicar identidad animal, validez clínica ni preparación para producción.
 
-## Requirements
+## Requisitos
 
-### Requirement: Selected analysis passage lifecycle
+### Requisito: ciclo de vida de pasajes del análisis seleccionado
 
-The UI MUST request the existing passages endpoint for the selected analysis and keep its loading, response, and request-error state separate from global analysis results, candidate BCS, and tracks. It MUST refresh while the endpoint reports `pending`, stop refreshing for terminal statuses, and ignore responses belonging to a previously selected analysis.
+La interfaz DEBE solicitar el endpoint de pasajes existente para el análisis seleccionado y mantener sus estados de carga, respuesta y error de solicitud separados de los resultados globales del análisis, el BCS del candidato y los tracks. DEBE actualizar mientras el endpoint informe `pending`, dejar de actualizar en estados terminales e ignorar las respuestas correspondientes a un análisis seleccionado anteriormente.
 
-#### Scenario: Pending passage tracking settles
+#### Escenario: se resuelve el tracking de pasajes pendiente
 
-- GIVEN a selected analysis returns `pending`
-- WHEN the UI refreshes its passage request
-- THEN it shows a pending/refreshing state until a terminal response arrives
-- AND it presents passages from the settled response
+- DADO que un análisis seleccionado devuelve `pending`
+- CUANDO la interfaz actualiza su solicitud de pasajes
+- ENTONCES muestra un estado pendiente/en actualización hasta que llega una respuesta terminal
+- Y presenta los pasajes de la respuesta ya resuelta
 
-#### Scenario: Selection changes during a request
+#### Escenario: cambia la selección durante una solicitud
 
-- GIVEN a passage request for analysis A is in flight
-- WHEN analysis B is selected before that request resolves
-- THEN A's response MUST NOT appear under B
-- AND B's passage state MUST load independently
+- DADO que hay una solicitud de pasajes en curso para el análisis A
+- CUANDO se selecciona el análisis B antes de que esa solicitud se resuelva
+- ENTONCES la respuesta de A NO DEBE aparecer bajo B
+- Y el estado de pasajes de B DEBE cargarse de manera independiente
 
-#### Scenario: Request error or terminal endpoint status
+#### Escenario: error de solicitud o estado terminal del endpoint
 
-- GIVEN the endpoint request fails or returns `failed`, `disabled`, or `unavailable`
-- WHEN the passage section renders
-- THEN it MUST show an understandable non-success state and any supplied reason
-- AND it MUST NOT present that state as an empty successful result
+- DADO que la solicitud al endpoint falla o devuelve `failed`, `disabled` o `unavailable`
+- CUANDO se renderiza la sección de pasajes
+- ENTONCES DEBE mostrar un estado comprensible de no éxito y cualquier motivo proporcionado
+- Y NO DEBE mostrar ese estado como un resultado vacío satisfactorio
 
-### Requirement: Ordered passage evidence and evaluation state
+### Requisito: evidencia de pasajes ordenada y estado de evaluación
 
-The UI MUST preserve endpoint passage order and show the original image only when `candidate.best_original_url` is supplied. It MUST show an experimental category only for a `bcs.status` of `evaluated` with a supplied category; absent BCS, `unevaluable` BCS, unavailable aggregate BCS, and unavailable images MUST remain distinct and MUST NOT be replaced by inferred values. Known reasons SHOULD be explained in Spanish; unknown reason values MUST remain visible as escaped plain text.
+La interfaz DEBE conservar el orden de pasajes del endpoint y mostrar la imagen original solo cuando se proporcione `candidate.best_original_url`. DEBE mostrar una categoría experimental únicamente cuando `bcs.status` sea `evaluated` y se haya proporcionado una categoría; la ausencia de BCS, el BCS `unevaluable`, el BCS agregado no disponible y las imágenes no disponibles DEBEN seguir siendo estados diferenciados y NO DEBEN reemplazarse por valores inferidos. Los motivos conocidos DEBERÍAN explicarse en español; los valores de motivos desconocidos DEBEN seguir visibles como texto plano escapado.
 
-#### Scenario: Completed passage results
+#### Escenario: resultados de pasajes completados
 
-- GIVEN a completed response with passages, original-image URLs, and evaluated BCS
-- WHEN the section renders
-- THEN passages appear in response order with supplied originals and experimental categories only for evaluated results
-- AND each passage is clearly labeled provisional, not an identified animal or clinical result
+- DADO que hay una respuesta completada con pasajes, URL de imágenes originales y BCS evaluado
+- CUANDO se renderiza la sección
+- ENTONCES los pasajes aparecen en el orden de la respuesta, con los originales proporcionados y categorías experimentales solo para resultados evaluados
+- Y cada pasaje se identifica claramente como provisional, no como un animal identificado ni un resultado clínico
 
-#### Scenario: Missing image or evaluation
+#### Escenario: falta la imagen o la evaluación
 
-- GIVEN a passage has no original URL, no BCS result, or an `unevaluable` BCS result
-- WHEN the section renders
-- THEN it shows image-unavailable or not-evaluated status and the supplied reason when present
-- AND it does not show a fabricated image, category, or reason
+- DADO que un pasaje no tiene URL original, no tiene resultado BCS o tiene un resultado BCS `unevaluable`
+- CUANDO se renderiza la sección
+- ENTONCES muestra el estado de imagen no disponible o no evaluada y el motivo proporcionado, si existe
+- Y no muestra una imagen, categoría o motivo inventados
 
-#### Scenario: Empty completed response and BCS warning
+#### Escenario: respuesta completada vacía y advertencia de BCS
 
-- GIVEN a completed response has no passages, or aggregate `bcs_status` is `unavailable`
-- WHEN the section renders
-- THEN it shows an explicit empty state or BCS-unavailable warning respectively
-- AND neither condition is presented as a successful evaluated passage
+- DADO que una respuesta completada no tiene pasajes o que `bcs_status` agregado es `unavailable`
+- CUANDO se renderiza la sección
+- ENTONCES muestra, respectivamente, un estado vacío explícito o una advertencia de BCS no disponible
+- Y ninguna de las dos condiciones se presenta como un pasaje evaluado satisfactoriamente
 
-### Requirement: Completed passage count and per-passage best-frame labeling
+### Requisito: conteo de pasajes completados y etiqueta del mejor frame por pasaje
 
-For a completed response, the UI MUST show the number of detected passages using the endpoint's `passages` array length (the current response schema has no separate total-count field). It MUST label each supplied `candidate.best_original_url` as the best frame selected for that passage, not as a global candidate or track crop, and show that passage's evaluated BCS or its supplied non-evaluation reason. The UI MUST NOT count tracks or unresolved attributions as passages, claim unique-animal identity, or introduce a new selection algorithm, model, or schema. Until a completed response is available, the count MUST remain unknown rather than displaying zero.
+Ante una respuesta completada, la interfaz DEBE mostrar la cantidad de pasajes detectados usando el tamaño del array `passages` del endpoint (el esquema actual de respuesta no tiene un campo separado de conteo total). DEBE etiquetar cada `candidate.best_original_url` proporcionado como el mejor frame seleccionado para ese pasaje, no como candidato global ni recorte de track, y mostrar el BCS evaluado de ese pasaje o el motivo de no evaluación proporcionado. La interfaz NO DEBE contar tracks ni atribuciones sin resolver como pasajes, afirmar identidad individual del animal ni introducir un nuevo algoritmo de selección, modelo o esquema. Hasta que haya una respuesta completada, el conteo DEBE permanecer desconocido en lugar de mostrar cero.
 
-#### Scenario: Completed response reports passage count and per-passage results
+#### Escenario: la respuesta completada informa el conteo de pasajes y los resultados por pasaje
 
-- GIVEN a completed response contains two passages and unresolved tracks
-- WHEN the passage section renders
-- THEN it displays “Pasadas detectadas: 2,” counting only the `passages` array
-- AND each passage's supplied original is labeled as its best selected frame, alongside its evaluated BCS or supplied non-evaluation reason
+- DADO que una respuesta completada contiene dos pasajes y tracks sin resolver
+- CUANDO se renderiza la sección de pasajes
+- ENTONCES muestra «Pasadas detectadas: 2», contando únicamente el array `passages`
+- Y el original proporcionado para cada pasaje se etiqueta como su mejor frame seleccionado, junto con su BCS evaluado o el motivo de no evaluación proporcionado
 
-#### Scenario: Completed response contains no passages
+#### Escenario: la respuesta completada no contiene pasajes
 
-- GIVEN a completed response has an empty `passages` array
-- WHEN the passage section renders
-- THEN it explicitly displays “Pasadas detectadas: 0” and the existing empty state
-- AND it does not infer a count from tracks or unresolved attributions
+- DADO que una respuesta completada tiene un array `passages` vacío
+- CUANDO se renderiza la sección de pasajes
+- ENTONCES muestra explícitamente «Pasadas detectadas: 0» y el estado vacío existente
+- Y no infiere el conteo a partir de tracks ni de atribuciones sin resolver
 
-#### Scenario: Passage count is not yet known
+#### Escenario: todavía no se conoce el conteo de pasajes
 
-- GIVEN the endpoint is pending, the request fails, or the endpoint is failed, disabled, or unavailable
-- WHEN the passage section renders
-- THEN it shows the applicable pending or non-success state without displaying zero as the detected-passage count
+- DADO que el endpoint está pendiente, la solicitud falla o el endpoint está `failed`, `disabled` o `unavailable`
+- CUANDO se renderiza la sección de pasajes
+- ENTONCES muestra el estado pendiente o de no éxito que corresponda, sin mostrar cero como conteo de pasajes detectados
 
-### Requirement: Attribution, endpoint warnings, and concept boundaries
+### Requisito: atribución, advertencias del endpoint y límites entre conceptos
 
-The UI MUST surface endpoint warnings and unresolved passage-attribution information when present, explain that passage evidence and track identifiers are provisional and scoped to one video, and distinguish the passage gallery from the global candidate BCS and tracks sections.
+La interfaz DEBE mostrar las advertencias del endpoint y la información de atribución de pasajes sin resolver cuando estén presentes, explicar que la evidencia de pasajes y los identificadores de tracks son provisionales y se limitan a un video, y distinguir la galería de pasajes de las secciones de BCS del candidato global y de tracks.
 
-#### Scenario: Unresolved attribution and warnings
+#### Escenario: atribución sin resolver y advertencias
 
-- GIVEN a response includes unresolved tracks or warning values
-- WHEN the completed passage section renders
-- THEN it communicates the unresolved count/details and warnings without claiming unique-animal identity or visibility
-- AND unknown warning values remain visible as escaped plain text
+- DADO que una respuesta incluye tracks sin resolver o valores de advertencia
+- CUANDO se renderiza la sección de pasajes completados
+- ENTONCES comunica el conteo/detalle sin resolver y las advertencias sin afirmar identidad individual del animal ni visibilidad
+- Y los valores de advertencia desconocidos siguen visibles como texto plano escapado
 
-#### Scenario: Global candidate and tracks remain distinct
+#### Escenario: el candidato global y los tracks siguen siendo conceptos distintos
 
-- GIVEN the selected analysis has global candidate BCS or tracks alongside passages
-- WHEN all result sections render
-- THEN the passage gallery is explicitly identified as passage-specific
-- AND global candidate BCS and tracks remain separately labeled and unchanged in meaning
+- DADO que el análisis seleccionado tiene BCS de candidato global o tracks además de pasajes
+- CUANDO se renderizan todas las secciones de resultados
+- ENTONCES la galería se identifica explícitamente como específica de los pasajes
+- Y el BCS del candidato global y los tracks siguen etiquetados por separado y conservan su significado

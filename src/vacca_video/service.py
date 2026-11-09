@@ -61,11 +61,13 @@ class VideoResources:
             self._worker_faulted = True
             self._available = False
 
-    def add_job_if_available(self, job_id, filename):
+    def add_job_if_available(
+        self, job_id, filename, idempotency_key=None, source_sha256=None, source_size=None
+    ):
         with self._admission_lock:
             if not self._available:
                 return False
-            self.store.add(job_id, filename)
+            self.store.add(job_id, filename, idempotency_key, source_sha256, source_size)
             return True
 
     def _recover_tracking(self):

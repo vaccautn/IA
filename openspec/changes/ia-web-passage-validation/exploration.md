@@ -1,37 +1,37 @@
-## Exploration: IA web passage validation
+## Exploración: validación de pasajes en la web de IA
 
-### Current State
-The IA web accepts local MP4/MOV uploads through `POST /api/v1/analyses`, polls analysis jobs, and renders sampled annotated frames, one global candidate BCS result, and tracks. Its API client has no `/passages` method, and the UI never renders the endpoint's ordered provisional passages. The backend already provides `GET /api/v1/analyses/{job_id}/passages` and per-sequence image routes. The response distinguishes pending, failed, disabled, and unavailable states; completed responses contain ordered passage entries, original-image URLs when available, authoritative BCS outcomes/reasons, and unresolved-attribution warnings.
+### Estado actual
+La web de IA acepta cargas locales MP4/MOV mediante `POST /api/v1/analyses`, consulta periódicamente los trabajos de análisis y muestra frames anotados muestreados, un resultado global de BCS del candidato y tracks. Su cliente de API no tiene un método `/passages` y la interfaz nunca muestra los pasajes provisionales ordenados del endpoint. El backend ya proporciona `GET /api/v1/analyses/{job_id}/passages` y rutas de imágenes por secuencia. La respuesta distingue los estados pendiente, fallido, deshabilitado y no disponible; las respuestas completadas contienen entradas de pasajes ordenadas, URL de imágenes originales cuando están disponibles, resultados/motivos autoritativos de BCS y advertencias de atribución sin resolver.
 
-Existing evidence is substantial: `outputs/5cow-validation-20261028/passages-response.json` records five provisional passages in sequence with categories 4, 4, 3, 3, 3 and original-image URLs; `validation-summary.json` records HTTP 200 and successful original-image URL checks. This is a validation result, not evidence of animal identity or clinical validity. The existing UI integration test bundles the real React app and hook with a simulated API; backend passage route tests use synthetic artifacts. Both are suitable for adding deterministic coverage without model inference.
+La evidencia existente es considerable: `outputs/5cow-validation-20261028/passages-response.json` registra cinco pasajes provisionales en secuencia con las categorías 4, 4, 3, 3, 3 y URL de imágenes originales; `validation-summary.json` registra HTTP 200 y comprobaciones satisfactorias de las URL de imágenes originales. Es un resultado de validación, no evidencia de identidad animal ni de validez clínica. La prueba de integración de interfaz existente agrupa la aplicación React real y el hook con una API simulada; las pruebas de rutas de pasajes del backend usan artefactos sintéticos. Ambas permiten agregar cobertura determinista sin inferencia de modelos.
 
-### Affected Areas
-- `web/src/api.js` — add a client call for the existing passage-list endpoint; passage original URLs can be rendered directly from the response.
-- `web/src/useVideoAnalysis.js` — load/reset passage state for the selected completed analysis and refresh while the endpoint reports pending, without conflating it with history/tracks polling or global-candidate BCS.
-- `web/src/components.jsx` and `web/src/style.css` — render passages in endpoint sequence, each with its original image and experimental category or a readable no-evaluation reason; show endpoint/unresolved warnings and non-clinical/provisional disclaimers.
-- `web/ui.test.mjs` — extend the rendered-app harness to verify endpoint calls, order, original image URLs, category and unevaluable reason rendering, and pending/error/selection behavior.
-- `tests/test_video_passages_api.py`, `src/vacca_video/webapp.py`, `src/vacca_video/schemas.py` — existing endpoint contract and response allowlist to reference/retain; no backend change is currently indicated.
+### Áreas afectadas
+- `web/src/api.js` — agregar una llamada del cliente al endpoint existente de lista de pasajes; las URL originales de los pasajes se pueden renderizar directamente desde la respuesta.
+- `web/src/useVideoAnalysis.js` — cargar/reiniciar el estado de pasajes del análisis completado seleccionado y actualizar mientras el endpoint informe que está pendiente, sin confundirlo con la consulta periódica del historial/tracks ni con el BCS del candidato global.
+- `web/src/components.jsx` y `web/src/style.css` — mostrar los pasajes en la secuencia del endpoint, cada uno con su imagen original y categoría experimental o un motivo legible de no evaluación; mostrar advertencias del endpoint/de atribución sin resolver y avisos de carácter provisional/no clínico.
+- `web/ui.test.mjs` — ampliar el arnés de la aplicación renderizada para verificar las llamadas al endpoint, el orden, las URL de imágenes originales, el renderizado de categorías y motivos de no evaluación, y el comportamiento pendiente/error/selección.
+- `tests/test_video_passages_api.py`, `src/vacca_video/webapp.py`, `src/vacca_video/schemas.py` — contrato existente del endpoint y lista permitida de respuestas que se deben consultar/conservar; por ahora no se indica ningún cambio en el backend.
 
-### Approaches
-1. **Render the existing passage endpoint in the IA harness (recommended)** — Add narrowly scoped UI/API state and an ordered result section, consuming existing endpoint statuses, BCS outcomes/reasons, and original-image URLs.
-   - Pros: Directly evidences the actual implemented API behavior, preserves sequence and per-passage semantics, reuses backend routes and browser test harness, avoids new dependencies and model execution.
-   - Cons: Requires separate pending/error states and request lifecycle handling; images may be absent for passages without a captured original.
-   - Effort: Medium.
+### Enfoques
+1. **Mostrar el endpoint de pasajes existente en el arnés de IA (recomendado)** — Agregar estado de interfaz/API de alcance acotado y una sección de resultados ordenados, consumiendo los estados, resultados/motivos de BCS y URL de imágenes originales existentes del endpoint.
+   - Ventajas: Evidencia directamente el comportamiento real de la API implementada, conserva la secuencia y la semántica por pasaje, reutiliza las rutas del backend y el arnés de pruebas del navegador, y evita dependencias nuevas y ejecutar modelos.
+   - Desventajas: Requiere estados independientes de pendiente/error y manejo del ciclo de vida de solicitudes; podrían faltar imágenes para pasajes sin un original capturado.
+   - Esfuerzo: Medio.
 
-2. **Extend the existing global candidate or tracks panels to represent passages** — Fold passage entries into currently rendered candidate/tracks state.
-   - Pros: Fewer visible sections in the UI.
-   - Cons: Conflates distinct API concepts and existing non-equivalent selection rules; risks implying tracks/global candidate are the authoritative ordered passage results.
-   - Effort: Medium, with higher semantic risk.
+2. **Ampliar los paneles existentes del candidato global o de tracks para representar pasajes** — Integrar las entradas de pasajes en el estado mostrado actualmente para el candidato/los tracks.
+   - Ventajas: Menos secciones visibles en la interfaz.
+   - Desventajas: Confunde conceptos distintos de la API y reglas de selección existentes que no son equivalentes; puede dar a entender que los tracks/el candidato global son los resultados ordenados autoritativos de pasajes.
+   - Esfuerzo: Medio, con mayor riesgo semántico.
 
-### Recommendation
-Choose approach 1 and keep the change strictly within the disposable IA validation web. Reuse `videoApi`/the existing React hook and rendered UI test harness; display sequence, timing/track reference as provisional within-video evidence, full original image, category only when `bcs.status === "evaluated"`, and a reason/status otherwise. Handle list-level statuses explicitly and avoid claiming unique-animal identity, visibility/eligibility, calibration, or clinical validity. Do not change backend routes or schemas, add dependencies, connect R2/backend, or modify generated validation outputs. The web lockfile is `web/package-lock.json`; Node commands must run with `web` as working directory (not IA root). Strict TDD is feasible and appropriate based on the existing `node --test` rendered UI suite and synthetic Python endpoint tests; the prior init's unconfigured/stale TDD note is not evidence against current test coverage.
+### Recomendación
+Elegir el enfoque 1 y mantener el cambio estrictamente dentro de la web descartable de validación de IA. Reutilizar `videoApi`/el hook React existente y el arnés de pruebas de interfaz renderizada; mostrar la secuencia, la referencia temporal/al track como evidencia provisional dentro del video, la imagen original completa, la categoría solo cuando `bcs.status === "evaluated"` y, en los demás casos, un motivo/estado. Manejar explícitamente los estados del listado y evitar afirmaciones de identidad individual, visibilidad/elegibilidad, calibración o validez clínica. No cambiar rutas ni esquemas del backend, agregar dependencias, conectar R2/backend ni modificar resultados de validación generados. El archivo de bloqueo de la web es `web/package-lock.json`; los comandos de Node deben ejecutarse con `web` como directorio de trabajo (no la raíz de IA). El TDD estricto es viable y apropiado según la suite existente de interfaz renderizada `node --test` y las pruebas sintéticas de endpoints en Python; la nota anterior de inicialización sobre TDD desconfigurado/desactualizado no demuestra que la cobertura actual sea insuficiente.
 
-### Risks
-- Passage BCS outcomes are experimental categories and can be unevaluable; the UI must never render a category for a missing/non-evaluated result or present it as a clinical score.
-- `track_id` is temporal and only scoped to the video; neither tracks nor passage sequence establish individual-animal identity. Unresolved tracks/warnings should not be hidden if the UI implies completeness.
-- The global job can be completed while passage processing is still pending; passage polling and cancellation must be tied to selected-job lifecycle and must not block existing detections/results.
-- UI tests can deterministically prove request/render behavior using mocked endpoint responses, but cannot prove live model availability. A later manual smoke test with a prepared local video/model may be useful; it is not required for exploration and must avoid mutating saved validation outputs.
-- Preserve the nine already-dirty IA Markdown files; only this named exploration artifact is authorized to be written in this phase.
+### Riesgos
+- Los resultados BCS de pasajes son categorías experimentales y pueden no ser evaluables; la interfaz nunca debe mostrar una categoría para un resultado ausente/no evaluado ni presentarla como puntuación clínica.
+- `track_id` es temporal y solo tiene alcance dentro del video; ni los tracks ni la secuencia de pasajes establecen identidad individual del animal. No se deben ocultar tracks/advertencias sin resolver si la interfaz implica que los datos están completos.
+- El trabajo global puede completarse mientras el procesamiento de pasajes sigue pendiente; la consulta periódica y la cancelación de pasajes deben vincularse al ciclo de vida del trabajo seleccionado y no deben bloquear las detecciones/resultados existentes.
+- Las pruebas de interfaz pueden demostrar de forma determinista el comportamiento de solicitudes/renderizado mediante respuestas simuladas del endpoint, pero no pueden demostrar la disponibilidad de modelos en vivo. Más adelante podría ser útil una prueba de humo manual con un video/modelo local preparado; no es necesaria para la exploración y debe evitar modificar resultados de validación guardados.
+- Preservar los nueve archivos Markdown de IA que ya tenían cambios; en esta fase solo se autoriza escribir este artefacto de exploración específico.
 
-### Ready for Proposal
-Yes. Propose the smallest front-end-only addition that consumes the existing `/passages` and passage-original routes, with rendered UI tests for completed, pending, unavailable/error, category/reason, order, and selected-job changes. Keep backend/R2/productization, production architecture, new dependencies, identity guarantees, and clinical-validity claims out of scope. Use `cd web; npm test` and `cd web; npm run build` for web verification, plus focused existing Python API tests only if the implementation touches backend contracts; do not run model inference for the UI tests.
+### Listo para la propuesta
+Sí. Proponer la adición mínima solo del frontend que consuma las rutas existentes `/passages` y de imágenes originales de pasajes, con pruebas de interfaz renderizada para los estados completado, pendiente, no disponible/error, categoría/motivo, orden y cambios del trabajo seleccionado. Mantener fuera del alcance el backend/R2/productización, la arquitectura de producción, las nuevas dependencias, las garantías de identidad y las afirmaciones de validez clínica. Usar `cd web; npm test` y `cd web; npm run build` para verificar la web, además de pruebas existentes enfocadas de la API Python solo si la implementación toca contratos del backend; no ejecutar inferencia de modelos para las pruebas de interfaz.

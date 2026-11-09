@@ -40,7 +40,7 @@ sola detección. Es un camino BCS opcional, no el único del video. Tras un trac
 exitoso, la API también evalúa secuencialmente cada pasaje que tenga una imagen
 original disponible; ese camino no necesita que el candidato global exista. Los
 resultados por pasaje se consultan en
-[`GET /api/v1/analyses/{id}/passages`](#experimental-per-passage-bcs). Ambos caminos
+[`GET /api/v1/analyses/{id}/passages`](#bcs-experimental-por-pasaje). Ambos caminos
 comparten runtime y compuerta BCS; la primera operación que llegue al runtime puede
 desencadenar la carga diferida del paquete.
 
@@ -157,9 +157,10 @@ el deslizador o reproducir la secuencia y descargar las detecciones JSONL.
 
 ## Aislamiento y estética
 
-El trabajo está en `feature/deteccion-video`, en el checkout `IA`. La interfaz y
-sus rutas se integran en `vacca_api`; los repositorios backend/frontend del equipo
-no requieren cambios. No es una integración productiva con usuarios o permisos.
+La UI local y sus rutas pertenecen al checkout `IA` y se integran en `vacca_api`;
+no importan código de los repositorios backend/frontend. La integración autenticada
+de análisis de sesiones es un recorrido separado, coordinado por el backend y
+documentado más abajo. Esta UI local no agrega usuarios ni permisos multiusuario.
 
 La interfaz es React. Se copiaron como snapshot la paleta CSS de
 `frontend/src/index.css`, Manrope y los recursos de marca de `frontend/public`
@@ -225,30 +226,33 @@ ausentes; `error` y `summary` del trabajo mantienen sus valores nulos explícito
 
 OpenAPI y explorador interactivo: http://127.0.0.1:8001/docs.
 
-### Experimental per-passage BCS
+### BCS experimental por pasaje
 
-`GET /api/v1/analyses/{id}/passages` preserves `vacca-video-passages-v1` and adds
-`passage.bcs`: a typed `evaluated` or `unevaluable` result, nullable category
-`1..5`, controlled reason, `input_representation: original_only`, experimental
-model status, package, timing, sanitized lineage and input SHA-256 when present.
-It exposes neither private paths nor BCS confidence. Inference uses the full
-original frame, which may contain other cows; it never classifies crops or masks.
-The category is experimental, not clinically validated; the model is not approved.
+`GET /api/v1/analyses/{id}/passages` conserva `vacca-video-passages-v1` y agrega
+`passage.bcs`: un resultado tipado `evaluated` o `unevaluable`, una categoría
+nullable `1..5`, un motivo controlado, `input_representation: original_only`, el
+estado experimental del modelo, el paquete, la temporización, la procedencia
+sanitizada y, si está presente, el SHA-256 de entrada. No expone rutas privadas ni
+la confianza de BCS. La inferencia usa el frame original completo, que puede incluir
+otras vacas; nunca clasifica recortes ni máscaras. La categoría es experimental,
+no está validada clínicamente y el modelo no está aprobado.
 
-| List-level `bcs_status` | Meaning |
+| `bcs_status` del listado | Significado |
 | --- | --- |
-| `completed` | Full sidecar bound to the summary, ordered intervals and current images; may include `unevaluable` passages without categories. |
-| `not_evaluated` | Absent sidecar (legacy/no configured phase), or job not yet completed; does not imply inference failure. |
-| `unavailable` | Unreadable, oversized, invalid or stale sidecar; `bcs_reason: passage_bcs_unreadable`, all results null, valid images retained. |
+| `completed` | Sidecar completo vinculado al resumen, los intervalos ordenados y las imágenes actuales; puede incluir pasajes `unevaluable` sin categorías. |
+| `not_evaluated` | Sidecar ausente (legado/fase no configurada) o trabajo aún sin completar; no implica un fallo de inferencia. |
+| `unavailable` | Sidecar ilegible, demasiado grande, inválido o desactualizado; `bcs_reason: passage_bcs_unreadable`, todos los resultados nulos y las imágenes válidas conservadas. |
 
-Candidate availability is separate from BCS availability. For compatibility,
-`candidate.bcs_status: not_evaluated` remains a **deprecated** tracking-producer
-snapshot, not the current inference state; use `passage.bcs` instead.
-`candidate.bcs_eligibility: not_assessed` still means clinical eligibility was not
-assessed. All passages remain chronological, including those without candidates.
-While the job is `pending` or `processing`, no passages, categories or files are
-exposed. There is no raw sidecar route. Job completion follows all configured
-stages, including sequential passage evaluation on the same parent BCS runtime/gate.
+La disponibilidad del candidato es independiente de la disponibilidad de BCS. Por
+compatibilidad, `candidate.bcs_status: not_evaluated` sigue siendo una instantánea
+**obsoleta** del productor de tracking, no el estado actual de inferencia; usar
+`passage.bcs` en su lugar. `candidate.bcs_eligibility: not_assessed` sigue
+significando que no se evaluó la elegibilidad clínica. Todos los pasajes se
+mantienen en orden cronológico, incluidos los que no tienen candidatos. Mientras
+el trabajo esté `pending` o `processing`, no se exponen pasajes, categorías ni
+archivos. No existe una ruta para el sidecar sin procesar. El trabajo se completa
+después de todas las etapas configuradas, incluida la evaluación secuencial de
+pasajes con el mismo runtime/control de BCS principal.
 
 En la web local, seleccioná un análisis completado y revisá **Pasajes del video**:
 las tarjetas conservan el orden de la API, muestran la imagen original disponible y
@@ -264,6 +268,8 @@ motivo de no evaluación. No es el candidato global ni un recorte de trayectoria
 | POST /api/v1/analyses?filename=nombre.mp4 | Body binario MP4 o MOV de QuickTime (`.mov`, grabaciones de celular), no multipart; devuelve 202 y trabajo persistido |
 | GET /api/v1/analyses | Últimos 100 trabajos, más recientes primero |
 | GET /api/v1/analyses/{id} | Trabajo y resumen final si está disponible |
+| DELETE /api/v1/analyses/{id}/artifacts | Limpieza idempotente de los archivos temporales de un trabajo terminal; conserva su registro local |
+| POST /api/v1/analyses/{id}/retry | Reanuda un trabajo `failed` con su fuente retenida; conserva el mismo ID |
 | GET /api/v1/analyses/{id}/frames?offset=0&limit=30 | items y total; máximo 100 por página |
 | GET /api/v1/analyses/{id}/frames/{index}/image | JPEG anotado del frame seleccionado |
 | GET /api/v1/analyses/{id}/candidate/image | PNG original del candidato BCS, ruta fija local del trabajo; nunca una ruta recibida en el resumen |
@@ -275,6 +281,24 @@ motivo de no evaluación. No es el candidato global ni un recorte de trayectoria
 | GET /api/v1/analyses/{id}/tracks/{track_id}/best-original | JPEG del frame original completo elegido, sin anotaciones |
 | GET /api/v1/analyses/{id}/tracks/{track_id}/best-masked | PNG de la silueta (fondo gris plano); 404 si la máscara no fue aceptada |
 | GET /api/v1/analyses/{id}/tracks/{track_id}/best-mask | PNG de la máscara binaria alineada con best-crop |
+
+`POST /api/v1/analyses` acepta la cabecera opcional `Idempotency-Key` (UUID). Si se
+repite la misma clave con los mismos bytes, devuelve el mismo trabajo incluso si ya
+terminó o sus archivos se limpiaron; la clave con contenido distinto responde `409`.
+Los clientes anteriores pueden omitir la cabecera y conservan el comportamiento
+existente. El servicio guarda el digest en su SQLite como tombstone idempotente.
+
+La ruta de limpieza responde `204` si se eliminó el árbol de archivos del trabajo o
+si ya estaba vacío. Mientras el trabajo siga `pending` o `processing`, responde `409`.
+Solo borra archivos debajo del directorio privado del UUID del trabajo; mantiene en
+SQLite el estado terminal, el nombre y la identidad idempotente para que un replay no
+vuelva a crear ni procesar un trabajo.
+La limpieza y el reintento se serializan por trabajo durante la validación del estado y
+la operación de archivos. Si la limpieza gana, el tombstone permanece y el reintento
+responde `409`; si el reintento gana, la limpieza observa el nuevo estado activo y
+responde `409`. El reintento conserva `input.mp4`, elimina el directorio `result` parcial
+y el log anterior, y recién entonces confirma el estado `pending`; el worker regenera su
+directorio de salida al procesar el trabajo.
 
 Las imágenes se sirven como `image/jpeg` con sus mismos bytes; la opción
 `?download=true` agrega una disposición de descarga con nombre
@@ -366,21 +390,21 @@ No se incluye un Dockerfile que reutilice los locks de Windows en Linux: eso
 requiere resolver y probar dependencias de otra plataforma. El arranque local
 anterior es el camino validado para esta entrega.
 
-## Conexión futura con VACCA
+## Relación con el backend de VACCA
 
-1. Mover los componentes del módulo a `features/videos` en el frontend y montarlos
-   bajo ProtectedRoute/AppLayout; reemplazar el adaptador `api.js` por httpClient
-   con JWT y las rutas que acuerde el backend. No copiar este shell encima del suyo.
-2. Reemplazar Store por trabajos autorizados del backend y almacenamiento R2.
-   El backend debe resolver los problemas de ownership identificados en
-   [la revisión de integración](revision-integracion-vacca-2026-10-01.md).
-3. Convertir Worker en consumidor de trabajos reclamados al backend, conservando
-   el procesador. Añadir lease, heartbeat, idempotencia y publicación de artefactos.
-4. Mantener versión y significado del resultado, agregando pruebas de contrato
-   entre ambos repositorios. La subida binaria local puede adaptarse a multipart
-   o a URLs firmadas; esa diferencia queda contenida en el adaptador HTTP.
+La integración de análisis de sesiones ya está implementada en el backend: este
+recibe la carga autenticada del frontend, admite el trabajo en IA mediante loopback,
+importa pasajes e imágenes según el orden guardado de la sesión y solicita la limpieza
+del video fuente después de persistir los resultados. El contrato correspondiente
+está documentado en `backend/docs/routers/analisis_video.md` dentro del repositorio
+backend.
 
-Es una base aislada para integrar, no la integración productiva ya terminada.
+Esta UI de IA continúa siendo un prototipo local independiente, con historial SQLite
+propio y sin usuarios ni permisos multiusuario. No es la UI autenticada de sesiones ni
+el almacenamiento de trabajos del backend. El backend puede usar R2 (predeterminado)
+o almacenamiento local configurado explícitamente; R2 no es un requisito del flujo.
+La interoperabilidad entre ambos recorridos se mantiene en sus contratos HTTP y no
+implica que esta UI se publique como interfaz de producción.
 
 ## Validación registrada de video y BCS
 

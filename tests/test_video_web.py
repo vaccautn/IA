@@ -6,6 +6,7 @@ import logging
 import threading
 import io
 import os
+import sqlite3
 import zipfile
 from urllib.parse import urlencode, urlsplit
 
@@ -104,6 +105,15 @@ def submit(client, name="vacas.mp4"):
     )
 
 
+def submit_idempotent(client, content=b"\x00\x00\x00\x18ftypisom00000000", key="123e4567-e89b-12d3-a456-426614174000"):
+    return client.post(
+        "/api/v1/analyses",
+        params={"filename": "vacas.mp4"},
+        content=content,
+        headers={"Idempotency-Key": key},
+    )
+
+
 def test_upload_is_persistent_and_path_is_generated(client):
     response = submit(client, "../vacas.mp4")
     assert response.status_code == 202
@@ -114,6 +124,250 @@ def test_upload_is_persistent_and_path_is_generated(client):
     reopened = webapp.Store(client.app.state.store.directory)
     assert reopened.get(job["id"])["name"] == "../vacas.mp4"
     assert client.get("/api/v1/analyses").json()[0]["id"] == job["id"]
+
+
+def test_idempotency_key_replays_same_upload_and_rejects_different_bytes(client):
+    first = submit_idempotent(client)
+    replay = submit_idempotent(client)
+
+    assert first.status_code == 202
+    assert replay.status_code == 202
+    assert replay.json()["id"] == first.json()["id"]
+    assert "idempotency_key" not in replay.json()
+    assert "source_sha256" not in replay.json()
+    assert len(client.app.state.store.list()) == 1
+    changed = submit_idempotent(client, content=b"\x00\x00\x00\x18ftypmp4200000000")
+    assert changed.status_code == 409
+    assert len(client.app.state.store.list()) == 1
+
+
+def test_idempotency_replay_hashes_without_disk_reservation(client, monkeypatch):
+    first = submit_idempotent(client)
+    assert first.status_code == 202
+    files_before = set(client.app.state.store.directory.iterdir())
+    monkeypatch.setattr(
+        webapp.shutil,
+        "disk_usage",
+        lambda path: type("Disk", (), {"free": 0})(),
+    )
+
+    replay = submit_idempotent(client)
+
+    assert replay.status_code == 202
+    assert replay.json()["id"] == first.json()["id"]
+    assert set(client.app.state.store.directory.iterdir()) == files_before
+
+
+def test_invalid_idempotency_key_is_rejected_before_admission(client):
+    response = client.post(
+        "/api/v1/analyses",
+        params={"filename": "vacas.mp4"},
+        content=b"\x00\x00\x00\x18ftypisom00000000",
+        headers={"Idempotency-Key": "not-a-uuid"},
+    )
+
+    assert response.status_code == 422
+    assert client.app.state.store.list() == []
+
+
+def test_cleanup_rejects_active_jobs_and_deletes_terminal_artifacts_idempotently(client):
+    response = submit_idempotent(client)
+    job_id = response.json()["id"]
+    directory = client.app.state.store.directory / job_id
+    artifact = directory / "result" / "detections.jsonl"
+    artifact.parent.mkdir()
+    artifact.write_text("temporary result", encoding="utf-8")
+
+    active_cleanup = client.request("DELETE", f"/api/v1/analyses/{job_id}/artifacts")
+    assert active_cleanup.status_code == 409
+    assert artifact.is_file()
+    client.app.state.store.update(job_id, "processing")
+    processing_cleanup = client.request("DELETE", f"/api/v1/analyses/{job_id}/artifacts")
+    assert processing_cleanup.status_code == 409
+    assert artifact.is_file()
+
+    client.app.state.store.update(job_id, "completed")
+    deleted = client.request("DELETE", f"/api/v1/analyses/{job_id}/artifacts")
+    repeated = client.request("DELETE", f"/api/v1/analyses/{job_id}/artifacts")
+
+    assert deleted.status_code == 204
+    assert repeated.status_code == 204
+    assert not directory.exists()
+    assert client.app.state.store.get(job_id)["status"] == "completed"
+
+
+def test_failed_job_retry_reuses_same_job_and_input_after_cleaning_partial_output(client):
+    response = submit_idempotent(client)
+    job_id = response.json()["id"]
+    store = client.app.state.store
+    store.update(job_id, "failed", "tracking failed")
+    directory = store.directory / job_id
+    input_path = directory / "input.mp4"
+    partial = directory / "result" / "tracking" / "partial.json"
+    partial.parent.mkdir(parents=True)
+    partial.write_text("partial", encoding="utf-8")
+
+    retried = client.post(f"/api/v1/analyses/{job_id}/retry")
+
+    assert retried.status_code == 202
+    assert retried.json()["id"] == job_id
+    assert retried.json()["status"] == "pending"
+    assert input_path.is_file()
+    assert input_path.read_bytes() == b"\x00\x00\x00\x18ftypisom00000000"
+    assert not (directory / "result").exists()
+    assert len(store.list()) == 1
+
+
+def test_failed_job_retry_is_idempotent_while_worker_already_reclaimed(client):
+    response = submit_idempotent(client)
+    job_id = response.json()["id"]
+    store = client.app.state.store
+    store.update(job_id, "failed", "worker failed")
+
+    first = client.post(f"/api/v1/analyses/{job_id}/retry")
+    repeated = client.post(f"/api/v1/analyses/{job_id}/retry")
+
+    assert first.status_code == 202
+    assert repeated.status_code == 202
+    assert first.json()["id"] == repeated.json()["id"] == job_id
+    assert store.get(job_id)["status"] == "pending"
+
+
+def test_cleanup_keeps_idempotency_tombstone_and_does_not_reprocess_replay(client):
+    response = submit_idempotent(client)
+    job_id = response.json()["id"]
+    client.app.state.store.update(job_id, "completed")
+    assert client.request("DELETE", f"/api/v1/analyses/{job_id}/artifacts").status_code == 204
+
+    replay = submit_idempotent(client)
+
+    assert replay.status_code == 202
+    assert replay.json()["id"] == job_id
+    assert len(client.app.state.store.list()) == 1
+    assert not (client.app.state.store.directory / job_id).exists()
+    retry = client.post(f"/api/v1/analyses/{job_id}/retry")
+    assert retry.status_code == 409
+
+    conflict = submit_idempotent(
+        client, content=b"\x00\x00\x00\x18ftypmp4200000000"
+    )
+    assert conflict.status_code == 409
+    assert len(client.app.state.store.list()) == 1
+
+
+def test_cleanup_rejects_non_uuid_job_ids_without_touching_sibling_paths(client, tmp_path):
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    client.app.state.store.add("not-a-uuid", "legacy.mp4")
+    client.app.state.store.update("not-a-uuid", "completed")
+
+    response = client.request("DELETE", "/api/v1/analyses/not-a-uuid/artifacts")
+
+    assert response.status_code == 404
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_failed_analysis_retry_reuses_job_and_source_and_clears_old_output(client):
+    response = submit_idempotent(client)
+    job_id = response.json()["id"]
+    store = client.app.state.store
+    store.update(job_id, "failed", "tracking failed")
+    directory = store.directory / job_id
+    input_path = directory / "input.mp4"
+    partial = directory / "result" / "tracking" / "partial.json"
+    partial.parent.mkdir(parents=True)
+    partial.write_text("old attempt", encoding="utf-8")
+    source_digest = store.get(job_id)["source_sha256"]
+
+    retried = client.post(f"/api/v1/analyses/{job_id}/retry")
+
+    assert retried.status_code == 202
+    assert retried.json()["id"] == job_id
+    assert retried.json()["status"] == "pending"
+    assert input_path.is_file()
+    assert input_path.read_bytes() == b"\x00\x00\x00\x18ftypisom00000000"
+    assert not (directory / "result").exists()
+    assert store.get(job_id)["source_sha256"] == source_digest
+
+    new_partial = directory / "result" / "new-attempt.txt"
+    new_partial.parent.mkdir()
+    new_partial.write_text("new attempt", encoding="utf-8")
+    repeated = client.post(f"/api/v1/analyses/{job_id}/retry")
+    assert repeated.status_code == 202
+    assert repeated.json()["id"] == job_id
+    assert new_partial.is_file()
+
+
+def test_store_adds_idempotency_columns_to_existing_history(tmp_path):
+    database = tmp_path / "jobs.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE jobs (id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, error TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO jobs VALUES ('legacy', 'legacy.mp4', 'completed', '2026-01-01', NULL)"
+        )
+
+    store = webapp.Store(tmp_path)
+
+    legacy = store.get("legacy")
+    assert legacy["idempotency_key"] is None
+    assert legacy["source_sha256"] is None
+    store.add("new-job", "new.mp4", "123e4567-e89b-12d3-a456-426614174000", "f" * 64)
+    assert store.get_by_idempotency_key("123e4567-e89b-12d3-a456-426614174000")[
+        "id"
+    ] == "new-job"
+
+
+def test_cleanup_and_retry_serialize_state_and_filesystem_transition(client, monkeypatch):
+    accepted = submit_idempotent(client)
+    job_id = accepted.json()["id"]
+    store = client.app.state.store
+    store.update(job_id, "failed", "worker failure")
+    directory = store.directory / job_id
+    partial = directory / "result" / "partial.json"
+    partial.parent.mkdir()
+    partial.write_text("partial", encoding="utf-8")
+    entered = threading.Event()
+    cleanup_reached_filesystem = threading.Event()
+    release = threading.Event()
+    original_rmtree = webapp.shutil.rmtree
+
+    def blocked_rmtree(path, *args, **kwargs):
+        if str(path).endswith("result"):
+            entered.set()
+            assert release.wait(2)
+        elif str(path) == str(directory):
+            cleanup_reached_filesystem.set()
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(webapp.shutil, "rmtree", blocked_rmtree)
+    outcomes = {}
+
+    def retry():
+        outcomes["retry"] = client.post(f"/api/v1/analyses/{job_id}/retry")
+
+    def cleanup():
+        outcomes["cleanup"] = client.request(
+            "DELETE", f"/api/v1/analyses/{job_id}/artifacts"
+        )
+
+    retry_thread = threading.Thread(target=retry)
+    retry_thread.start()
+    assert entered.wait(2)
+    cleanup_thread = threading.Thread(target=cleanup)
+    cleanup_thread.start()
+    assert not cleanup_reached_filesystem.wait(0.05)
+    release.set()
+    retry_thread.join(2)
+    cleanup_thread.join(2)
+
+    assert not retry_thread.is_alive() and not cleanup_thread.is_alive()
+    assert outcomes["retry"].status_code == 202
+    assert outcomes["cleanup"].status_code == 409
+    assert store.get(job_id)["status"] == "pending"
+    assert (directory / "input.mp4").is_file()
 
 
 def test_invalid_and_large_uploads_leave_no_job_or_file(client, monkeypatch):

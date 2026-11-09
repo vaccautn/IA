@@ -26,6 +26,20 @@ def test_raw_mp4_request_and_typed_job_response():
         assert set(operation["responses"][str(code)]["content"]) == {"application/json"}
 
 
+def test_analysis_upload_idempotency_and_private_terminal_cleanup_contract():
+    schema = main.app.openapi()
+    upload = schema["paths"]["/api/v1/analyses"]["post"]
+    key = next(p for p in upload["parameters"] if p["name"] == "Idempotency-Key")
+    assert key["in"] == "header"
+    assert key["required"] is False
+    assert {item.get("type") for item in key["schema"]["anyOf"]} == {"string", "null"}
+
+    cleanup = schema["paths"]["/api/v1/analyses/{job_id}/artifacts"]["delete"]
+    assert "204" in cleanup["responses"]
+    assert set(cleanup["responses"]["404"]["content"]) == {"application/json"}
+    assert set(cleanup["responses"]["409"]["content"]) == {"application/json"}
+
+
 @pytest.mark.parametrize("suffix,media_type", [
     ("/frames/{index}/image", "image/jpeg"),
     ("/candidate/image", "image/png"),

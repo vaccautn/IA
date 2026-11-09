@@ -30,10 +30,12 @@ def _sha256(path: Path) -> str:
 
 
 def export_crops(runs, output, include_review: bool = False) -> dict:
-    """Copy one image per exported track and write an empty-label sheet.
+    """Copia una imagen por track exportado y crea una planilla sin etiquetas.
 
-    Each video may appear once: two trackers over the same video would export
-    the same animals twice and leak them across train/validation splits.
+    El video original debe existir para verificar su SHA-256. Cada video puede
+    aparecer una sola vez: dos trackers sobre el mismo video duplicarían las
+    muestras y podrían filtrarlas entre particiones. Se validan fuentes y nombres
+    de destino antes de copiar; la carpeta de salida debe ser nueva.
     """
     output = Path(output)
     if output.exists():
@@ -42,17 +44,22 @@ def export_crops(runs, output, include_review: bool = False) -> dict:
     for run in map(Path, runs):
         summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
         video = Path(summary["input"])
-        digest = _sha256(video) if video.is_file() else None
-        key = digest or str(video)
+        if not video.is_file():
+            raise ValueError(
+                f"El video original debe estar disponible para verificar su identidad: {video.name}"
+            )
+        digest = _sha256(video)
+        key = digest
         if key in seen:
-            raise ValueError(f"El video de {run} ya se exportó desde {seen[key]}; usar un solo tracker por video")
+            raise ValueError(
+                f"El video de {run} ya se exportó desde {seen[key]}; use un solo tracker por video"
+            )
         seen[key] = run
         loaded.append((run, summary, video, digest))
-    images = output / "images"
-    images.mkdir(parents=True)
-    rows = []
+
+    rows, copies, planned_names = [], [], set()
     for run, summary, video, digest in loaded:
-        video_id = digest[:12] if digest else run.name
+        video_id = digest
         tracker = Path(summary.get("tracker", "tracker")).stem
         groups = {}
         for track in sorted(summary["tracks"], key=lambda item: item["track_id"]):
@@ -65,8 +72,13 @@ def export_crops(runs, output, include_review: bool = False) -> dict:
             segmentation = track.get("segmentation") or {}
             masked = segmentation.get("status") == "ok" and segmentation.get("best_masked")
             source = run / (segmentation["best_masked"] if masked else track["best_crop"])
+            if not source.is_file():
+                raise ValueError(f"Falta el recorte original del track {track_id}")
             name = f"{video_id}-{tracker}-t{track_id}.png"
-            shutil.copyfile(source, images / name)
+            if name in planned_names:
+                raise ValueError(f"Hay un destino de imagen duplicado en la exportación: {name}")
+            planned_names.add(name)
+            copies.append((source, name))
             rows.append({
                 "image": name, "image_kind": "masked" if masked else "rect",
                 "group": groups[track_id], "video": video.name, "video_sha256": digest or "",
@@ -75,6 +87,11 @@ def export_crops(runs, output, include_review: bool = False) -> dict:
                 "warnings": ";".join(track["warnings"]), "mask_status": segmentation.get("status", ""),
                 "bcs_category": "", "notes": "",
             })
+
+    images = output / "images"
+    images.mkdir(parents=True)
+    for source, name in copies:
+        shutil.copyfile(source, images / name)
     with (output / LABELS_FILE).open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=COLUMNS)
         writer.writeheader()
