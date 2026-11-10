@@ -1,5 +1,48 @@
 # VACCA Vision — API de detección bovina y BCS ordinal
 
+Microservicio de visión por computadora de **VACCA**, un sistema de soporte de
+decisiones para el manejo nutricional de rodeos de cría. Detecta vacas en imágenes,
+estima su condición corporal (CC/BCS) en escala 1 a 5 y analiza videos de la manga
+separando cada animal que pasa.
+
+> **Proyecto Final de Ingeniería en Sistemas de Información** · Universidad
+> Tecnológica Nacional, Facultad Regional Resistencia (UTN FRRe) · 2026.
+
+📐 **Arquitectura del sistema completo:**
+[frontend/ARQUITECTURA.md](https://github.com/vaccautn/frontend/blob/develop/ARQUITECTURA.md) ·
+**Arquitectura interna de IA:** [docs/arquitectura.md](docs/arquitectura.md)
+
+## Rol en el sistema
+
+```mermaid
+flowchart LR
+    FE[frontend] --> BE[backend FastAPI]
+    BE -->|"POST /detect"| DET["Detector<br/>YOLO26n"]
+    BE -->|"POST /bcs"| BCS["Clasificador CC 1..5<br/>ResNet18 + CORAL"]
+    BE -->|"/api/v1/analyses"| VID["Análisis de video<br/>tracking por pasaje"]
+    subgraph IA["IA · este repo (red privada, :8001)"]
+        DET
+        BCS
+        VID
+    end
+    VID --> DET
+    VID --> BCS
+```
+
+| Paquete | Responsabilidad |
+| --- | --- |
+| `src/vacca_api` | API FastAPI: `/detect`, `/bcs`, `/ready/bcs`, `/health`, `/metrics` y validación de imágenes |
+| `src/vacca_bcs` | Dataset sin fugas entre particiones, entrenamiento y serving del modelo ordinal de CC |
+| `src/vacca_video` | Muestreo de frames, tracking de cada vaca, pasajes, CC por pasaje y API `/api/v1/analyses` |
+| `web/` | UI React de la herramienta local de video |
+
+- **Detección:** YOLO26n ajustado sobre ~18.000 imágenes: mAP50 0,974, precisión 0,976
+  y exhaustividad 0,924 (ver [Resultados de entrenamiento](#resultados-de-entrenamiento)).
+- **CC:** ResNet18 con cabeza ordinal CORAL. Es un paquete experimental, no aprobado
+  para producción, cuyos pesos se distribuyen fuera de Git.
+- **Seguridad:** la API no tiene autenticación propia; solo el backend la consume, por
+  loopback o red privada.
+
 ## Inicio local: qué ejecutar y en qué orden
 
 **Para probar IA sola**, preparar únicamente `IA` y abrir `/ui` (imágenes) o
